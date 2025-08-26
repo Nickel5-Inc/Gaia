@@ -1,5 +1,5 @@
 import os
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Union, Tuple
 import numpy as np
@@ -67,6 +67,45 @@ async def fetch_gfs_data(
     Returns:
         xr.Dataset: Dataset containing all required variables, processed for Aurora.
     """
+    # Check if cached file exists first
+    if output_dir:
+        date_str = run_time.strftime("%Y%m%d")
+        cycle_str = run_time.strftime("%H")
+        # Include lead hours in filename to avoid conflicts
+        leads_str = "_".join(str(h) for h in sorted(lead_hours))
+        cache_file = os.path.join(output_dir, f"gfs_raw_{date_str}_{cycle_str}z_leads_{leads_str}.nc")
+        
+        # Also check legacy filename format for backward compatibility
+        legacy_cache_file = os.path.join(output_dir, f"gfs_raw_{date_str}_{cycle_str}z.nc")
+        
+        for cf in [cache_file, legacy_cache_file]:
+            if os.path.exists(cf):
+                try:
+                    logger.info(f"Loading cached GFS data from: {cf}")
+                    import pandas as pd
+                    ds = xr.open_dataset(cf, engine="netcdf4")
+                    # Check if the cached file has the requested lead hours
+                    if hasattr(ds, 'time') and ds.time is not None:
+                        cached_leads = []
+                        for t in ds.time.values:
+                            # Ensure both timestamps are timezone-aware or both are naive
+                            t_ts = pd.Timestamp(t)
+                            run_ts = pd.Timestamp(run_time)
+                            if t_ts.tz is None and run_ts.tz is not None:
+                                t_ts = t_ts.tz_localize('UTC')
+                            elif t_ts.tz is not None and run_ts.tz is None:
+                                run_ts = run_ts.tz_localize('UTC')
+                            delta = t_ts - run_ts
+                            cached_leads.append(int(delta.total_seconds() / 3600))
+                        if all(lead in cached_leads for lead in lead_hours):
+                            logger.info(f"GFS cache hit is valid for leads {lead_hours}")
+                            return ds
+                        else:
+                            logger.info(f"Cache has leads {cached_leads}, need {lead_hours}, re-fetching")
+                            ds.close()
+                except Exception as e:
+                    logger.warning(f"Failed to load cached GFS data from {cf}: {e}, trying next or fetching fresh")
+    
     logger.info(
         f"Asynchronously fetching GFS data for run time: {run_time}, lead hours: {lead_hours}"
     )
@@ -81,6 +120,7 @@ async def fetch_gfs_data(
         try:
             import netCDF4
             import xarray as xr
+            import numpy as np
 
             # Force re-registration of netcdf4 backend in this thread
             try:
@@ -280,13 +320,66 @@ async def fetch_gfs_data(
                 if output_dir:
                     try:
                         os.makedirs(output_dir, exist_ok=True)
+                        # Ensure directory is accessible by all workers
+                        try:
+                            os.chmod(output_dir, 0o777)  # rwxrwxrwx
+                        except Exception:
+                            pass  # Ignore if we can't change permissions
+                        # Include lead hours in filename to avoid conflicts
+                        leads_str = "_".join(str(h) for h in sorted(lead_hours))
                         out_file = os.path.join(
-                            output_dir, f"gfs_raw_{date_str}_{cycle_str}z.nc"
+                            output_dir, f"gfs_raw_{date_str}_{cycle_str}z_leads_{leads_str}.nc"
                         )
                         logger.info(f"Saving raw fetched data to: {out_file}")
-                        ds.to_netcdf(out_file)
+                        
+                        # NetCDF doesn't support timezone-aware timestamps
+                        # Convert to UTC and remove timezone info for saving
+                        if 'time' in ds.coords:
+                            import pandas as pd
+                            # numpy is already imported globally as np
+                            time_vals = ds.time.values
+                            # Check if time values are timezone-aware
+                            if hasattr(time_vals, 'dtype') and 'datetime64' in str(time_vals.dtype):
+                                # Convert to pandas datetime to handle timezones
+                                time_index = pd.to_datetime(time_vals)
+                                if hasattr(time_index, 'tz') and time_index.tz is not None:
+                                    # Convert to UTC and remove timezone
+                                    time_vals = time_index.tz_convert('UTC').tz_localize(None).values
+                                else:
+                                    time_vals = time_index.values
+                                # Assign back as numpy datetime64[ns] without timezone
+                                ds = ds.assign_coords(time=time_vals)
+                        
+                        # Enforce netCDF4 engine and ensure it is available in this context
+                        try:
+                            import netCDF4  # noqa: F401
+                        except Exception as imp_err:
+                            raise RuntimeError(f"netCDF4 import failed in save context: {imp_err}")
+                        available = list(xr.backends.list_engines())
+                        if "netcdf4" not in available:
+                            raise RuntimeError(
+                                f"netcdf4 engine not registered; available engines: {available}"
+                            )
+                        
+                        # Remove file if it exists to avoid permission issues
+                        if os.path.exists(out_file):
+                            try:
+                                os.remove(out_file)
+                            except Exception as e:
+                                logger.warning(f"Could not remove existing file {out_file}: {e}")
+                        
+                        ds.to_netcdf(out_file, engine="netcdf4")
+                        
+                        # Set permissions to be readable/writable by all processes
+                        # 0o666 = rw-rw-rw- (readable and writable by owner, group, and others)
+                        try:
+                            os.chmod(out_file, 0o666)
+                            logger.debug(f"Set permissions 666 on {out_file}")
+                        except Exception as e:
+                            logger.warning(f"Could not set permissions on {out_file}: {e}")
                     except Exception as save_err:
-                        logger.error(f"Failed to save raw NetCDF file: {save_err}")
+                        logger.error(f"Failed to save raw NetCDF file with netcdf4: {save_err}")
+                        raise
 
                 logger.info("Processing fetched data for Aurora requirements...")
                 processed_ds = process_opendap_dataset(ds)
@@ -511,6 +604,11 @@ async def fetch_gfs_analysis_data(
     target_times = sorted(list(set(valid_target_times)))
 
     cache_dir.mkdir(parents=True, exist_ok=True)
+    # Ensure directory is accessible by all workers
+    try:
+        os.chmod(cache_dir, 0o777)  # rwxrwxrwx
+    except Exception:
+        pass  # Ignore if we can't change permissions
     time_strings = [t.strftime("%Y%m%d%H") for t in target_times]
     cache_key = hashlib.md5("_anal_".join(time_strings).encode()).hexdigest()
     cache_filename = cache_dir / f"gfs_analysis_{cache_key}.nc"
@@ -639,6 +737,7 @@ async def fetch_gfs_analysis_data(
         try:
             import netCDF4
             import xarray as xr
+            import numpy as np
 
             # Force re-registration of netcdf4 backend in this thread
             try:
@@ -1108,6 +1207,12 @@ async def fetch_gfs_analysis_data(
             for engine in engines_to_try:
                 try:
                     processed_ds.to_netcdf(cache_filename, engine=engine)
+                    # Set permissions to be readable/writable by all processes
+                    try:
+                        os.chmod(cache_filename, 0o666)  # rw-rw-rw-
+                        logger.debug(f"Set permissions 666 on {cache_filename}")
+                    except Exception as e:
+                        logger.warning(f"Could not set permissions on {cache_filename}: {e}")
                     logger.info(
                         f"Successfully saved GFS analysis cache using '{engine}' engine"
                     )

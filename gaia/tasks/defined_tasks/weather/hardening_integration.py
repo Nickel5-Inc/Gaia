@@ -15,7 +15,7 @@ IMPLEMENTATION PHASES:
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List, Any
 import asyncio
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -150,7 +150,7 @@ class WeatherStateConsistencyManager:
             )
 
     async def auto_recover_inconsistencies(
-        self, max_recoveries_per_run: int = 3
+        self
     ) -> Dict[str, int]:
         """
         Automatically recover from detected inconsistencies.

@@ -7,7 +7,24 @@ import fsspec
 import xarray as xr
 import psutil
 import pandas as pd
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
+
+logger = get_logger(__name__)
+
+# Process-local: capture last verified open error details by job_id
+_last_verified_open_error = {}
+
+def set_last_verified_open_error(job_id: str, message: str):
+    try:
+        _last_verified_open_error[job_id] = message
+    except Exception:
+        pass
+
+def get_last_verified_open_error(job_id: str) -> Optional[str]:
+    try:
+        return _last_verified_open_error.get(job_id)
+    except Exception:
+        return None
 
 # Ensure blosc codec is available for zarr operations
 try:
@@ -47,6 +64,23 @@ except ImportError:
         )
 
 logger = get_logger(__name__)
+
+# Lightweight request throttle/cache to prevent request storms during verification
+_CAT_CACHE_MAX = 2048
+_cat_cache = {}
+_cat_order = []
+
+def _cat_cached(fs, path: str) -> bytes:
+    key = path
+    if key in _cat_cache:
+        return _cat_cache[key]
+    data = fs.cat(path)
+    _cat_cache[key] = data
+    _cat_order.append(key)
+    if len(_cat_order) > _CAT_CACHE_MAX:
+        oldest = _cat_order.pop(0)
+        _cat_cache.pop(oldest, None)
+    return data
 
 
 def get_current_memory_usage_mb():
@@ -96,7 +130,10 @@ def _synchronous_zarr_open_unverified(
                 f"SYNC_ZARR_OPEN_UNVERIFIED: Blosc codec test successful in executor thread"
             )
         except Exception as codec_err:
-            logger.warning(f"SYNC_ZARR_OPEN_UNVERIFIED: Codec test failed: {codec_err}")
+            logger.warning(
+                f"SYNC_ZARR_OPEN_UNVERIFIED: Codec test failed: {codec_err}",
+                exc_info=True,
+            )
 
         # Additional fallback: set zarr codec for this thread explicitly
         try:
@@ -112,10 +149,11 @@ def _synchronous_zarr_open_unverified(
             ):
                 zarr.codec_registry.register_codec(blosc_codec)
         except Exception as e:
-            logger.debug(f"Failed to register blosc codec: {e}")
+            logger.debug(f"Failed to register blosc codec: {e}", exc_info=True)
     except Exception as e:
         logger.warning(
-            f"SYNC_ZARR_OPEN_UNVERIFIED: Failed to ensure blosc codec in executor thread: {e}"
+            f"SYNC_ZARR_OPEN_UNVERIFIED: Failed to ensure blosc codec in executor thread: {e}",
+            exc_info=True,
         )
 
     if zarr_store_url.endswith(".zarr") and not zarr_store_url.endswith("/"):
@@ -237,7 +275,7 @@ async def open_remote_zarr_dataset_unverified(
 
 
 def _synchronous_open_with_verifying_mapper(
-    verifying_mapper: VerifyingChunkMapper, consolidated: bool
+    verifying_mapper, consolidated: bool
 ) -> Optional[xr.Dataset]:
     """Synchronous helper to open dataset with the VerifyingChunkMapper."""
     # CRITICAL: Ensure blosc codec is available in this executor thread
@@ -276,12 +314,14 @@ def _synchronous_open_with_verifying_mapper(
 
         except Exception as codec_err:
             logger.warning(
-                f"Job {verifying_mapper.job_id_for_logging}: Codec registration failed: {codec_err}"
+                f"Job {verifying_mapper.job_id_for_logging}: Codec registration failed: {codec_err}",
+                exc_info=True,
             )
 
     except Exception as e:
         logger.warning(
-            f"Job {verifying_mapper.job_id_for_logging}: Failed to ensure blosc codec in executor thread: {e}"
+            f"Job {verifying_mapper.job_id_for_logging}: Failed to ensure blosc codec in executor thread: {e}",
+            exc_info=True,
         )
 
     try:
@@ -353,6 +393,96 @@ def _synchronous_open_with_verifying_mapper(
         return None
 
 
+async def open_verified_remote_zarr_variable(
+    zarr_store_url: str,
+    claimed_manifest_content_hash: str,
+    miner_hotkey_ss58: str,
+    variable_names: List[str],
+    storage_options: Optional[Dict] = None,
+    job_id: Optional[str] = "unknown_job",
+) -> Optional[xr.Dataset]:
+    """
+    Opens specific variables from a remote Zarr dataset to minimize HTTP requests.
+    Only loads the requested variables instead of the entire dataset.
+    """
+    import multiprocessing as mp
+    import threading
+    process_name = mp.current_process().name if mp.current_process() else "unknown"
+    thread_name = threading.current_thread().name
+    
+    logger.info(
+        f"🔍 ZARR OPEN [{process_name}:{thread_name}] Job {job_id}: "
+        f"Opening SPECIFIC variables {variable_names} from Zarr: {zarr_store_url}"
+    )
+
+    if get_trusted_manifest is None or VerifyingChunkMapper is None:
+        logger.critical(
+            f"Job {job_id}: Hashing utilities not available. Cannot perform verified open."
+        )
+        return None
+
+    headers_for_manifest = storage_options.get("headers") if storage_options else None
+
+    trusted_manifest = await get_trusted_manifest(
+        zarr_store_url=zarr_store_url,
+        claimed_manifest_content_hash=claimed_manifest_content_hash,
+        miner_hotkey_ss58=miner_hotkey_ss58,
+        headers=headers_for_manifest,
+        job_id=job_id,
+    )
+
+    if trusted_manifest is None:
+        logger.error(f"Job {job_id}: Manifest verification failed for {zarr_store_url}")
+        return None
+
+    try:
+        zarr_store_url_cleaned = zarr_store_url + (
+            "/" if not zarr_store_url.endswith("/") and zarr_store_url.endswith(".zarr") else ""
+        )
+        if not zarr_store_url_cleaned.endswith("/"):
+            zarr_store_url_cleaned += "/"
+
+        protocol = zarr_store_url_cleaned.split("://")[0]
+        http_fs_kwargs = {}
+        if storage_options and "headers" in storage_options:
+            http_fs_kwargs["headers"] = storage_options["headers"]
+        http_fs_kwargs["ssl"] = storage_options.get("ssl", False) if storage_options else False
+
+        fs = fsspec.filesystem(protocol, **http_fs_kwargs)
+        verifying_mapper = VerifyingChunkMapper(
+            root=zarr_store_url_cleaned,
+            fs=fs,
+            trusted_manifest=trusted_manifest,
+            job_id_for_logging=job_id,
+        )
+
+        is_consolidated = ".zmetadata" in trusted_manifest.get("files", {})
+        
+        # Open only specific variables to minimize data transfer
+        loop = asyncio.get_running_loop()
+        dataset = await loop.run_in_executor(
+            None,
+            lambda: xr.open_zarr(
+                verifying_mapper,
+                consolidated=is_consolidated,
+                decode_times=True,
+                mask_and_scale=True,
+                chunks="auto",
+            )[variable_names]  # Only load requested variables
+        )
+
+        if dataset is not None:
+            logger.success(f"Job {job_id}: ✅ Successfully opened {len(variable_names)} variables from Zarr")
+            return dataset
+        else:
+            logger.error(f"Job {job_id}: Failed to open specific variables from Zarr")
+            return None
+
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error opening variable-specific Zarr: {e}")
+        return None
+
+
 async def open_verified_remote_zarr_dataset(
     zarr_store_url: str,
     claimed_manifest_content_hash: str,
@@ -367,7 +497,16 @@ async def open_verified_remote_zarr_dataset(
     3. Opens the Zarr store using xarray with this verifying mapper.
     Returns an xarray.Dataset if successful, None otherwise.
     """
-    logger.info(f"Job {job_id}: Attempting VERIFIED open for Zarr: {zarr_store_url}")
+    import multiprocessing as mp
+    import threading
+    process_name = mp.current_process().name if mp.current_process() else "unknown"
+    thread_name = threading.current_thread().name
+    
+    logger.info(
+        f"🔍 ZARR OPEN FULL [{process_name}:{thread_name}] Job {job_id}: "
+        f"Attempting VERIFIED open for Zarr: {zarr_store_url}"
+    )
+    # removed code marker
 
     if get_trusted_manifest is None or VerifyingChunkMapper is None:
         logger.critical(
@@ -421,9 +560,11 @@ async def open_verified_remote_zarr_dataset(
             f"Job {job_id}: VerifyingChunkMapper created for {zarr_store_url_cleaned}."
         )
 
+        # Detect consolidated heuristically: prefer presence of .zmetadata on server if available in listing,
+        # but don't rely solely on manifest contents since many manifests exclude metadata files.
         is_consolidated = ".zmetadata" in trusted_manifest.get("files", {})
         logger.info(
-            f"Job {job_id}: Store determined to be consolidated from manifest: {is_consolidated}"
+            f"Job {job_id}: Initial consolidated guess from manifest: {is_consolidated}"
         )
 
         loop = asyncio.get_running_loop()
@@ -433,6 +574,38 @@ async def open_verified_remote_zarr_dataset(
             verifying_mapper,
             is_consolidated,
         )
+        if dataset is None:
+            # Retry with opposite consolidated flag to handle incorrect guess without extra network I/O
+            logger.info(
+                f"Job {job_id}: Retrying xr.open_zarr with consolidated={not is_consolidated}"
+            )
+            try:
+                import traceback as _tb
+                logger.error(
+                    f"Job {job_id}: First xr.open_zarr returned None (consolidated={is_consolidated}).\nStack:\n" + ''.join(_tb.format_stack(limit=16))
+                )
+            except Exception:
+                pass
+            try:
+                dataset = await loop.run_in_executor(
+                    None,
+                    _synchronous_open_with_verifying_mapper,
+                    verifying_mapper,
+                    (not is_consolidated),
+                )
+            except Exception as retry_exc:
+                logger.error(
+                    f"Job {job_id}: Retry open_zarr failed: {retry_exc}",
+                    exc_info=True,
+                )
+        if dataset is None:
+            try:
+                import traceback as _tb
+                logger.error(
+                    f"Job {job_id}: Second xr.open_zarr returned None (consolidated={not is_consolidated}).\nStack:\n" + ''.join(_tb.format_stack(limit=16))
+                )
+            except Exception:
+                pass
 
         if dataset is not None:
             logger.info(
@@ -443,11 +616,18 @@ async def open_verified_remote_zarr_dataset(
             logger.error(
                 f"Job {job_id}: Opening Zarr with VerifyingChunkMapper returned None for {zarr_store_url}"
             )
-            return None
+            set_last_verified_open_error(job_id, "open_with_verifying_mapper returned None")
+            # Strict: fail immediately (no fallback)
+            raise RuntimeError("open_with_verifying_mapper returned None")
 
     except Exception as e:
         logger.error(
             f"Job {job_id}: Error in open_verified_remote_zarr_dataset (post-manifest check) for {zarr_store_url}: {e}",
             exc_info=True,
         )
-        return None
+        try:
+            set_last_verified_open_error(job_id, f"exception: {e}")
+        except Exception:
+            pass
+        # Strict: re-raise so upstream treats as failure (no fallback)
+        raise

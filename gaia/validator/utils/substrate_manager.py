@@ -10,7 +10,7 @@ from typing import Optional, Any, Dict, List
 from contextlib import contextmanager
 from fiber.chain.interface import get_substrate
 from substrateinterface import SubstrateInterface
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -38,10 +38,13 @@ class ProcessIsolatedSubstrate:
     @property
     def url(self) -> str:
         """URL property for compatibility with existing code."""
+        # CRITICAL FIX: Always prioritize explicit chain_endpoint over network defaults
         if self.chain_endpoint and self.chain_endpoint.strip():
-            return self.chain_endpoint.strip()
+            endpoint = self.chain_endpoint.strip()
+            logger.debug(f"Using explicit chain_endpoint: {endpoint} (network: {self.subtensor_network})")
+            return endpoint
 
-        # Construct default URL based on network
+        # Fallback to network-based defaults only when no explicit endpoint provided
         if self.subtensor_network == "finney":
             return "wss://entrypoint-finney.opentensor.ai:443"
         elif self.subtensor_network == "test":
@@ -121,9 +124,15 @@ try:
     
     from fiber.chain.interface import get_substrate
     
-    if "{self.chain_endpoint}" and "{self.chain_endpoint}".strip():
-        substrate = get_substrate(subtensor_network="{self.subtensor_network}", subtensor_address="{self.chain_endpoint}")
+    # DEBUG: Log what endpoint we're actually using in subprocess
+    endpoint = "{self.chain_endpoint}".strip() if "{self.chain_endpoint}" else ""
+    print(f"DEBUG SUBPROCESS: network='{self.subtensor_network}', endpoint='" + endpoint + "'", file=sys.stderr)
+    
+    if endpoint:
+        print(f"DEBUG SUBPROCESS: Using explicit endpoint: " + endpoint, file=sys.stderr)
+        substrate = get_substrate(subtensor_network="{self.subtensor_network}", subtensor_address=endpoint)
     else:
+        print(f"DEBUG SUBPROCESS: Using network default for: {self.subtensor_network}", file=sys.stderr)
         substrate = get_substrate(subtensor_network="{self.subtensor_network}")
     
     params = {repr(params)}
@@ -217,12 +226,17 @@ try:
     
     from fiber.chain.interface import get_substrate
     
+    # DEBUG: Log what endpoint we're actually using in subprocess
+    endpoint = "{self.chain_endpoint}".strip() if "{self.chain_endpoint}" else ""
+    print(f"DEBUG SUBPROCESS RPC: network='{self.subtensor_network}', endpoint='" + endpoint + "'", file=sys.stderr)
     print(f"DEBUG: Connecting to substrate...", file=sys.stderr)
     connection_start = time.time()
     
-    if "{self.chain_endpoint}" and "{self.chain_endpoint}".strip():
-        substrate = get_substrate(subtensor_network="{self.subtensor_network}", subtensor_address="{self.chain_endpoint}")
+    if endpoint:
+        print(f"DEBUG SUBPROCESS RPC: Using explicit endpoint: " + endpoint, file=sys.stderr)
+        substrate = get_substrate(subtensor_network="{self.subtensor_network}", subtensor_address=endpoint)
     else:
+        print(f"DEBUG SUBPROCESS RPC: Using network default for: {self.subtensor_network}", file=sys.stderr)
         substrate = get_substrate(subtensor_network="{self.subtensor_network}")
     
     connection_time = time.time() - connection_start
@@ -555,8 +569,11 @@ class SubstrateManager:
                         subtensor_network=self.subtensor_network,
                         chain_endpoint=self.chain_endpoint,
                     )
-                    logger.debug(
+                    logger.info(
                         f"🛡️ Fresh process-isolated substrate connection #{self._connection_count} created"
+                        f"\n   Network: {self.subtensor_network}"
+                        f"\n   Endpoint: {self.chain_endpoint}"
+                        f"\n   Will use URL: {self._current_connection.url}"
                     )
                 else:
                     # Create regular connection

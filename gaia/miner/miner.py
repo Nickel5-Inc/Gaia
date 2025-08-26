@@ -2,7 +2,7 @@ import os
 import sys  # Add sys import
 import traceback  # Add traceback import
 import subprocess  # For managing inference server subprocess
-import atexit  # To ensure inference server is stopped
+  # To ensure inference server is stopped
 import time  # For health check delays
 import httpx  # For health checking inference server
 from urllib.parse import urlparse  # To parse service URL
@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 import argparse
 from fiber import SubstrateInterface
 import uvicorn
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from fiber.encrypted.miner import server as fiber_server
 from fiber.encrypted.miner.core import configuration
 from fiber.encrypted.miner.middleware import configure_extra_logging_middleware
@@ -147,24 +147,16 @@ class Miner:
             else int(os.getenv("PUBLIC_PORT", 33333))
         )
         # Load chain endpoint from args or env (CLI > ENV > Default)
-        # Check if args.subtensor and args.subtensor.chain_endpoint exist and were provided via CLI
-        cli_chain_endpoint = None
-        if hasattr(args, "subtensor") and hasattr(args.subtensor, "chain_endpoint"):
-            cli_chain_endpoint = (
-                args.subtensor.chain_endpoint
-            )  # Will be None if not provided via CLI (due to default=None)
-
+        # Handle dot notation arguments properly
+        cli_chain_endpoint = getattr(args, 'subtensor.chain_endpoint', None)
         self.subtensor_chain_endpoint = (
             cli_chain_endpoint
             if cli_chain_endpoint is not None
             else os.getenv("SUBTENSOR_ADDRESS", "wss://test.finney.opentensor.ai:443/")
         )
 
-        # Load chain network from args or env (CLI > ENV > Default)
-        cli_network = None
-        if hasattr(args, "subtensor") and hasattr(args.subtensor, "network"):
-            cli_network = args.subtensor.network  # Will be None if not provided via CLI
-
+        # Handle dot notation arguments properly
+        cli_network = getattr(args, 'subtensor.network', None)
         self.subtensor_network = (
             cli_network
             if cli_network is not None
@@ -884,9 +876,9 @@ class Miner:
                     if current_time - req_time < 60
                 ]
 
-                # Check rate limit (max 100 requests per minute per IP)
+                # Check rate limit (increased for comprehensive scoring)
                 max_requests_per_minute = int(
-                    os.getenv("MINER_RATE_LIMIT_PER_MINUTE", "100")
+                    os.getenv("MINER_RATE_LIMIT_PER_MINUTE", "500")  # Increased from 100 to 500 for comprehensive scoring
                 )
                 if len(request_counts[client_ip]) >= max_requests_per_minute:
                     self.logger.warning(

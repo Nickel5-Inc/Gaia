@@ -31,67 +31,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-async def prepare_input_batch_from_payload(
-    payload_str: str, config: Dict[str, Any]
-) -> Optional[Batch]:
-    """
-    Deserializes a base64 encoded, pickled Aurora Batch object from a JSON payload string.
-    The payload_str is expected to be a JSON string containing a "serialized_aurora_batch" field.
-    """
-    try:
-        # Use high-performance JSON parsing
-        payload_dict = loads(payload_str)
-        if JSON_PERFORMANCE_AVAILABLE:
-            logger.debug("Using orjson for inference payload JSON parsing")
 
-        # Expect "batch_data" from WeatherTask
-        if "batch_data" not in payload_dict:
-            logger.error("'batch_data' field missing in the JSON payload.")
-            return None
-
-        serialized_batch_b64 = payload_dict["batch_data"]
-        if not isinstance(serialized_batch_b64, str):
-            logger.error("'batch_data' must be a base64 encoded string.")
-            return None
-
-        logger.debug("Decoding base64 serialized batch...")
-        pickled_batch_bytes = base64.b64decode(serialized_batch_b64)
-
-        logger.debug("Unpickling batch data...")
-        deserialized_batch = pickle.loads(pickled_batch_bytes)
-
-        if _AURORA_AVAILABLE:
-            if not isinstance(deserialized_batch, Batch):  # type: ignore
-                logger.error(
-                    f"Deserialized object is not an Aurora Batch. Type: {type(deserialized_batch)}"
-                )
-                return None
-        elif deserialized_batch is None:  # Basic check if Aurora not available
-            logger.error("Deserialized batch is None.")
-            return None
-
-        logger.info("Successfully deserialized input Aurora Batch.")
-        return deserialized_batch
-
-    except Exception as e:  # Catch all JSON parsing exceptions
-        logger.error(f"JSON parsing error in payload: {e}")
-        return None
-    except base64.binascii.Error as e:
-        logger.error(f"Base64 decoding error: {e}")
-        return None
-    except pickle.UnpicklingError as e:
-        logger.error(f"Unpickling error: {e}")
-        return None
-    except (
-        TypeError
-    ) as e:  # Catches potential errors if data isn't bytes for b64decode or pickle.loads
-        logger.error(f"Type error during deserialization: {e}")
-        return None
-    except Exception as e:
-        logger.error(
-            f"Unexpected error in prepare_input_batch_from_payload: {e}", exc_info=True
-        )
-        return None
 
 
 # Commenting out serialize_prediction_step as it seems to be for an older HTTP flow

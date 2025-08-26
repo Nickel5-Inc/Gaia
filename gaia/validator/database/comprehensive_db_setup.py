@@ -33,7 +33,7 @@ from dataclasses import dataclass
 project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -84,14 +84,7 @@ class ComprehensiveDatabaseSetup:
         self.alembic_config_path = project_root / "alembic_validator.ini"
         self.migrations_dir = project_root / "alembic" / "versions"
 
-        logger.info(f"🔧 Comprehensive Database Setup initialized")
-        logger.info(
-            f"   System: {self.system_info['os']} {self.system_info['version']}"
-        )
-        logger.info(
-            f"   PostgreSQL: {self.postgres_info.get('version', 'Not detected')}"
-        )
-        logger.info(f"   Test Mode: {self.test_mode}")
+        logger.debug(f"Database setup initialized - {self.system_info['os']} {self.system_info['version']}, PostgreSQL {self.postgres_info.get('version', 'unknown')}, test mode: {self.test_mode}")
 
     def _detect_system(self) -> Dict[str, str]:
         """Detect the operating system and version"""
@@ -186,7 +179,7 @@ class ComprehensiveDatabaseSetup:
         Main orchestration method for complete database setup.
         This is designed to be idempotent and self-healing.
         """
-        logger.info("🚀 Starting comprehensive database system setup...")
+        logger.info("🚀 Setting up database system...")
 
         # Check if the system is already perfectly configured. If so, we're done.
         if await self._check_if_already_configured():
@@ -239,33 +232,31 @@ class ComprehensiveDatabaseSetup:
         Check if the database system is already properly configured.
         Returns True if everything is working and no setup is needed.
         """
-        logger.info("🔍 Checking if database system is already configured...")
+        logger.debug("Checking if database system is already configured...")
 
         try:
             # Check 1: PostgreSQL service is running
             service_name = await self._detect_postgresql_service()
             if not service_name:
-                logger.info("❌ PostgreSQL service not detected")
+                logger.debug("PostgreSQL service not detected")
                 return False
 
             cmd = ["sudo", "systemctl", "is-active", service_name]
             success, stdout, stderr = await self._run_command(cmd, timeout=10)
             if not success or stdout.strip() != "active":
-                logger.info("❌ PostgreSQL service not running")
+                logger.debug("PostgreSQL service not running")
                 return False
 
             # Check 2: Database connection works
             if not await self._test_database_connection():
-                logger.info("❌ Database connection test failed")
+                logger.debug("Database connection test failed")
                 return False
 
             # Check 3: Application database exists
             cmd = ["sudo", "-u", "postgres", "psql", "-lqt"]
             success, stdout, stderr = await self._run_command(cmd, timeout=10)
             if not success or self.config.database_name not in stdout:
-                logger.info(
-                    f"❌ Application database '{self.config.database_name}' not found"
-                )
+                logger.debug(f"Application database '{self.config.database_name}' not found")
                 return False
 
             # Check 4: Alembic is set up
@@ -284,20 +275,20 @@ class ComprehensiveDatabaseSetup:
             )
             # PostgreSQL returns 't' for true, 'f' for false
             if not success or "t" not in stdout.strip().replace("exists", "").strip():
-                logger.info("❌ Alembic not configured")
+                logger.debug("Alembic not configured")
                 return False
 
             logger.info("✅ Database system is already properly configured!")
             return True
 
         except Exception as e:
-            logger.info(f"❌ Configuration check failed: {e}")
+            logger.debug(f"Configuration check failed: {e}")
             return False
 
     async def _ensure_postgresql_installed(self) -> bool:
         """Install PostgreSQL if not already installed"""
         if self.postgres_info["installed"]:
-            logger.info("✅ PostgreSQL already installed")
+            logger.debug("PostgreSQL already installed")
             return True
 
         logger.info("📦 Installing PostgreSQL...")
@@ -1388,14 +1379,10 @@ async def setup_comprehensive_database(
     Returns:
         bool: True if setup was successful, False otherwise
     """
-    logger.info("🚀 Starting Comprehensive Database Setup")
+    logger.info("🚀 Starting comprehensive database setup")
 
     try:
         setup_manager = ComprehensiveDatabaseSetup(config=config, test_mode=test_mode)
-
-        # Log initial status
-        status = setup_manager.get_status()
-        logger.info(f"📊 Initial Status: {json.dumps(status, indent=2)}")
 
         # Run the complete setup
         success = await setup_manager.setup_complete_database_system()
@@ -1419,11 +1406,9 @@ async def setup_comprehensive_database(
                 success = False
 
         if success:
-            logger.info("🎉 Comprehensive Database Setup completed successfully!")
+            logger.info("✅ Database setup completed successfully")
         else:
-            logger.error(
-                "💥 Comprehensive Database Setup FAILED, even after repair attempts."
-            )
+            logger.error("❌ Database setup failed, even after repair attempts")
 
         return success
 

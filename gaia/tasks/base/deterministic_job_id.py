@@ -2,7 +2,7 @@ import hashlib
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 

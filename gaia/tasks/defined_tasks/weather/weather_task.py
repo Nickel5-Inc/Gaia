@@ -7,6 +7,7 @@ import os
 import sys
 import importlib.util
 from pydantic import Field, ConfigDict
+import random
 
 # High-performance JSON operations for weather task
 try:
@@ -21,7 +22,7 @@ except ImportError:
         return json.loads(s)
 
 
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from gaia.tasks.base.task import Task
 from gaia.tasks.base.deterministic_job_id import DeterministicJobID
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
@@ -55,10 +56,7 @@ import tempfile
 import subprocess
 
 import boto3  # For R2
-from botocore.exceptions import (
-    ClientError as BotoClientError,
-)  # For R2 error handling, aliased to avoid conflict if other ClientError exists
-from . import weather_http_utils
+
 
 # Ensure blosc codec is available for zarr operations
 try:
@@ -124,7 +122,6 @@ from .processing.weather_logic import (
 from .hardening_integration import WeatherTaskHardeningMixin
 from .processing.weather_workers import (
     initial_scoring_worker,
-    finalize_scores_worker,
     cleanup_worker,
     run_inference_background,
     fetch_and_hash_gfs_task,
@@ -172,10 +169,11 @@ def _load_config(self):
         config["inference_steps"] * config["forecast_step_hours"]
     )
 
-    # Scoring Parameters
+    # OPTIMIZED DAY1 SCORING: Single lead time for fast quality control
+    # Day1 scoring focuses on quick validation, not comprehensive analysis
     config["initial_scoring_lead_hours"] = parse_int_list(
-        "WEATHER_INITIAL_SCORING_LEAD_HOURS", [6, 12]
-    )  # Day 0.25, 0.5
+        "WEATHER_INITIAL_SCORING_LEAD_HOURS", [12]
+    )  # Single 12-hour lead time for efficient QC
     # Progressive daily scoring: score each day from 1-10 as ERA5 data becomes available
     config["final_scoring_lead_hours"] = parse_int_list(
         "WEATHER_FINAL_SCORING_LEAD_HOURS",
@@ -312,25 +310,69 @@ def _load_config(self):
         "gs://weatherbench2/datasets/era5-hourly-climatology/1990-2019_6h_1440x721.zarr",
     )
 
-    # Day-1 Scoring Specific Configurations
-    default_day1_vars_levels = [
-        {"name": "z", "level": 500, "standard_name": "geopotential"},
-        {"name": "t", "level": 850, "standard_name": "temperature"},
+    # Comprehensive Scoring Configuration - All Variables and Pressure Levels (except static vars)
+    # Surface variables (no pressure level)
+    surface_vars = [
         {"name": "2t", "level": None, "standard_name": "2m_temperature"},
+        {"name": "10u", "level": None, "standard_name": "10m_u_component_of_wind"},
+        {"name": "10v", "level": None, "standard_name": "10m_v_component_of_wind"},
         {"name": "msl", "level": None, "standard_name": "mean_sea_level_pressure"},
+    ]
+    
+    # Atmospheric variables (will handle all pressure levels as dimensions)
+    atmospheric_vars = [
+        {"name": "t", "level": "all", "standard_name": "temperature"},
+        {"name": "u", "level": "all", "standard_name": "u_component_of_wind"},
+        {"name": "v", "level": "all", "standard_name": "v_component_of_wind"},
+        {"name": "q", "level": "all", "standard_name": "specific_humidity"},
+        {"name": "z", "level": "all", "standard_name": "geopotential"},
+    ]
+    
+    # Combine all variables (surface + atmospheric, excluding static vars)
+    # This gives us 9 total variables instead of 69 variable/level combinations
+    default_comprehensive_vars_levels = surface_vars + atmospheric_vars
+    
+    # OPTIMIZED DAY1 SCORING: Essential surface variables for quality control
+    # Focus on variables that can quickly validate atmospheric reasonableness and detect GFS cloning
+    default_day1_vars_levels = [
+        # Core surface variables - most important for immediate validation
+        {"name": "2t", "level": None, "standard_name": "2m_temperature"},      # Temperature patterns
+        {"name": "msl", "level": None, "standard_name": "mean_sea_level_pressure"},  # Pressure systems
+        {"name": "10u", "level": None, "standard_name": "10m_u_component_of_wind"},  # Wind patterns U - FIXED
+        {"name": "10v", "level": None, "standard_name": "10m_v_component_of_wind"},  # Wind patterns V - FIXED
+        # Single atmospheric level for vertical structure check
+        {"name": "z", "level": 500, "standard_name": "geopotential"},          # 500hPa geopotential height
     ]
     try:
         day1_vars_levels_json = os.getenv("WEATHER_DAY1_VARIABLES_LEVELS_JSON")
-        config["day1_variables_levels_to_score"] = (
-            loads(day1_vars_levels_json)
-            if day1_vars_levels_json
-            else default_day1_vars_levels
-        )
+        if day1_vars_levels_json:
+            config["day1_variables_levels_to_score"] = loads(day1_vars_levels_json)
+        else:
+            # Use optimized day1 scoring by default for fast quality control
+            # Set WEATHER_USE_COMPREHENSIVE_SCORING=true to enable full variable scoring (not recommended for day1)
+            use_comprehensive = os.getenv("WEATHER_USE_COMPREHENSIVE_SCORING", "false").lower() in ["true", "1", "yes"]
+            config["day1_variables_levels_to_score"] = (
+                default_comprehensive_vars_levels if use_comprehensive else default_day1_vars_levels
+            )
     except Exception:
         logger.warning(
-            "Invalid JSON for WEATHER_DAY1_VARIABLES_LEVELS_JSON. Using default."
+            "Invalid JSON for WEATHER_DAY1_VARIABLES_LEVELS_JSON. Using optimized day1 scoring."
         )
         config["day1_variables_levels_to_score"] = default_day1_vars_levels
+    
+    # Also set final scoring variables to use the same comprehensive list
+    try:
+        final_vars_levels_json = os.getenv("WEATHER_FINAL_SCORING_VARIABLES_LEVELS_JSON")
+        if final_vars_levels_json:
+            config["final_scoring_variables_levels"] = loads(final_vars_levels_json)
+        else:
+            # Use comprehensive scoring for final scoring as well
+            config["final_scoring_variables_levels"] = default_comprehensive_vars_levels
+    except Exception:
+        logger.warning(
+            "Invalid JSON for WEATHER_FINAL_SCORING_VARIABLES_LEVELS_JSON. Using comprehensive scoring."
+        )
+        config["final_scoring_variables_levels"] = default_comprehensive_vars_levels
 
     default_day1_clim_bounds = {
         "2t": (180, 340),  # Kelvin
@@ -367,11 +409,13 @@ def _load_config(self):
     config["day1_clone_penalty_gamma"] = float(
         os.getenv("WEATHER_DAY1_CLONE_PENALTY_GAMMA", "1.0")
     )
+    # OPTIMIZED DAY1 CLONE DETECTION: Thresholds for essential surface variables
     default_clone_delta_thresholds = {
-        "2t": 0.0025,  # (RMSE 0.1K)^2
-        "msl": 400,  # (RMSE 100Pa or 1hPa)^2
-        "z500": 100,  # (RMSE 100 m^2/s^2)^2 for geopotential
-        "t850": 0.04,  # (RMSE 0.5K)^2
+        "2t": 0.0025,    # (RMSE 0.05K)^2 - 2m temperature
+        "msl": 400,      # (RMSE 20Pa)^2 - mean sea level pressure  
+        "10u": 0.01,     # (RMSE 0.1 m/s)^2 - 10m U wind
+        "10v": 0.01,     # (RMSE 0.1 m/s)^2 - 10m V wind
+        "z500": 100,     # (RMSE 10 m)^2 - 500hPa geopotential height
     }
     try:
         clone_delta_json = os.getenv("WEATHER_DAY1_CLONE_DELTA_THRESHOLDS_JSON")
@@ -412,7 +456,7 @@ def _load_config(self):
 
     # Default to 6 hours
 
-    logger.info(f"WeatherTask configuration loaded: {config}")
+    logger.debug(f"WeatherTask configuration loaded with {len(config)} settings")
     return config
 
 
@@ -473,8 +517,6 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         self.initial_scoring_queue = asyncio.Queue()
         self.initial_scoring_worker_running = False
         self.initial_scoring_workers = []
-        self.final_scoring_worker_running = False
-        self.final_scoring_workers = []
         self.cleanup_worker_running = False
         self.cleanup_workers = []
         self.r2_cleanup_worker_running = False  # For R2 cleanup
@@ -485,16 +527,17 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         self.test_mode_run_scored_event = asyncio.Event()
         self.last_test_mode_run_id = None
 
+        # GPU INFERENCE CONCURRENCY: Controls concurrent inference operations on miners
+        # This is separate from scoring concurrency and remains relevant for GPU resource management
         self.gpu_semaphore = asyncio.Semaphore(
             self.config.get("max_concurrent_inferences", 1)
         )
 
-        era5_scoring_concurrency = int(
-            os.getenv("WEATHER_VALIDATOR_ERA5_SCORING_CONCURRENCY", "4")
-        )
-        self.era5_scoring_semaphore = asyncio.Semaphore(era5_scoring_concurrency)
+        # ERA5 SCORING: Sequential processing for CPU-intensive operations
+        # ERA5 scoring is CPU-bound (interpolation, MSE, ACC calculations) and doesn't benefit from asyncio concurrency
+        # The heavy computations already use asyncio.to_thread(), so asyncio-level parallelism adds overhead without benefit
         logger.info(
-            f"ERA5 scoring concurrency for validator set to: {era5_scoring_concurrency}"
+            "ERA5 scoring configured for sequential processing (CPU-intensive operations don't benefit from asyncio concurrency)"
         )
 
         # Configure file serving mode for miners
@@ -628,7 +671,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         # Initialize hardening system
         try:
             self.__init_hardening__()
-            logger.info("Weather task hardening system initialized successfully")
+            logger.debug("Weather task hardening system initialized")
         except Exception as hardening_error:
             logger.warning(f"Could not initialize hardening system: {hardening_error}")
             logger.info(
@@ -1851,17 +1894,28 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         """
         pass
 
+    async def initiate_fetch_retry_once(self, validator) -> None:
+        """
+        DEPRECATED: This function is part of the old retry system and is never called.
+        Only called from initiate_fetch_retry_loop which is also never called.
+        The new job-based pipeline handles retries differently.
+        Retry initiate-fetch for newest run stuck without any responses.
+        """
+        return  # Disabled - never called
+    async def initiate_fetch_retry_loop(self, validator) -> None:
+        """
+        DEPRECATED: This function is never called and uses the old retry system.
+        The new job-based pipeline handles retries through the worker retry mechanism.
+        Periodic retry loop to ensure initiate-fetch is sent for active runs.
+        """
+        return  # Disabled - never called
     async def validator_execute(self, validator):
         """
-        Orchestrates the weather forecast task for the validator:
-        1. Waits for the scheduled run time (e.g., daily post-00Z GFS availability).
-        2. Fetches necessary GFS analysis data (T=0h from 00Z run, T=-6h from previous 18Z run).
-        3. Serializes data and creates a run record in DB.
-        4. Queries miners with the payload (/weather-forecast-request).
-        5. Records miner acceptances in DB.
+        Simplified validator execution - only creates runs and enqueues orchestration jobs.
+        All actual work is handled by worker processes.
         """
         self.validator = validator
-        logger.info("Starting WeatherTask validator execution loop...")
+        logger.info("Starting simplified WeatherTask validator execution loop (orchestration only)...")
 
         if not self.initial_scoring_worker_running:
             # Apply global LRU cache limits to prevent unlimited memory growth during scoring
@@ -1873,8 +1927,6 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 logger.warning(f"Failed to apply global LRU cache limits: {e}")
 
             await self.start_background_workers(
-                num_initial_scoring_workers=1,
-                num_final_scoring_workers=1,
                 num_cleanup_workers=1,
             )
             logger.info("Started background workers for scoring and cleanup.")
@@ -1886,7 +1938,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         )
 
         if self.test_mode:
-            logger.warning("Running in TEST MODE: Execution will run once immediately.")
+            logger.warning("Running in TEST MODE: Execution will loop approximately every 30 minutes.")
 
         # Track recovery state to avoid too frequent recovery attempts
         last_recovery_time = 0
@@ -1901,80 +1953,15 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             3  # Allow multiple attempts per run in case of transient issues
         )
 
+        last_run_date = None
+        # In test mode, trigger a new run every ~30 minutes
+        test_run_interval_minutes = self.config.get("test_run_interval_minutes", 30)
+        last_test_run_started_at = None
+        
         while True:
             try:
                 await validator.update_task_status("weather", "active", "waiting")
-
-                # Perform gradual, non-blocking recovery every 5 minutes
-                current_time = time.time()
-                if current_time - last_recovery_time > recovery_interval:
-                    logger.debug("Performing periodic recovery check...")
-                    stale_run_processed = False
-                    try:
-                        # One-time backfill of scoring jobs from existing data (only runs if table is empty)
-                        await self._backfill_scoring_jobs_from_existing_data()
-                        # Sequential recovery - process one run at a time
-                        stale_run_processed = (
-                            await self._check_and_recover_incomplete_runs_sequential(
-                                processed_runs_this_session, max_attempts_per_run
-                            )
-                        )
-                        # Enhanced recovery with state consistency checks (includes original recovery)
-                        await self.enhanced_recovery_check()
-                        # Check for missing weather score rows
-                        missing_scores_result = (
-                            await self.check_and_build_missing_weather_scores()
-                        )
-                        if missing_scores_result["score_rows_created"] > 0:
-                            logger.info(
-                                f"Recovery: Built {missing_scores_result['score_rows_created']} missing weather score rows"
-                            )
-                        last_recovery_time = current_time
-                    except Exception as recovery_err:
-                        logger.warning(
-                            f"Error during periodic recovery: {recovery_err}"
-                        )
-
-                    # If any run was processed, continue recovery loop to work through backlog
-                    if stale_run_processed in ["stale_processed", "run_processed"]:
-                        # Check if we've hit the session limit
-                        total_attempts = sum(processed_runs_this_session.values())
-                        if total_attempts >= max_runs_per_session:
-                            logger.info(
-                                f"Made {total_attempts} recovery attempts this session, reaching limit - proceeding to normal scheduling"
-                            )
-                            processed_runs_this_session.clear()
-                        else:
-                            if stale_run_processed == "stale_processed":
-                                logger.info(
-                                    "Stale run was processed - will check for more incomplete runs in 30 seconds"
-                                )
-                            else:
-                                logger.info(
-                                    "Run recovery attempted - will check for more incomplete runs in 30 seconds"
-                                )
-                            # Don't reset to 0 - that causes continuous recovery loops that interrupt active scoring
-                            # Instead, use a shorter interval for when we're actively recovering runs
-                            last_recovery_time = current_time - (
-                                recovery_interval - 30
-                            )  # Check again in 30 seconds
-                            await asyncio.sleep(
-                                0.1
-                            )  # Yield CPU time to other async tasks
-                            continue  # Go back to top of loop
-                    elif stale_run_processed == "no_more_runs":
-                        logger.info(
-                            "No more incomplete runs to process - proceeding to normal scheduling"
-                        )
-                        processed_runs_this_session.clear()  # Reset for next session
-                    else:
-                        # No runs processed this cycle or unexpected return value, add a small sleep
-                        if stale_run_processed is not False:
-                            logger.debug(
-                                f"Unexpected recovery return value: {stale_run_processed}"
-                            )
-                        await asyncio.sleep(0.1)
-
+                
                 now_utc = datetime.now(timezone.utc)
 
                 if not self.test_mode:
@@ -1991,29 +1978,63 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     else:
                         next_run_trigger_time = target_run_time_today
 
+                    # Add random jitter (0-30 minutes) to spread validator start times
+                    jitter_minutes = random.randint(0, 30)
+                    next_run_trigger_time = next_run_trigger_time + timedelta(minutes=jitter_minutes)
+
                     wait_seconds = (next_run_trigger_time - now_utc).total_seconds()
                     logger.info(
-                        f"Current time: {now_utc}. Next weather run scheduled at {next_run_trigger_time}. Waiting for {wait_seconds:.2f} seconds."
+                        f"Current time: {now_utc}. Next weather run scheduled at {next_run_trigger_time} (jitter={jitter_minutes}m). Waiting for {wait_seconds:.2f} seconds."
                     )
                     if wait_seconds > 0:
                         await asyncio.sleep(wait_seconds)
                     now_utc = datetime.now(timezone.utc)
 
+                # Determine if we should create a new run
+                should_create_run = False
+                
+                if self.test_mode:
+                    # Test mode: create a new run every configured interval
+                    if (
+                        last_test_run_started_at is None
+                        or (now_utc - last_test_run_started_at).total_seconds() >= test_run_interval_minutes * 60
+                    ):
+                        should_create_run = True
+                        logger.info(
+                            f"TEST MODE: Creating run (interval {test_run_interval_minutes} minutes)"
+                        )
+                elif (
+                    last_run_date is None or 
+                    last_run_date < now_utc.date()
+                ):
+                    # Production: run once per day at scheduled time
+                    should_create_run = True
+                    last_run_date = now_utc.date()
+                    
+                if not should_create_run:
+                    # Not time to run yet, continue waiting
+                    await asyncio.sleep(60)
+                    continue
+                    
                 logger.info(
-                    f"Initiating weather forecast run triggered around {now_utc}..."
+                    f"Time to create weather forecast run at {now_utc}"
                 )
                 await validator.update_task_status(
-                    "weather", "processing", "initializing_run"
+                    "weather", "processing", "creating_run"
                 )
 
                 if self.test_mode:
-                    logger.info(
-                        f"Test mode enabled. Adjusting GFS init time by -8 days from {now_utc.strftime('%Y-%m-%d %H:%M')} UTC."
+                    # Centralize hindcast shift configuration via util_time.get_effective_gfs_init
+                    # Default shift is -7 days; configurable via config fields test_hindcast_days/hours.
+                    from gaia.tasks.defined_tasks.weather.pipeline.steps.util_time import (
+                        get_effective_gfs_init,
                     )
-                    now_utc -= timedelta(days=8)
-                    logger.info(
-                        f"Adjusted GFS init time for test mode: {now_utc.strftime('%Y-%m-%d %H:%M')} UTC."
-                    )
+                    shifted = get_effective_gfs_init(self, now_utc)
+                    if shifted != now_utc:
+                        logger.info(
+                            f"Test mode enabled. Hindcast shift applied: {now_utc.strftime('%Y-%m-%d %H:%M')} -> {shifted.strftime('%Y-%m-%d %H:%M')} UTC"
+                        )
+                        now_utc = shifted
 
                 gfs_t0_run_time = now_utc.replace(
                     hour=0, minute=0, second=0, microsecond=0
@@ -2032,14 +2053,36 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 SELECT id, status, run_initiation_time
                 FROM weather_forecast_runs 
                 WHERE gfs_init_time_utc = :gfs_init 
-                AND status NOT IN ('completed', 'error', 'stale_abandoned', 'restarted_as_new_run', 'recovery_failed')
+                AND status NOT IN ('completed', 'error', 'stale_abandoned')
                 ORDER BY run_initiation_time DESC
                 LIMIT 1
                 """
-                existing_run = await self.db_manager.fetch_one(
-                    existing_run_query, {"gfs_init": gfs_t0_run_time}
-                )
+                # Route via validator DB accessor to avoid main-loop blocking
+                try:
+                    req_id = str(uuid.uuid4())
+                    fut = asyncio.get_event_loop().create_future()
+                    if hasattr(self, "validator") and hasattr(self.validator, "_db_results"):
+                        self.validator._db_results[req_id] = fut
+                        await self.validator._db_work_queue.put(
+                            {
+                                "id": req_id,
+                                "kind": "fetch_one",
+                                "query": existing_run_query,
+                                "params": {"gfs_init": gfs_t0_run_time},
+                            }
+                        )
+                        existing_run = await fut
+                    else:
+                        existing_run = await self.db_manager.fetch_one(
+                            existing_run_query, {"gfs_init": gfs_t0_run_time}
+                        )
+                except Exception:
+                    existing_run = await self.db_manager.fetch_one(
+                        existing_run_query, {"gfs_init": gfs_t0_run_time}
+                    )
 
+                run_id = None
+                
                 if existing_run:
                     run_id = existing_run["id"]
                     existing_status = existing_run["status"]
@@ -2053,788 +2096,104 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
                     if run_age_hours > 24:
                         logger.warning(
-                            f"[Run {run_id}] Existing run is too old ({run_age_hours:.1f}h), marking as stale and creating new run"
+                            f"[Run {run_id}] Existing run is too old ({run_age_hours:.1f}h), marking as stale"
                         )
-                        await _update_run_status(self, run_id, "stale_abandoned")
-                        existing_run = None  # Will create new run below
+                        await self.db_manager.execute(
+                            "UPDATE weather_forecast_runs SET status = 'stale_abandoned' WHERE id = :id",
+                            {"id": run_id}
+                        )
+                        run_id = None  # Will create new run below
                     else:
                         logger.info(
-                            f"[Run {run_id}] Reusing existing active run. Continuing with validator_score to check progress."
+                            f"[Run {run_id}] Reusing existing active run, will enqueue orchestration job."
                         )
-                        await self.validator_score()
 
-                        if self.test_mode:
-                            logger.info(
-                                "TEST MODE: Found existing run. Exiting validator_execute loop."
-                            )
-                            break
-                        else:
-                            # Continue loop to wait for next scheduled time
-                            continue
 
-                # Only create new run if no existing run found
-                if not existing_run:
-                    run_id = None
+
+
+                # Create new run if needed
+                if not run_id:
                     try:
                         run_insert_query = """
                             INSERT INTO weather_forecast_runs (run_initiation_time, target_forecast_time_utc, gfs_init_time_utc, status)
                             VALUES (:init_time, :target_time, :gfs_init, :status)
                             RETURNING id
                         """
-                        effective_forecast_start_time = gfs_t0_run_time
                         run_record = await self.db_manager.fetch_one(
                             run_insert_query,
                             {
                                 "init_time": now_utc,
-                                "target_time": effective_forecast_start_time,
-                                "gfs_init": effective_forecast_start_time,
-                                "status": "fetching_gfs",
+                                "target_time": gfs_t0_run_time,
+                                "gfs_init": gfs_t0_run_time,
+                                "status": "created",
                             },
                         )
 
                         if run_record and "id" in run_record:
                             run_id = run_record["id"]
                             logger.info(
-                                f"[Run {run_id}] Created NEW weather_forecast_runs record with ID: {run_id}"
-                            )
-                        else:
-                            logger.error(
-                                "Failed to retrieve run_id using fetch_one after insert."
-                            )
-                            raise RuntimeError(
-                                "Failed to create run_id for forecast run."
+                                f"[Run {run_id}] Created NEW weather_forecast_runs record"
                             )
 
-                    except Exception as db_err:
-                        logger.error(
-                            f"Failed to create forecast run record in DB: {db_err}",
-                            exc_info=True,
-                        )
-                        if self.test_mode:
-                            logger.warning(
-                                "TEST MODE: DB error during run_id creation. Exiting validator_execute loop."
-                            )
-                            break
                         else:
+                            logger.error("Failed to create run record")
                             await asyncio.sleep(60)
                             continue
+                            
+                    except Exception as e:
+                        logger.error(f"Error creating run: {e}", exc_info=True)
+                        await asyncio.sleep(60)
+                        continue
 
-                    await validator.update_task_status(
-                        "weather", "processing", "sending_fetch_requests"
-                    )
-                    await _update_run_status(self, run_id, "sending_fetch_requests")
-
-                    payload_data = WeatherInitiateFetchData(
-                        forecast_start_time=gfs_t0_run_time,  # T=0h time
-                        previous_step_time=gfs_t_minus_6_run_time,  # T=-6h time
-                        validator_hotkey=(
-                            validator.keypair.ss58_address
-                            if validator.keypair
-                            else None
-                        ),
-                    )
-                    payload_dict = payload_data.model_dump(mode="json")
-
-                    payload = {"nonce": str(uuid.uuid4()), "data": payload_dict}
-
-                    logger.info(
-                        f"[Run {run_id}] Querying miners with weather initiate fetch request (Endpoint: /weather-initiate-fetch)... Payload size approx: {len(dumps(payload))} bytes"
-                    )
-                    responses = await validator.query_miners(
-                        payload=payload, endpoint="/weather-initiate-fetch"
-                    )
-                    logger.info(
-                        f"[Run {run_id}] Received {len(responses)} initial responses from miners for fetch initiation."
-                    )
-
-                    await validator.update_task_status(
-                        "weather", "processing", "recording_acceptances"
-                    )
-                    accepted_count = 0
-                    for miner_hotkey, response_data in responses.items():
-                        try:
-                            miner_response = response_data
-                            if (
-                                isinstance(response_data, dict)
-                                and "text" in response_data
-                            ):
-                                try:
-                                    miner_response = loads(response_data["text"])
-                                    logger.debug(
-                                        f"[Run {run_id}] Parsed JSON from response text for {miner_hotkey}: {miner_response}"
-                                    )
-                                except (Exception, TypeError) as json_err:
-                                    logger.warning(
-                                        f"[Run {run_id}] Failed to parse response text for {miner_hotkey}: {json_err}"
-                                    )
-                                    miner_response = {
-                                        "status": "parse_error",
-                                        "message": str(json_err),
-                                    }
-
-                            if (
-                                isinstance(miner_response, dict)
-                                and miner_response.get("status")
-                                == WeatherTaskStatus.FETCH_ACCEPTED
-                                and miner_response.get("job_id")
-                            ):
-                                miner_uid_result = await self.db_manager.fetch_one(
-                                    "SELECT uid FROM node_table WHERE hotkey = :hk",
-                                    {"hk": miner_hotkey},
-                                )
-                                miner_uid = (
-                                    miner_uid_result["uid"] if miner_uid_result else -1
-                                )
-
-                                if miner_uid == -1:
-                                    logger.warning(
-                                        f"[Run {run_id}] Miner {miner_hotkey} accepted but UID not found in node_table."
-                                    )
-                                    continue
-
-                                miner_job_id = miner_response.get("job_id")
-
-                                insert_resp_query = """
-                                       INSERT INTO weather_miner_responses
-                                        (run_id, miner_uid, miner_hotkey, response_time, status, job_id)
-                                        VALUES (:run_id, :uid, :hk, :resp_time, :status, :job_id)
-                                       ON CONFLICT (run_id, miner_uid) DO UPDATE SET
-                                        response_time = EXCLUDED.response_time, 
-                                        status = EXCLUDED.status,
-                                        job_id = EXCLUDED.job_id
-                                  """
-                                await self.db_manager.execute(
-                                    insert_resp_query,
-                                    {
-                                        "run_id": run_id,
-                                        "uid": miner_uid,
-                                        "hk": miner_hotkey,
-                                        "resp_time": datetime.now(timezone.utc),
-                                        "status": "fetch_initiated",
-                                        "job_id": miner_job_id,
-                                    },
-                                )
-                                accepted_count += 1
-                                logger.debug(
-                                    f"[Run {run_id}] Recorded acceptance from Miner UID {miner_uid} ({miner_hotkey}). Miner Job ID: {miner_job_id}"
-                                )
-                            else:
-                                logger.warning(
-                                    f"[Run {run_id}] Miner {miner_hotkey} did not return successful 'fetch_accepted' status or job_id. Response: {miner_response}"
-                                )
-                        except Exception as resp_proc_err:
-                            logger.error(
-                                f"[Run {run_id}] Error processing response from {miner_hotkey}: {resp_proc_err}",
-                                exc_info=True,
-                            )
-
-                    logger.info(
-                        f"[Run {run_id}] Completed processing initiate fetch responses. {accepted_count} miners accepted."
-                    )
-                    await _update_run_status(self, run_id, "awaiting_input_hashes")
-
-                    wait_minutes = self.config.get("validator_hash_wait_minutes", 10)
-                    if self.test_mode:
-                        original_wait = wait_minutes
-                        wait_minutes = 1
-                        logger.info(
-                            f"TEST MODE: Using shortened wait time of {wait_minutes} minute(s) instead of {original_wait} minutes"
-                        )
-                    logger.info(
-                        f"[Run {run_id}] Waiting for {wait_minutes} minutes for miners to fetch GFS and compute input hash..."
-                    )
-                    await validator.update_task_status(
-                        "weather", "waiting", "miner_fetch_wait"
-                    )
-                    await asyncio.sleep(wait_minutes * 60)
-                    logger.info(
-                        f"[Run {run_id}] Wait finished. Proceeding with input hash verification."
-                    )
-                    await validator.update_task_status(
-                        "weather", "processing", "verifying_hashes"
-                    )
-                    await _update_run_status(self, run_id, "verifying_input_hashes")
-
-                    responses_to_check_query = """
-                        SELECT id, miner_hotkey, job_id
-                        FROM weather_miner_responses
-                        WHERE run_id = :run_id
-                          AND (
-                              status = 'fetch_initiated' OR
-                              (status = 'retry_scheduled' AND next_retry_time IS NOT NULL AND next_retry_time <= :now)
-                          )
-                    """
-                    miners_to_poll = await self.db_manager.fetch_all(
-                        responses_to_check_query,
-                        {"run_id": run_id, "now": datetime.now(timezone.utc)},
-                    )
-                    logger.info(
-                        f"[Run {run_id}] Polling {len(miners_to_poll)} miners for input hash status."
-                    )
-
-                    miner_hash_results = {}
-                    polling_tasks = []
-
-                    async def _poll_single_miner(response_rec):
-                        resp_id = response_rec["id"]
-                        miner_hk = response_rec["miner_hotkey"]
-                        miner_job_id = response_rec["job_id"]
-                        logger.debug(
-                            f"[Run {run_id}] Polling miner {miner_hk[:8]} (Job: {miner_job_id}) for input status using query_miners."
-                        )
-
-                        node = validator.metagraph.nodes.get(miner_hk)
-                        if not node:
-                            logger.warning(
-                                f"[Run {run_id}] Miner {miner_hk[:8]} not found in metagraph. Cannot poll."
-                            )
-                            return resp_id, {
-                                "status": "validator_poll_error",
-                                "message": f"Miner {miner_hk[:8]} not found in metagraph",
-                            }
-                        elif not node.ip:
-                            logger.warning(
-                                f"[Run {run_id}] Miner {miner_hk[:8]} missing IP address in metagraph. Cannot poll."
-                            )
-                            return resp_id, {
-                                "status": "validator_poll_error",
-                                "message": f"Miner {miner_hk[:8]} missing IP address in metagraph",
-                            }
-                        elif not node.port:
-                            logger.warning(
-                                f"[Run {run_id}] Miner {miner_hk[:8]} missing port in metagraph. Cannot poll."
-                            )
-                            return resp_id, {
-                                "status": "validator_poll_error",
-                                "message": f"Miner {miner_hk[:8]} missing port in metagraph",
-                            }
-
-                        try:
-                            status_payload_data = WeatherGetInputStatusData(
-                                job_id=miner_job_id
-                            )
-                            status_payload = {
-                                "nonce": str(uuid.uuid4()),
-                                "data": status_payload_data.model_dump(),
-                            }
-                            endpoint = "/weather-get-input-status"
-
-                            all_responses = await validator.query_miners(
-                                payload=status_payload,
-                                endpoint=endpoint,
-                                hotkeys=[miner_hk],
-                            )
-
-                            status_response = all_responses.get(miner_hk)
-
-                            if status_response:
-                                parsed_response = status_response
-                                if (
-                                    isinstance(status_response, dict)
-                                    and "text" in status_response
-                                ):
-                                    try:
-                                        parsed_response = loads(status_response["text"])
-                                    except (Exception, TypeError) as json_err:
-                                        logger.warning(
-                                            f"[Run {run_id}] Failed to parse JSON response from miner {miner_hk[:8]} (IP: {node.ip}:{node.port}): {json_err}. Raw response: {status_response.get('text', '')[:200]}"
-                                        )
-                                        parsed_response = {
-                                            "status": "parse_error",
-                                            "message": f"JSON parse error from miner {miner_hk[:8]}: {type(json_err).__name__}: {str(json_err)}",
-                                        }
-
-                                logger.debug(
-                                    f"[Run {run_id}] Received status from {miner_hk[:8]}: {parsed_response}"
-                                )
-                                return resp_id, parsed_response
-                            else:
-                                logger.warning(
-                                    f"[Run {run_id}] No response received from miner {miner_hk[:8]} (IP: {node.ip}:{node.port}) via query_miners endpoint {endpoint}."
-                                )
-                                return resp_id, {
-                                    "status": "validator_poll_failed",
-                                    "message": f"No response from miner {miner_hk[:8]} at {node.ip}:{node.port} on {endpoint}",
-                                }
-
-                        except asyncio.TimeoutError as timeout_err:
-                            logger.error(
-                                f"[Run {run_id}] Timeout polling miner {miner_hk[:8]} (IP: {node.ip}:{node.port}): {timeout_err}"
-                            )
-                            return resp_id, {
-                                "status": "validator_poll_error",
-                                "message": f"Timeout polling miner {miner_hk[:8]} at {node.ip}:{node.port}: {str(timeout_err)}",
-                            }
-                        except ConnectionError as conn_err:
-                            logger.error(
-                                f"[Run {run_id}] Connection error polling miner {miner_hk[:8]} (IP: {node.ip}:{node.port}): {conn_err}"
-                            )
-                            return resp_id, {
-                                "status": "validator_poll_error",
-                                "message": f"Connection error to miner {miner_hk[:8]} at {node.ip}:{node.port}: {str(conn_err)}",
-                            }
-                        except Exception as poll_err:
-                            logger.error(
-                                f"[Run {run_id}] Error polling miner {miner_hk[:8]} (IP: {node.ip}:{node.port}): {poll_err}",
-                                exc_info=True,
-                            )
-                            return resp_id, {
-                                "status": "validator_poll_error",
-                                "message": f"Error polling miner {miner_hk[:8]} at {node.ip}:{node.port}: {type(poll_err).__name__}: {str(poll_err)}",
-                            }
-
-                    for resp_rec in miners_to_poll:
-                        polling_tasks.append(_poll_single_miner(resp_rec))
-
-                    poll_results = await asyncio.gather(
-                        *polling_tasks, return_exceptions=True
-                    )
-
-                    for i, result in enumerate(poll_results):
-                        if isinstance(result, Exception):
-                            # Extract resp_id from the task if possible
-                            logger.error(
-                                f"[Run {run_id}] Polling task failed with exception: {result}"
-                            )
-                            continue
-                        resp_id, status_data = result
-                        miner_hash_results[resp_id] = status_data
-                    logger.info(
-                        f"[Run {run_id}] Collected input status from {len(miner_hash_results)}/{len(miners_to_poll)} miners."
-                    )
-
-                    validator_input_hash = None
+                # Now just enqueue an orchestration job - workers will handle everything
+                if run_id:
+                    # Get validator hotkey for tracking
+                    validator_hotkey = "unknown_validator"
                     try:
-                        logger.info(
-                            f"[Run {run_id}] Validator computing its own reference input hash..."
-                        )
-                        gfs_cache_dir = Path(
-                            self.config.get(
-                                "gfs_analysis_cache_dir", "./gfs_analysis_cache"
-                            )
-                        )
-                        validator_input_hash = await compute_input_data_hash(
-                            t0_run_time=gfs_t0_run_time,
-                            t_minus_6_run_time=gfs_t_minus_6_run_time,
-                            cache_dir=gfs_cache_dir,
-                        )
-                        if validator_input_hash:
-                            logger.info(
-                                f"[Run {run_id}] Validator computed reference hash: {validator_input_hash[:10]}..."
-                            )
-                        else:
-                            logger.error(
-                                f"[Run {run_id}] Validator failed to compute its own reference input hash. Cannot verify miners."
-                            )
-                            await _update_run_status(
-                                self,
-                                run_id,
-                                "error",
-                                "Validator failed hash computation",
-                            )
-                            miners_to_trigger = []
-
-                    except Exception as val_hash_err:
-                        logger.error(
-                            f"[Run {run_id}] Error during validator hash computation: {val_hash_err}",
-                            exc_info=True,
-                        )
-                        await _update_run_status(
-                            self,
-                            run_id,
-                            "error",
-                            f"Validator hash error: {val_hash_err}",
-                        )
-                        miners_to_trigger = []
-
-                    miners_to_trigger = []
-                    if validator_input_hash:
-                        update_tasks = []
-                        for i, (resp_id, status_data) in enumerate(
-                            miner_hash_results.items()
-                        ):
-                            miner_status = status_data.get("status")
-                            miner_hash = status_data.get("input_data_hash")
-                            error_msg = status_data.get("message")
-                            new_db_status = None
-                            hash_match = None
-
-                            if (
-                                miner_hash
-                                and miner_status
-                                == WeatherTaskStatus.INPUT_HASHED_AWAITING_VALIDATION.value
-                            ):
-                                if miner_hash == validator_input_hash:
-                                    logger.info(
-                                        f"[Run {run_id}] Hash MATCH for response ID {resp_id} (Miner status: {miner_status})!"
-                                    )
-                                    new_db_status = "input_validation_complete"
-                                    hash_match = True
-                                    orig_rec = next(
-                                        (
-                                            m
-                                            for m in miners_to_poll
-                                            if m["id"] == resp_id
-                                        ),
-                                        None,
-                                    )
-                                    if orig_rec:
-                                        miners_to_trigger.append(
-                                            (
-                                                resp_id,
-                                                orig_rec["miner_hotkey"],
-                                                orig_rec["job_id"],
-                                            )
-                                        )
-                                    else:
-                                        logger.error(
-                                            f"[Run {run_id}] Could not find original record for resp_id {resp_id} to trigger inference."
-                                        )
-                                else:
-                                    logger.warning(
-                                        f"[Run {run_id}] Hash MISMATCH for response ID {resp_id}. Miner: {miner_hash[:10]}... Validator: {validator_input_hash[:10]}... (Miner status: {miner_status})"
-                                    )
-                                    new_db_status = "input_hash_mismatch"
-                                    hash_match = False
-                            elif miner_status == WeatherTaskStatus.FETCH_ERROR.value:
-                                new_db_status = "input_fetch_error"
-                            elif miner_status in [
-                                WeatherTaskStatus.FETCHING_GFS.value,
-                                WeatherTaskStatus.HASHING_INPUT.value,
-                                WeatherTaskStatus.FETCH_QUEUED.value,
-                            ]:
-                                # Get current retry count for this response
-                                retry_count_query = "SELECT retry_count FROM weather_miner_responses WHERE id = :resp_id"
-                                retry_result = await self.db_manager.fetch_one(
-                                    retry_count_query, {"resp_id": resp_id}
-                                )
-                                current_retry_count = (
-                                    retry_result["retry_count"] if retry_result else 0
-                                )
-
-                                # Define retry intervals in minutes: 5, 10, 15
-                                retry_intervals = [5, 10, 15]
-
-                                if current_retry_count < len(retry_intervals):
-                                    # Schedule next retry
-                                    next_interval = retry_intervals[current_retry_count]
-                                    next_retry_time = datetime.now(
-                                        timezone.utc
-                                    ) + timedelta(minutes=next_interval)
-
-                                    logger.info(
-                                        f"[Run {run_id}] Miner for response ID {resp_id} is still working (status: {miner_status}). "
-                                        f"Scheduling retry {current_retry_count + 1}/3 in {next_interval} minutes at {next_retry_time.strftime('%H:%M:%S')} UTC."
-                                    )
-
-                                    # Update to retry_scheduled status with next retry time and incremented retry count
-                                    update_query = """
-                                        UPDATE weather_miner_responses
-                                        SET status = 'retry_scheduled',
-                                            retry_count = :retry_count,
-                                            next_retry_time = :next_retry_time,
-                                            last_polled_time = :now
-                                        WHERE id = :resp_id
-                                    """
-                                    update_tasks.append(
-                                        self.db_manager.execute(
-                                            update_query,
-                                            {
-                                                "resp_id": resp_id,
-                                                "retry_count": current_retry_count + 1,
-                                                "next_retry_time": next_retry_time,
-                                                "now": datetime.now(timezone.utc),
-                                            },
-                                        )
-                                    )
-                                    new_db_status = (
-                                        None  # Don't process in the main update logic
-                                    )
-                                else:
-                                    # Exhausted all retries, mark as failed
-                                    logger.warning(
-                                        f"[Run {run_id}] Miner for response ID {resp_id} exhausted all 3 retries (status: {miner_status}). "
-                                        f"Marking as input timeout after final retry at 15 minutes."
-                                    )
-                                    new_db_status = "input_hash_timeout"
-                            elif miner_status in [
-                                WeatherTaskStatus.VALIDATOR_POLL_FAILED.value,
-                                WeatherTaskStatus.VALIDATOR_POLL_ERROR.value,
-                            ]:
-                                new_db_status = "input_poll_error"
-                                # The detailed error message is already captured in error_msg from status_data.get('message')
-                            else:
-                                new_db_status = "input_fetch_error"
-
-                            if new_db_status:
-                                update_query = """
-                                    UPDATE weather_miner_responses
-                                    SET status = :status,
-                                        input_hash_miner = :m_hash,
-                                        input_hash_validator = :v_hash,
-                                        input_hash_match = :match,
-                                        error_message = :err,
-                                        last_polled_time = :now
-                                    WHERE id = :resp_id
-                                """
-                                update_tasks.append(
-                                    self.db_manager.execute(
-                                        update_query,
-                                        {
-                                            "resp_id": resp_id,
-                                            "status": new_db_status,
-                                            "m_hash": miner_hash,
-                                            "v_hash": validator_input_hash,
-                                            "match": hash_match,
-                                            "err": (
-                                                error_msg
-                                                if error_msg is not None
-                                                else ""
-                                            ),
-                                            "now": datetime.now(timezone.utc),
-                                        },
-                                    )
-                                )
-
-                                # Yield control if processing many results
-                                if (
-                                    len(miner_hash_results) > 20 and i % 20 == 19
-                                ):  # Yield every 20 items after the 20th
-                                    await asyncio.sleep(0)
-
-                        # Execute all update tasks after the loop completes
-                        if update_tasks:
-                            results = await asyncio.gather(
-                                *update_tasks, return_exceptions=True
-                            )
-                            failed_updates = sum(
-                                1 for r in results if isinstance(r, Exception)
-                            )
-                            if failed_updates > 0:
-                                logger.error(
-                                    f"[Run {run_id}] {failed_updates}/{len(update_tasks)} DB updates failed"
-                                )
-                                for i, r in enumerate(results):
-                                    if isinstance(r, Exception):
-                                        logger.error(
-                                            f"[Run {run_id}] Update {i} failed: {r}"
-                                        )
-                            else:
-                                logger.info(
-                                    f"[Run {run_id}] Updated DB for {len(update_tasks)} miner responses after hash check."
-                                )
-
-                    if miners_to_trigger:
-                        logger.info(
-                            f"[Run {run_id}] Triggering inference for {len(miners_to_trigger)} miners with matching input hashes."
-                        )
-                        await validator.update_task_status(
-                            "weather", "processing", "triggering_inference"
-                        )
-                        trigger_tasks = []
-
-                        async def _trigger_single_miner(
-                            resp_id, miner_hk, miner_job_id
-                        ):
-                            logger.debug(
-                                f"[Run {run_id}] Attempting to trigger inference for {miner_hk[:8]} (Job: {miner_job_id}) using query_miners."
-                            )
-                            try:
-                                trigger_payload_data = WeatherStartInferenceData(
-                                    job_id=miner_job_id
-                                )
-                                trigger_payload = {
-                                    "nonce": str(uuid.uuid4()),
-                                    "data": trigger_payload_data.model_dump(),
-                                }
-                                endpoint = "/weather-start-inference"
-
-                                all_responses = await validator.query_miners(
-                                    payload=trigger_payload,
-                                    endpoint=endpoint,
-                                    hotkeys=[miner_hk],
-                                )
-
-                                trigger_response = all_responses.get(miner_hk)
-
-                                parsed_response = trigger_response
-                                if (
-                                    isinstance(trigger_response, dict)
-                                    and "text" in trigger_response
-                                ):
-                                    try:
-                                        parsed_response = loads(
-                                            trigger_response["text"]
-                                        )
-                                    except (Exception, TypeError) as json_err:
-                                        logger.warning(
-                                            f"[Run {run_id}] Failed to parse trigger response text for {miner_hk[:8]}: {json_err}"
-                                        )
-                                        parsed_response = {
-                                            "status": "parse_error",
-                                            "message": str(json_err),
-                                        }
-
-                                if (
-                                    parsed_response
-                                    and parsed_response.get("status")
-                                    == WeatherTaskStatus.INFERENCE_STARTED.value
-                                ):
-                                    logger.info(
-                                        f"[Run {run_id}] Successfully triggered inference for {miner_hk[:8]} (Job: {miner_job_id})."
-                                    )
-                                    return resp_id, True
-                                else:
-                                    logger.warning(
-                                        f"[Run {run_id}] Failed to trigger inference for {miner_hk[:8]} (Job: {miner_job_id}). Response: {parsed_response}"
-                                    )
-                                    return resp_id, False
-                            except Exception as trigger_err:
-                                logger.error(
-                                    f"[Run {run_id}] Error triggering inference for {miner_hk[:8]} (Job: {miner_job_id}): {trigger_err}",
-                                    exc_info=True,
-                                )
-                                return resp_id, False
-
-                        for resp_id, miner_hk, miner_job_id in miners_to_trigger:
-                            trigger_tasks.append(
-                                _trigger_single_miner(resp_id, miner_hk, miner_job_id)
-                            )
-
-                        trigger_results = await asyncio.gather(
-                            *trigger_tasks, return_exceptions=True
-                        )
-
-                        final_update_tasks = []
-                        triggered_count = 0
-                        for i, result in enumerate(trigger_results):
-                            if isinstance(result, Exception):
-                                logger.error(
-                                    f"[Run {run_id}] Trigger task {i} failed with exception: {result}"
-                                )
-                                continue
-                            resp_id, success = result
-                            if success:
-                                triggered_count += 1
-                                final_update_tasks.append(
-                                    self.db_manager.execute(
-                                        "UPDATE weather_miner_responses SET status = 'inference_triggered' WHERE id = :id",
-                                        {"id": resp_id},
-                                    )
-                                )
-                            # Yield control if processing many results
-                            if (
-                                len(trigger_results) > 20 and i % 20 == 19
-                            ):  # Yield every 20 items after the 20th
-                                await asyncio.sleep(0)
-
-                        if final_update_tasks:
-                            results = await asyncio.gather(
-                                *final_update_tasks, return_exceptions=True
-                            )
-                        failed_updates = sum(
-                            1 for r in results if isinstance(r, Exception)
-                        )
-                        if failed_updates > 0:
-                            logger.error(
-                                f"[Run {run_id}] {failed_updates} final DB updates failed"
-                            )
-                        logger.info(
-                            f"[Run {run_id}] Completed inference trigger process. Successfully triggered {triggered_count}/{len(miners_to_trigger)} miners."
-                        )
-                        if triggered_count > 0:
-                            await _update_run_status(
-                                self, run_id, "awaiting_inference_results"
-                            )
-                        else:
-                            await _update_run_status(
-                                self, run_id, "inference_trigger_failed"
-                            )  # No miners successfully triggered
-                    else:
-                        logger.warning(
-                            f"[Run {run_id}] No miners eligible for inference trigger after hash verification."
-                        )
-                        await _update_run_status(self, run_id, "no_matching_hashes")
-
-                    logger.info(
-                        f"[ValidatorExecute] Concluded processing for run {run_id}. Triggering validator_score."
-                    )
-                    await self.validator_score()
-
-                    if self.test_mode:
-                        logger.info(
-                            f"TEST MODE: validator_execute iteration for run {run_id} complete."
-                        )
-                        if (
-                            hasattr(self, "last_test_mode_run_id")
-                            and self.last_test_mode_run_id == run_id
-                        ):
-                            logger.info(
-                                f"TEST MODE: Waiting for Day-1 scoring of run {run_id} to complete..."
-                            )
-
-                            # Use optional timeout or wait indefinitely for long-running scoring
-                            timeout = await self._get_scoring_timeout_if_enabled()
-                            if timeout:
-                                logger.info(
-                                    f"TEST MODE: Using safety timeout of {timeout:.0f} seconds for Day-1 scoring"
-                                )
-                            else:
-                                logger.info(
-                                    "TEST MODE: No timeout - waiting indefinitely for Day-1 scoring to complete (long-running operation)"
-                                )
-
-                            try:
-                                if timeout:
-                                    # Use timeout with periodic progress logging
-                                    await self._wait_for_scoring_with_progress(
-                                        self.test_mode_run_scored_event, timeout, run_id
-                                    )
-                                else:
-                                    # Wait indefinitely with periodic progress logging
-                                    await self._wait_for_scoring_with_progress(
-                                        self.test_mode_run_scored_event, None, run_id
-                                    )
-                                logger.info(
-                                    f"TEST MODE: Day-1 scoring for run {run_id} completed successfully."
-                                )
-                            except asyncio.TimeoutError:
-                                logger.error(
-                                    f"TEST MODE: Safety timeout reached waiting for Day-1 scoring of run {run_id} after {timeout:.0f} seconds."
-                                )
-                            self.test_mode_run_scored_event.clear()
-                        else:
-                            logger.info(
-                                f"TEST MODE: Not waiting for scoring event as run_id ({run_id}) doesn't match last_test_mode_run_id ({getattr(self, 'last_test_mode_run_id', None)})."
-                            )
-                        logger.info(
-                            "TEST MODE: Exiting validator loop after one successful attempt or error within the attempt."
-                        )
-                        break
-
-            except Exception as loop_err:
-                logger.error(
-                    f"Error in validator_execute main loop: {loop_err}", exc_info=True
-                )
-                await validator.update_task_status("weather", "error")
-                if "run_id" in locals() and run_id is not None:
-                    try:
-                        await _update_run_status(
-                            self,
-                            run_id,
-                            "error",
-                            error_message=f"Unhandled loop error: {loop_err}",
-                        )
-                    except:
+                        if validator.keypair:
+                            validator_hotkey = validator.keypair.ss58_address
+                    except Exception:
                         pass
-
-                if self.test_mode:
-                    logger.info(
-                        "TEST MODE: Encountered an error. Exiting validator_execute loop."
+                    
+                    # Enqueue orchestration job
+                    job_id = await self.db_manager.enqueue_validator_job(
+                        job_type="weather.run.orchestrate",
+                        payload={
+                            "run_id": run_id,
+                            "validator_hotkey": validator_hotkey,
+                        },
+                        priority=50,  # High priority
+                        run_id=run_id,
                     )
-                    break
+                    
+                    if job_id:
+                        logger.info(
+                            f"[Run {run_id}] Enqueued orchestration job {job_id}. Workers will handle GFS download, miner queries, and scoring."
+                        )
+                    else:
+                        logger.warning(f"[Run {run_id}] Failed to enqueue orchestration job")
+                    
+                    await validator.update_task_status("weather", "active", "orchestration_enqueued")
+                    
+                    # In test mode, record start time and continue looping without exiting
+                    if self.test_mode:
+                        self.last_test_mode_run_id = run_id
+                        last_test_run_started_at = now_utc
+                        logger.info(
+                            f"TEST MODE: Run {run_id} started. Next run will be scheduled in ~{test_run_interval_minutes} minutes."
+                        )
+                    
+                # Continue to next iteration
+                await asyncio.sleep(60)  # Check every minute
+                
+            except Exception as e:
+                logger.error(f"Error in validator execute loop: {e}", exc_info=True)
+                await asyncio.sleep(60)
+                continue
+        
+        logger.info("Validator execute loop ended")
 
-                await asyncio.sleep(600)  # Sleep only if not in test mode
+    # End of simplified validator_execute method
 
     async def validator_score(self, result=None, force_run_id=None):
         """
@@ -2932,56 +2291,11 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
             # Handle verification logic for both awaiting_inference_results and verifying_miner_forecasts
             if current_run_status == "awaiting_inference_results":
-                # Standard verification flow for inference_triggered responses
-                responses_query = """
-                SELECT mr.id, mr.miner_hotkey, mr.status, mr.job_id
-                FROM weather_miner_responses mr
-                WHERE mr.run_id = :run_id
-                  AND (
-                      mr.status = 'inference_triggered' OR
-                      (mr.status = 'retry_scheduled' AND mr.next_retry_time IS NOT NULL AND mr.next_retry_time <= :now)
-                  )
-                """
-                query_params = {"run_id": run_id, "now": datetime.now(timezone.utc)}
-                miner_responses = await self.db_manager.fetch_all(
-                    responses_query, query_params
+                # Defer per-miner verification entirely to worker pool
+                logger.info(
+                    f"[Run {run_id}] Deferring verification to worker pool; scheduler will claim per-miner verify items."
                 )
-
-                num_attempted_verification = len(miner_responses)
-                if not miner_responses:
-                    logger.info(
-                        f"[Run {run_id}] No miner responses found with status 'inference_triggered'."
-                    )
-                else:
-                    logger.info(
-                        f"[Run {run_id}] Found {num_attempted_verification} 'inference_triggered' responses to verify."
-                    )
-
-                verification_tasks = []
-                for response in miner_responses:
-                    verification_tasks.append(
-                        verify_miner_response(self, run_record, response)
-                    )
-
-                if verification_tasks:
-                    results = await asyncio.gather(
-                        *verification_tasks, return_exceptions=True
-                    )
-                    failed_verifications = sum(
-                        1 for r in results if isinstance(r, Exception)
-                    )
-                    if failed_verifications > 0:
-                        logger.error(
-                            f"[Run {run_id}] {failed_verifications}/{len(verification_tasks)} verification tasks failed"
-                        )
-                        for i, r in enumerate(results):
-                            if isinstance(r, Exception):
-                                logger.error(
-                                    f"[Run {run_id}] Verification {i} failed: {r}"
-                                )
-                    logger.info(
-                        f"[Run {run_id}] Completed verification attempts for {len(verification_tasks)} responses ({len(verification_tasks) - failed_verifications} successful)."
-                    )
+                num_attempted_verification = 0
             else:
                 # For runs already in verifying_miner_forecasts, skip verification and go straight to scoring check
                 num_attempted_verification = 0
@@ -3790,8 +3104,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
     ) -> Dict[str, Any]:
         """
         Handles the /weather-initiate-fetch request.
-        Creates a job record and launches the background task for fetching GFS and hashing.
-        If a failed job for the same timestep exists, it will be reset and retried.
+        Creates a job record and launches the background task for fetching GFS and running inference.
+        NEW: Immediately triggers inference after GFS download - no input verification step.
         """
         if self.node_type != "miner":
             logger.error("handle_initiate_fetch called on non-miner node.")
@@ -3817,6 +3131,157 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
             # Extract validator hotkey from request data
             validator_hotkey = request_data.validator_hotkey
+            
+            # CRITICAL: Verify the request is intended for this miner's hotkey
+            expected_miner_hotkey = getattr(request_data, 'expected_miner_hotkey', None)
+            actual_miner_hotkey = self.keypair.ss58_address if self.keypair else "unknown_miner"
+            
+            # DEBUG: Log what we received for debugging
+            logger.info(
+                f"[Miner] Hotkey verification check: "
+                f"expected={expected_miner_hotkey[:8] + '...' + expected_miner_hotkey[-8:] if expected_miner_hotkey else 'None'}, "
+                f"actual={actual_miner_hotkey[:8]}...{actual_miner_hotkey[-8:]}"
+            )
+            
+            # DEBUG: Log the raw request data to see what fields are actually present
+            logger.info(f"[Miner] Raw request_data attributes: {[attr for attr in dir(request_data) if not attr.startswith('_')]}")
+            
+            if expected_miner_hotkey and expected_miner_hotkey != actual_miner_hotkey:
+                logger.error(
+                    f"[Miner] Hotkey verification FAILED! Request intended for {expected_miner_hotkey[:8]}...{expected_miner_hotkey[-8:]} "
+                    f"but this miner is {actual_miner_hotkey[:8]}...{actual_miner_hotkey[-8:]}. "
+                    f"Rejecting request to prevent crossover."
+                )
+                return self._validate_and_format_response(
+                    {
+                        "status": WeatherTaskStatus.FETCH_REJECTED.value,
+                        "message": f"Hotkey verification failed - request intended for different miner",
+                        "expected_hotkey": expected_miner_hotkey,
+                        "actual_hotkey": actual_miner_hotkey,
+                    },
+                    ["status", "message"],
+                )
+            elif expected_miner_hotkey:
+                logger.info(
+                    f"[Miner] Hotkey verification PASSED - request correctly intended for {actual_miner_hotkey[:8]}...{actual_miner_hotkey[-8:]}"
+                )
+
+            # FAST-PATH: If there is already a completed forecast for this GFS time, reuse it and return ready-to-score info
+            try:
+                # Determine miner and validator hotkeys to generate deterministic job_id
+                miner_hotkey = actual_miner_hotkey
+                if not validator_hotkey:
+                    validator_hotkey = "unknown_validator"
+
+                fastpath_job_id = DeterministicJobID.generate_weather_job_id(
+                    gfs_init_time=t0_run_time,
+                    miner_hotkey=miner_hotkey,
+                    validator_hotkey=validator_hotkey,
+                    job_type="forecast",
+                )
+
+                completed_inference_query = """
+                    SELECT id, target_netcdf_path, verification_hash
+                    FROM weather_miner_jobs 
+                    WHERE gfs_init_time_utc = :gfs_time 
+                    AND status = 'completed'
+                    AND target_netcdf_path IS NOT NULL
+                    AND verification_hash IS NOT NULL
+                    ORDER BY processing_end_time DESC 
+                    LIMIT 1
+                """
+                completed_inference = await self.db_manager.fetch_one(
+                    completed_inference_query, {"gfs_time": t0_run_time}
+                )
+
+                if completed_inference:
+                    target_path = completed_inference["target_netcdf_path"]
+                    verification_hash = completed_inference["verification_hash"]
+
+                    # Ensure a job record exists for this validator/miner pair with our deterministic ID
+                    job_exists_check = """
+                        SELECT id, status, target_netcdf_path, verification_hash
+                        FROM weather_miner_jobs WHERE id = :job_id
+                    """
+                    existing_fast_job = await self.db_manager.fetch_one(
+                        job_exists_check, {"job_id": fastpath_job_id}
+                    )
+
+                    if not existing_fast_job:
+                        insert_query = """
+                            INSERT INTO weather_miner_jobs (id, validator_request_time, validator_hotkey, gfs_init_time_utc, gfs_t_minus_6_time_utc, status, processing_start_time, processing_end_time, target_netcdf_path, verification_hash)
+                            VALUES (:id, :req_time, :val_hk, :gfs_init, :gfs_t_minus_6, 'completed', NOW(), NOW(), :target_path, :hash)
+                        """
+                        await self.db_manager.execute(
+                            insert_query,
+                            {
+                                "id": fastpath_job_id,
+                                "req_time": datetime.now(timezone.utc),
+                                "val_hk": validator_hotkey,
+                                "gfs_init": t0_run_time,
+                                "gfs_t_minus_6": t_minus_6_run_time,
+                                "target_path": target_path,
+                                "hash": verification_hash,
+                            },
+                        )
+                    elif existing_fast_job["status"] != "completed" or not existing_fast_job.get("target_netcdf_path") or not existing_fast_job.get("verification_hash"):
+                        # Update to completed and set artifacts
+                        await self.db_manager.execute(
+                            """
+                            UPDATE weather_miner_jobs 
+                            SET status = 'completed', processing_end_time = NOW(), target_netcdf_path = :target_path, verification_hash = :hash
+                            WHERE id = :job_id
+                            """,
+                            {
+                                "job_id": fastpath_job_id,
+                                "target_path": target_path,
+                                "hash": verification_hash,
+                            },
+                        )
+
+                    # Build JWT access token and response
+                    zarr_dir_name = Path(str(target_path)).name
+                    if not zarr_dir_name.endswith(".zarr"):
+                        logger.warning(f"[Miner Job {fastpath_job_id}] Completed target path is not a .zarr directory: {zarr_dir_name}")
+
+                    miner_jwt_secret_key = self.config.get(
+                        "miner_jwt_secret_key", os.getenv("MINER_JWT_SECRET_KEY")
+                    )
+                    if not miner_jwt_secret_key:
+                        logger.warning(
+                            "MINER_JWT_SECRET_KEY not set in config or environment. Using default insecure key."
+                        )
+                        miner_jwt_secret_key = "insecure_default_key_for_development_only"
+                    jwt_algorithm = self.config.get("jwt_algorithm", "HS256")
+                    token_expire_minutes = int(
+                        self.config.get("access_token_expire_minutes", 60)
+                    )
+
+                    token_data = {
+                        "job_id": fastpath_job_id,
+                        "file_path": zarr_dir_name,
+                        "exp": datetime.now(timezone.utc)
+                        + timedelta(minutes=token_expire_minutes),
+                    }
+                    access_token = jwt.encode(
+                        token_data, miner_jwt_secret_key, algorithm=jwt_algorithm
+                    )
+
+                    zarr_url_for_response = f"/forecasts/{zarr_dir_name}"
+
+                    return self._validate_and_format_response(
+                        {
+                            "status": WeatherTaskStatus.COMPLETED.value,
+                            "job_id": fastpath_job_id,
+                            "message": "Forecast already completed and ready for access",
+                            "zarr_store_url": zarr_url_for_response,
+                            "verification_hash": verification_hash,
+                            "access_token": access_token,
+                        },
+                        ["status", "job_id"],
+                    )
+            except Exception as fast_err:
+                logger.debug(f"[Miner] Fast-path check failed or not applicable: {fast_err}")
 
             # Find existing job for this exact time and validator
             if validator_hotkey:
@@ -3857,26 +3322,20 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 status = existing_job["status"]
 
                 # If the job is in a recoverable (failed) state, reset and retry it.
-                if status in [
-                    "error",
-                    "fetch_error",
-                    "failed",
-                    "input_hash_mismatch",
-                    "input_hash_timeout",
-                    "input_poll_error",
-                ]:
+                if status in ["failed"]:
                     logger.warning(
-                        f"[Miner Job {job_id}] Found existing FAILED job (status: {status}). Resetting and retrying."
+                        f"[Miner Job {job_id}] Found existing FAILED job (status: {status}). Resetting and retrying with combined workflow."
                     )
 
-                    # Reset status to 'fetch_queued' and clear any previous error message.
+                    # Reset status to 'received' and clear any previous error message.
                     await update_job_status(
-                        self, job_id, "fetch_queued", error_message=""
+                        self, job_id, "received", error_message=""
                     )
 
-                    # Relaunch the background task to fetch and hash the data.
+                    # Relaunch the combined background task (fetch + inference).
+                    from .processing.weather_workers import fetch_and_run_inference_task
                     asyncio.create_task(
-                        fetch_and_hash_gfs_task(
+                        fetch_and_run_inference_task(
                             task_instance=self,
                             job_id=job_id,
                             t0_run_time=t0_run_time,
@@ -3918,7 +3377,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 AND gfs_t_minus_6_time_utc = :gfs_t_minus_6
                 AND input_data_hash IS NOT NULL
                 AND input_batch_pickle_path IS NOT NULL
-                AND status IN ('input_hashed_awaiting_validation', 'in_progress', 'completed')
+                AND status IN ('processing', 'completed')
                 ORDER BY validator_request_time DESC
                 LIMIT 1
             """
@@ -3930,6 +3389,12 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             # Extract miner hotkey for deterministic generation
             miner_hotkey = (
                 self.keypair.ss58_address if self.keypair else "unknown_miner"
+            )
+            
+            # CRITICAL: Log the actual miner hotkey being used for job creation and manifest signing
+            logger.info(
+                f"[Miner] Using hotkey {miner_hotkey[:8]}...{miner_hotkey[-8:]} "
+                f"for job creation and manifest signing (from self.keypair.ss58_address)"
             )
             # Use the validator hotkey extracted above, or fall back to placeholder
             if not validator_hotkey:
@@ -3982,7 +3447,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 "pickle_path": existing_input_job[
                                     "input_batch_pickle_path"
                                 ],
-                                "status": "input_hashed_awaiting_validation",
+                                "status": "processing",
                             },
                         )
                         logger.info(
@@ -3992,6 +3457,14 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         logger.info(
                             f"[Miner Job {job_id}] Job already exists, skipping creation (likely from another validator)."
                         )
+                                    # NEW: Immediately start inference after reusing existing GFS data
+                try:
+                    from .processing.weather_workers import run_inference_background
+                    logger.info(f"[Miner Job {job_id}] Starting inference immediately with existing GFS data")
+                    asyncio.create_task(run_inference_background(self, job_id))
+                except Exception as inf_err:
+                    logger.warning(f"[Miner Job {job_id}] Failed to schedule inference: {inf_err}")
+
                     return self._validate_and_format_response(
                         {
                             "status": WeatherTaskStatus.FETCH_ACCEPTED.value,
@@ -4029,25 +3502,29 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                             "val_hk": validator_hotkey,
                             "gfs_init": t0_run_time,
                             "gfs_t_minus_6": t_minus_6_run_time,
-                            "status": "fetch_queued",
+                            "status": "received",
                         },
                     )
                     logger.info(
-                        f"[Miner Job {job_id}] DB record created. Launching background fetch/hash task."
+                        f"[Miner Job {job_id}] DB record created. Launching combined fetch and inference task."
                     )
                 else:
                     logger.info(
                         f"[Miner Job {job_id}] Job already exists, skipping creation (likely from another validator)."
                     )
 
+                # NEW: Start combined GFS fetch and inference task
+                # This task will fetch GFS data and immediately start inference
+                from .processing.weather_workers import fetch_and_run_inference_task
                 asyncio.create_task(
-                    fetch_and_hash_gfs_task(
+                    fetch_and_run_inference_task(
                         task_instance=self,
                         job_id=job_id,
                         t0_run_time=t0_run_time,
                         t_minus_6_run_time=t_minus_6_run_time,
                     )
                 )
+                logger.info(f"[Miner Job {job_id}] Started combined GFS fetch and inference task")
 
             return self._validate_and_format_response(
                 {
@@ -4073,10 +3550,10 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
     async def handle_get_input_status(self, job_id: str) -> Dict[str, Any]:
         """
-        Handles the /weather-get-input-status request.
+        Handles the /weather-poll-job-status request.
         Returns the current status and input hash (if computed) for the job.
         If the job is ready for inference but hasn't been triggered, it reports
-        the status as 'input_hashed_awaiting_validation' to conform to the validator.
+        the current processing status.
         """
         if self.node_type != "miner":
             logger.error("handle_get_input_status called on non-miner node.")
@@ -4109,25 +3586,20 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
             status_to_report = result["status"]
             # If hashing is done and we are waiting for the validator to trigger inference,
-            # report the specific status the validator is looking for.
-            # For completed jobs, also report as awaiting validation so validator includes us in scoring
-            if result.get("input_data_hash"):
-                if status_to_report in ["in_progress", "completed"]:
-                    status_to_report = (
-                        WeatherTaskStatus.INPUT_HASHED_AWAITING_VALIDATION.value
-                    )
-                    logger.debug(
-                        f"[Miner Job {job_id}] Job status '{result['status']}' with hash converted to '{status_to_report}' for validator compatibility"
-                    )
+            # Report the actual status without conversion
+            # The validator needs to see "completed" to know inference is done
+            logger.debug(
+                f"[Miner Job {job_id}] Job actual status: '{result['status']}', reporting as: '{status_to_report}'"
+            )
 
+            # Simplified reporting: expose raw job status for polling
             response = {
                 "job_id": job_id,
                 "status": status_to_report,
-                "input_data_hash": result.get("input_data_hash"),
                 "message": result.get("error_message"),
             }
             logger.debug(
-                f"[Miner Job {job_id}] Reporting status: {response['status']}, Hash available: {response['input_data_hash'] is not None}"
+                f"[Miner Job {job_id}] Reporting status: {response['status']}"
             )
             return self._validate_and_format_response(response, ["job_id", "status"])
 
@@ -4212,7 +3684,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 current_job_check_query = """
                     SELECT id, status, validator_request_time, processing_start_time FROM weather_miner_jobs 
                     WHERE id = :current_job_id 
-                    AND status IN ('in_progress', 'completed', 'processing', 'running_inference', 'processing_input', 'processing_output')
+                    AND status IN ('processing', 'completed')
                     LIMIT 1
                 """
                 current_job = await self.db_manager.fetch_one(
@@ -4501,30 +3973,53 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         self.initial_scoring_workers = []
         logger.info("Stopped all initial scoring workers")
 
-    async def start_final_scoring_workers(self, num_workers=1):
-        """Start background workers for final ERA5-based scoring."""
-        if self.final_scoring_worker_running:
-            logger.info("Final scoring workers already running")
-            return
-
-        self.final_scoring_worker_running = True
-        for _ in range(num_workers):
-            worker = asyncio.create_task(finalize_scores_worker(self))
-            self.final_scoring_workers.append(worker)
-        logger.info(f"Started {num_workers} final scoring workers")
-
     async def stop_final_scoring_workers(self):
-        """Stop all background final scoring workers."""
-        if not self.final_scoring_worker_running:
+        """Stop all final scoring workers (multiprocess workers managed by validator)."""
+        if self.node_type != "validator":
             return
-
-        self.final_scoring_worker_running = False
-        logger.info("Stopping final scoring workers...")
-        for worker in self.final_scoring_workers:
-            worker.cancel()
-
-        self.final_scoring_workers = []
-        logger.info("Stopped all final scoring workers")
+            
+        if hasattr(self, "validator") and self.validator:
+            # Access the validator's multiprocess workers
+            if hasattr(self.validator, "_weather_worker_processes"):
+                worker_processes = self.validator._weather_worker_processes
+                if worker_processes:
+                    logger.info(f"Stopping {len(worker_processes)} final scoring worker processes...")
+                    
+                    # First try to terminate gracefully
+                    for p in worker_processes:
+                        try:
+                            if p.is_alive():
+                                p.terminate()
+                        except Exception as e:
+                            logger.debug(f"Could not terminate process {p.name}: {e}")
+                    
+                    # Wait for processes to exit gracefully
+                    import time
+                    for p in worker_processes:
+                        try:
+                            p.join(timeout=2)
+                            if not p.is_alive():
+                                logger.debug(f"Process {p.name} terminated gracefully")
+                        except Exception:
+                            pass
+                    
+                    # Force kill any remaining processes
+                    for p in worker_processes:
+                        try:
+                            if p.is_alive():
+                                logger.warning(f"Force killing worker process {p.name} (pid={p.pid})")
+                                p.kill()
+                        except Exception as e:
+                            logger.debug(f"Could not kill process {p.name}: {e}")
+                    
+                    worker_processes.clear()
+                    logger.info("Final scoring worker processes stopped")
+                else:
+                    logger.info("No final scoring worker processes to stop")
+            else:
+                logger.debug("Validator has no _weather_worker_processes attribute")
+        else:
+            logger.debug("No validator reference available for stopping final scoring workers")
 
     async def start_cleanup_workers(self, num_workers=1):
         """Start background workers for cleaning up old data."""
@@ -4562,18 +4057,11 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
     async def start_background_workers(
         self,
-        num_ensemble_workers=1,
-        num_initial_scoring_workers=1,
-        num_final_scoring_workers=1,
         num_cleanup_workers=1,
     ):
         if self.node_type == "validator":
-            await self.start_initial_scoring_workers(
-                num_workers=num_initial_scoring_workers
-            )
-            await self.start_final_scoring_workers(
-                num_workers=num_final_scoring_workers
-            )
+            # Always skip legacy batch workers; per-miner pipeline is active by default
+            logger.info("[WeatherTask] Per-miner pipeline active; skipping legacy batch workers")
             await self.start_cleanup_workers(num_workers=num_cleanup_workers)
         elif self.node_type == "miner":
             if self.config.get("r2_cleanup_enabled", False):
@@ -4703,42 +4191,29 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 "data": status_payload_data.model_dump(),
                             }
 
-                            responses_dict = await self.query_miners(
-                                payload=status_payload,
-                                endpoint="/weather-get-input-status",
-                                hotkeys=[miner_hk],
+                            from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import poll_miner_job_status
+                            status_response = await poll_miner_job_status(
+                                validator=self.validator,
+                                miner_hotkey=miner_hk,
+                                job_id=miner_job_id,
+                                db_manager=self.db_manager,
                             )
 
-                            status_response = responses_dict.get(miner_hk)
-
-                            if status_response:
-                                parsed_response = status_response
-                                if (
-                                    isinstance(status_response, dict)
-                                    and "text" in status_response
-                                ):
-                                    try:
-                                        parsed_response = loads(status_response["text"])
-                                    except (Exception, TypeError) as json_err:
-                                        logger.warning(
-                                            f"[HashWorker] [Run {run_id}] Failed to parse JSON response from miner {miner_hk[:8]}: {json_err}. Raw response: {status_response.get('text', '')[:200]}"
-                                        )
-                                        parsed_response = {
-                                            "status": "parse_error",
-                                            "message": f"JSON parse error from miner {miner_hk[:8]}: {type(json_err).__name__}: {str(json_err)}",
-                                        }
-
+                            if status_response and status_response.get("success"):
+                                # Extract the data from the standardized response format
+                                parsed_response = status_response.get("data", {})
+                                
                                 logger.debug(
                                     f"[Run {run_id}] Received status from {miner_hk[:8]}: {parsed_response}"
                                 )
                                 return resp_id, parsed_response
                             else:
                                 logger.warning(
-                                    f"[HashWorker] [Run {run_id}] No response received from miner {miner_hk[:8]} on /weather-get-input-status endpoint."
+                                    f"[HashWorker] [Run {run_id}] No response received from miner {miner_hk[:8]} on /weather-poll-job-status endpoint."
                                 )
                                 return resp_id, {
                                     "status": "validator_poll_failed",
-                                    "message": f"No response from miner {miner_hk[:8]} on /weather-get-input-status endpoint",
+                                    "message": f"No response from miner {miner_hk[:8]} on /weather-poll-job-status endpoint",
                                 }
                         except asyncio.TimeoutError as timeout_err:
                             logger.error(
@@ -5319,547 +4794,17 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         self, processed_runs_this_session=None, max_attempts_per_run=3
     ):
         """
+        DEPRECATED: This function uses the old bulk query system and is replaced by the job-based pipeline.
         Sequential version of run recovery that processes one run at a time to avoid system overload.
         Designed for periodic execution without blocking normal operations.
         """
-        logger.debug("Checking for incomplete runs (sequential recovery)...")
-
-        if processed_runs_this_session is None:
-            processed_runs_this_session = {}
-
-        # Look for one incomplete run at a time
-        recoverable_states = [
-            "sending_fetch_requests",
-            "no_miners_to_poll",  # Added to allow recovery of runs with no miners
-            "awaiting_input_hashes",
-            "verifying_input_hashes",
-            "triggering_inference",
-            "awaiting_inference_results",
-            "verifying_miner_forecasts",
-            # INCLUDE SCORING STATES - can get stuck due to restarts during scoring
-            "day1_scoring_started",
-            "era5_final_scoring_started",
-            "era5_final_scoring_partial",
-            # AGGRESSIVELY RETRY FAILED DAY1 SCORING
-            "day1_scoring_failed",
-            "initial_scoring_queued",
-            "initial_scoring_failed",
-        ]
-
-        # Also include failure states that might be recoverable with full workflow
-        potentially_recoverable_failure_states = [
-            "stalled_no_valid_forecasts",
-            "all_forecasts_failed_verification",
-            "no_matching_hashes",
-            "inference_trigger_failed",
-            "hash_verification_failed",
-        ]
-
-        # Also check for runs that might be ready for scoring
-        cutoff_time = datetime.now(timezone.utc) - timedelta(
-            minutes=self.config.get("verification_wait_minutes", 30)
-        )
-
-        # Get up to 20 runs to check, prioritizing runs that haven't completed day1 scoring
-        # Include both normal recoverable states and failure states that might be recoverable
-        all_recoverable_states = (
-            recoverable_states + potentially_recoverable_failure_states
-        )
-
-        # First, prioritize runs that haven't completed day1 scoring
-        day1_priority_query = """
-        SELECT id, gfs_init_time_utc, status, run_initiation_time, 
-               CASE WHEN status IN ('verifying_miner_forecasts', 'day1_scoring_started', 'initial_scoring_failed') THEN 1 ELSE 2 END as priority
-        FROM weather_forecast_runs 
-        WHERE status IN ({}) OR (status = 'awaiting_inference_results' AND run_initiation_time < :cutoff_time)
-        ORDER BY priority ASC, run_initiation_time DESC
-        LIMIT 20
-        """.format(
-            ",".join(f"'{state}'" for state in all_recoverable_states)
-        )
-
-        recovery_query = day1_priority_query
-
-        incomplete_runs = await self.db_manager.fetch_all(
-            recovery_query, {"cutoff_time": cutoff_time}
-        )
-
-        # Debug: Log what we found with priority information
-        logger.debug(
-            f"Recovery query found {len(incomplete_runs)} incomplete runs (prioritized by day1 scoring)"
-        )
-        for run in incomplete_runs:
-            priority_str = "HIGH" if run.get("priority", 2) == 1 else "NORMAL"
-            logger.debug(
-                f"  - Run {run['id']}: status='{run['status']}', priority={priority_str}, age={(datetime.now(timezone.utc) - run['run_initiation_time']).total_seconds() / 3600:.1f}h"
-            )
-
-        if not incomplete_runs:
-            # Check if there are any runs in unexpected states
-            debug_query = """
-            SELECT id, status, run_initiation_time, gfs_init_time_utc
-            FROM weather_forecast_runs 
-            WHERE run_initiation_time > (CURRENT_TIMESTAMP - INTERVAL '72 hours')
-            ORDER BY run_initiation_time DESC
-            LIMIT 5
-            """
-            all_recent_runs = await self.db_manager.fetch_all(debug_query)
-            logger.debug(f"Recent runs for debugging ({len(all_recent_runs)} found):")
-            for run in all_recent_runs:
-                run_age = (
-                    datetime.now(timezone.utc) - run["run_initiation_time"]
-                ).total_seconds() / 3600
-                logger.debug(
-                    f"  - Run {run['id']}: status='{run['status']}', age={run_age:.1f}h"
-                )
-
-            return "no_more_runs"
-
-        # Find the first run we can process (not exceeded max attempts and not in cooldown)
-        run_cooldown_minutes = 15  # Don't retry failed runs for at least 15 minutes
-        run_cooldown_time = datetime.now(timezone.utc) - timedelta(
-            minutes=run_cooldown_minutes
-        )
-
-        run_to_process = None
-        for run in incomplete_runs:
-            run_id = run["id"]
-            status = run["status"]
-            attempt_count = processed_runs_this_session.get(run_id, 0)
-
-            # Skip if exceeded max attempts
-            if attempt_count >= max_attempts_per_run:
-                continue
-
-            # Smart stale detection - different logic for different statuses
-            run_age_hours = (
-                datetime.now(timezone.utc) - run["run_initiation_time"]
-            ).total_seconds() / 3600
-            is_stale, stale_reason = await self._is_run_stale(
-                run_id, status, run_age_hours
-            )
-
-            if is_stale:
-                logger.warning(
-                    f"Run {run_id} is stale ({stale_reason}), marking as abandoned"
-                )
-                await _update_run_status(self, run_id, "stale_abandoned")
-                logger.info(
-                    f"Stale run {run_id} marked as abandoned - validator will immediately proceed to check for new run creation"
-                )
-                return "stale_processed"  # Special return value for stale runs
-
-            # Check cooldown for failure states
-            if status in potentially_recoverable_failure_states:
-                # Use run_initiation_time as a proxy for when the run entered failure state
-                # This is less precise but better than crashing on missing columns
-                last_status_time = run["run_initiation_time"]
-
-                if last_status_time and last_status_time > run_cooldown_time:
-                    time_since_failure = (
-                        datetime.now(timezone.utc) - last_status_time
-                    ).total_seconds() / 60
-                    logger.debug(
-                        f"Run {run_id} in failure state '{status}' is still in cooldown period ({time_since_failure:.1f}min < {run_cooldown_minutes}min). Skipping to check next run."
-                    )
-                    continue  # Skip this run and check the next one
-
-            # This run is eligible for processing
-            run_to_process = run
-            break
-
-        if not run_to_process:
-            logger.debug(
-                f"All {len(incomplete_runs)} incomplete runs are either at max attempts ({max_attempts_per_run}) or in cooldown periods"
-            )
-            return "no_more_runs"
-
-        # Process the selected run
-        run = run_to_process
-        run_id = run["id"]
-        status = run["status"]
-        gfs_time = run["gfs_init_time_utc"]
-        run_age_hours = (
-            datetime.now(timezone.utc) - run["run_initiation_time"]
-        ).total_seconds() / 3600
-
-        # Track this attempt
-        attempt_count = processed_runs_this_session.get(run_id, 0) + 1
-        processed_runs_this_session[run_id] = attempt_count
-
-        logger.info(
-            f"Sequential recovery processing: Run {run_id} (status='{status}', age={run_age_hours:.1f}h, attempt={attempt_count}/{max_attempts_per_run})"
-        )
-
-        # Handle failure states that might be recoverable (we already passed cooldown check above)
-        if status in potentially_recoverable_failure_states:
-            logger.info(
-                f"Recovering run {run_id}: resetting failure state '{status}' and re-running full hash verification workflow (passed {run_cooldown_minutes}min cooldown)"
-            )
-
-            # Reset run status
-            await _update_run_status(self, run_id, "verifying_input_hashes")
-
-            # Also reset miner responses back to fresh state for full retry
-            reset_miner_responses_query = """
-            UPDATE weather_miner_responses 
-            SET status = 'fetch_initiated', 
-                input_hash_miner = NULL,
-                input_hash_validator = NULL, 
-                input_hash_match = NULL,
-                error_message = '',
-                last_polled_time = NULL
-            WHERE run_id = :run_id 
-            AND status IN ('input_hash_mismatch', 'input_fetch_error', 'input_hash_timeout', 
-                          'input_poll_error', 'input_validation_complete', 'inference_triggered')
-            """
-            reset_result = await self.db_manager.execute(
-                reset_miner_responses_query, {"run_id": run_id}
-            )
-            logger.info(
-                f"[Run {run_id}] Reset miner responses to fresh state for recovery retry"
-            )
-
-            await self._execute_hash_verification_workflow(run_id)
-            return "run_processed"
-
-        # Recover based on current status - process synchronously
-        try:
-            if status == "sending_fetch_requests" or status == "no_miners_to_poll":
-                # Check if we have any miner responses for this run
-                existing_responses = await self.db_manager.fetch_one(
-                    "SELECT COUNT(*) as count FROM weather_miner_responses WHERE run_id = :run_id",
-                    {"run_id": run_id},
-                )
-                response_count = (
-                    existing_responses["count"] if existing_responses else 0
-                )
-
-                if response_count == 0 or status == "no_miners_to_poll":
-                    # No responses recorded - need to actually send fetch requests
-                    logger.info(
-                        f"Recovering run {run_id}: Actually re-sending fetch requests to miners (found {response_count} existing responses)"
-                    )
-
-                    # Get the GFS times from the run
-                    run_data = await self.db_manager.fetch_one(
-                        "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id",
-                        {"run_id": run_id},
-                    )
-
-                    if not run_data:
-                        logger.error(f"Run {run_id} not found in database")
-                        return False
-
-                    gfs_t0_run_time = run_data["gfs_init_time_utc"]
-                    gfs_t_minus_6_run_time = gfs_t0_run_time - timedelta(hours=6)
-
-                    # Prepare the payload
-                    payload_data = WeatherInitiateFetchData(
-                        forecast_start_time=gfs_t0_run_time,
-                        previous_step_time=gfs_t_minus_6_run_time,
-                        validator_hotkey=(
-                            self.validator.keypair.ss58_address
-                            if self.validator.keypair
-                            else None
-                        ),
-                    )
-                    payload_dict = payload_data.model_dump(mode="json")
-
-                    payload = {"nonce": str(uuid.uuid4()), "data": payload_dict}
-
-                    # Actually send the requests to miners
-                    logger.info(
-                        f"[Run {run_id}] Sending weather initiate fetch requests to miners..."
-                    )
-                    responses = await self.validator.query_miners(
-                        payload=payload, endpoint="/weather-initiate-fetch"
-                    )
-                    logger.info(
-                        f"[Run {run_id}] Received {len(responses)} responses from miners."
-                    )
-
-                    # Process responses and record them
-                    accepted_count = 0
-                    for miner_hotkey, response_data in responses.items():
-                        try:
-                            miner_response = response_data
-                            if (
-                                isinstance(response_data, dict)
-                                and "text" in response_data
-                            ):
-                                try:
-                                    miner_response = loads(response_data["text"])
-                                except (Exception, TypeError):
-                                    miner_response = {"status": "parse_error"}
-
-                            if (
-                                isinstance(miner_response, dict)
-                                and miner_response.get("status")
-                                == WeatherTaskStatus.FETCH_ACCEPTED
-                                and miner_response.get("job_id")
-                            ):
-
-                                miner_uid_result = await self.db_manager.fetch_one(
-                                    "SELECT uid FROM node_table WHERE hotkey = :hk",
-                                    {"hk": miner_hotkey},
-                                )
-                                miner_uid = (
-                                    miner_uid_result["uid"] if miner_uid_result else -1
-                                )
-
-                                if miner_uid != -1:
-                                    miner_job_id = miner_response.get("job_id")
-
-                                    insert_resp_query = """
-                                        INSERT INTO weather_miner_responses
-                                        (run_id, miner_uid, miner_hotkey, response_time, status, job_id)
-                                        VALUES (:run_id, :uid, :hk, :resp_time, :status, :job_id)
-                                        ON CONFLICT (run_id, miner_uid) DO UPDATE SET
-                                        response_time = EXCLUDED.response_time,
-                                        status = EXCLUDED.status,
-                                        job_id = EXCLUDED.job_id
-                                    """
-                                    await self.db_manager.execute(
-                                        insert_resp_query,
-                                        {
-                                            "run_id": run_id,
-                                            "uid": miner_uid,
-                                            "hk": miner_hotkey,
-                                            "resp_time": datetime.now(timezone.utc),
-                                            "status": "fetch_initiated",
-                                            "job_id": miner_job_id,
-                                        },
-                                    )
-                                    accepted_count += 1
-                                    logger.debug(
-                                        f"[Run {run_id}] Recorded acceptance from Miner UID {miner_uid}"
-                                    )
-                        except Exception as e:
-                            logger.error(
-                                f"[Run {run_id}] Error processing response from {miner_hotkey}: {e}"
-                            )
-
-                    logger.info(
-                        f"[Run {run_id}] Recovery: {accepted_count} miners accepted fetch requests"
-                    )
-
-                    if accepted_count > 0:
-                        await _update_run_status(self, run_id, "awaiting_input_hashes")
-                        # Continue with hash verification after waiting
-                        await self._continue_run_workflow(run_id)
-                    else:
-                        logger.warning(
-                            f"[Run {run_id}] No miners accepted fetch requests during recovery"
-                        )
-                        await _update_run_status(self, run_id, "no_miners_to_poll")
-                else:
-                    # We have existing responses, just continue with hash verification
-                    logger.info(
-                        f"Recovering run {run_id}: Found {response_count} existing responses, continuing with hash verification"
-                    )
-                    await _update_run_status(self, run_id, "awaiting_input_hashes")
-                    await self._continue_run_workflow(run_id)
-
-            elif status == "awaiting_input_hashes":
-                logger.info(f"Recovering run {run_id}: continuing hash verification")
-                await _update_run_status(self, run_id, "verifying_input_hashes")
-                await self._continue_run_workflow(run_id)
-
-            elif status == "verifying_input_hashes":
-                logger.info(f"Recovering run {run_id}: re-running hash verification")
-                await self._continue_run_workflow(run_id)
-
-            elif status == "triggering_inference":
-                logger.info(
-                    f"Recovering run {run_id}: checking inference trigger status"
-                )
-                await _update_run_status(self, run_id, "awaiting_inference_results")
-                await self._continue_run_workflow(run_id)
-
-            elif status in ["awaiting_inference_results", "verifying_miner_forecasts"]:
-                logger.info(f"Recovering run {run_id}: processing ready for scoring")
-                await self._continue_run_workflow(run_id)
-
-            elif status == "day1_scoring_started":
-                # Check how long the run has been in this status before considering it stuck
-                # Scoring can take several minutes, especially with many miners
-                scoring_job_check = await self.db_manager.fetch_one(
-                    """SELECT started_at, status FROM weather_scoring_jobs 
-                       WHERE run_id = :run_id AND score_type = 'day1_qc'""",
-                    {"run_id": run_id},
-                )
-
-                should_recover = True
-                if scoring_job_check and scoring_job_check["started_at"]:
-                    time_in_scoring = (
-                        datetime.now(timezone.utc) - scoring_job_check["started_at"]
-                    ).total_seconds()
-                    # Allow at least 10 minutes for scoring to complete
-                    if time_in_scoring < 600:  # 10 minutes
-                        logger.debug(
-                            f"Run {run_id}: Still in active Day-1 scoring (elapsed: {time_in_scoring:.0f}s), skipping recovery"
-                        )
-                        should_recover = False
-                    else:
-                        logger.warning(
-                            f"Run {run_id}: Day-1 scoring stuck for {time_in_scoring:.0f}s, triggering recovery"
-                        )
-
-                if should_recover:
-                    logger.info(
-                        f"Recovering run {run_id}: resetting stuck Day-1 scoring state '{status}' after timeout"
-                    )
-
-                    # Reset run status to allow re-processing
-                    await _update_run_status(self, run_id, "verifying_miner_forecasts")
-
-                    # Reset Day-1 scoring job to queued status for retry with smart partial logic
-                    reset_job_query = """
-                    UPDATE weather_scoring_jobs 
-                    SET status = 'queued', started_at = NULL, error_message = 'Reset due to scoring timeout'
-                    WHERE run_id = :run_id AND score_type = 'day1_qc' AND status IN ('in_progress', 'queued')
-                    """
-                    await self.db_manager.execute(
-                        reset_job_query, {"run_id": run_id, "score_type": "day1_qc"}
-                    )
-
-                    logger.info(
-                        f"Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' with 'day1_qc' job queued for smart partial retry"
-                    )
-
-                    # Trigger immediate scoring check
-                    await self._continue_run_workflow(run_id)
-
-            elif status in [
-                "day1_scoring_failed",
-                "initial_scoring_failed",
-                "initial_scoring_queued",
-            ]:
-                logger.info(
-                    f"Recovering run {run_id}: Retrying failed/stuck Day-1 scoring (status: '{status}')"
-                )
-
-                # Check if we have any verified responses to score
-                verified_check = await self.db_manager.fetch_one(
-                    """SELECT COUNT(*) as count FROM weather_miner_responses 
-                       WHERE run_id = :run_id AND verification_passed = TRUE""",
-                    {"run_id": run_id},
-                )
-                verified_count = verified_check["count"] if verified_check else 0
-
-                if verified_count > 0:
-                    # Check if we already have some day1 scores (partial completion)
-                    existing_scores = await self.db_manager.fetch_one(
-                        "SELECT COUNT(*) as count FROM weather_miner_scores WHERE run_id = :run_id AND score_type = 'day1_qc_score'",
-                        {"run_id": run_id},
-                    )
-                    existing_count = existing_scores["count"] if existing_scores else 0
-
-                    logger.info(
-                        f"Run {run_id}: Found {verified_count} verified responses, {existing_count} already scored"
-                    )
-
-                    # Reset to trigger re-scoring
-                    await _update_run_status(self, run_id, "verifying_miner_forecasts")
-
-                    # Ensure scoring job exists and is queued
-                    await self.db_manager.execute(
-                        """INSERT INTO weather_scoring_jobs (run_id, score_type, status, created_at)
-                           VALUES (:run_id, 'day1_qc', 'queued', NOW())
-                           ON CONFLICT (run_id, score_type) 
-                           DO UPDATE SET status = 'queued', started_at = NULL, error_message = 'Retry after failure'""",
-                        {"run_id": run_id},
-                    )
-
-                    # Trigger scoring workflow
-                    await self._continue_run_workflow(run_id)
-
-                    # Don't call update_combined_weather_scores here - scoring hasn't completed yet
-                    # The scoring workers will call it when they complete
-
-                else:
-                    logger.warning(
-                        f"Run {run_id}: No verified responses available, cannot retry scoring"
-                    )
-                    await _update_run_status(
-                        self, run_id, "no_verified_responses_for_scoring"
-                    )
-
-            elif status == "era5_final_scoring_started":
-                logger.info(
-                    f"Recovering run {run_id}: resetting stuck ERA5 scoring state '{status}' - likely interrupted by restart"
-                )
-
-                # Check progress of both Day-1 and ERA5 scoring for smart recovery
-                day1_complete_check = await self.db_manager.fetch_one(
-                    "SELECT COUNT(*) as count FROM weather_miner_scores WHERE run_id = :run_id AND score_type = 'day1_qc_score'",
-                    {"run_id": run_id},
-                )
-
-                era5_partial_check = await self.db_manager.fetch_one(
-                    "SELECT COUNT(*) as era5_count FROM weather_miner_scores WHERE run_id = :run_id AND score_type = 'era5_final_composite_score'",
-                    {"run_id": run_id},
-                )
-
-                day1_count = day1_complete_check["count"] if day1_complete_check else 0
-                era5_count = (
-                    era5_partial_check["era5_count"] if era5_partial_check else 0
-                )
-
-                # Log partial recovery information
-                if era5_count > 0:
-                    logger.info(
-                        f"Run {run_id}: ERA5 partial progress detected - {era5_count} miners already have ERA5 scores"
-                    )
-
-                if day1_count > 0:
-                    # Day-1 scoring is complete, reset to day1_scoring_complete to trigger ERA5 scoring
-                    await _update_run_status(self, run_id, "day1_scoring_complete")
-                    logger.info(
-                        f"Run {run_id}: Reset from '{status}' to 'day1_scoring_complete' (Day-1 complete: {day1_count} miners) for ERA5 partial recovery"
-                    )
-                else:
-                    # Day-1 scoring not complete, reset to earlier state
-                    await _update_run_status(self, run_id, "verifying_miner_forecasts")
-                    logger.info(
-                        f"Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' (Day-1 not complete)"
-                    )
-
-                # Reset ERA5 scoring job to queued status for smart partial recovery
-                reset_job_query = """
-                UPDATE weather_scoring_jobs 
-                SET status = 'queued', started_at = NULL, error_message = 'Reset for partial recovery after validator restart'
-                WHERE run_id = :run_id AND score_type = 'era5_final' AND status IN ('in_progress', 'queued')
-                """
-                await self.db_manager.execute(
-                    reset_job_query, {"run_id": run_id, "score_type": "era5_final"}
-                )
-
-                if era5_count > 0:
-                    logger.info(
-                        f"Run {run_id}: Reset ERA5 scoring job for smart partial recovery (will resume from {era5_count} completed miners)"
-                    )
-                else:
-                    logger.info(
-                        f"Run {run_id}: Reset ERA5 scoring job for full scoring"
-                    )
-
-                # Trigger immediate scoring check
-                await self._continue_run_workflow(run_id)
-
-        except Exception as recovery_error:
-            logger.error(
-                f"Error recovering run {run_id}: {recovery_error}", exc_info=True
-            )
-            await _update_run_status(
-                self, run_id, "recovery_failed", error_message=str(recovery_error)
-            )
-
-        return "run_processed"  # Normal recovery, not stale
+        logger.debug("_check_and_recover_incomplete_runs_sequential disabled in new pipeline")
+        return "disabled"
 
     async def _check_and_recover_incomplete_runs(self):
         """
+        DEPRECATED: This function uses the old bulk query system and is replaced by the job-based pipeline.
+        This function is never called and should be removed in the next cleanup.
         Check for incomplete runs from previous validator sessions and attempt to recover them.
         Returns True if any runs were recovered and should be processed.
         """
@@ -6020,7 +4965,11 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         return len(incomplete_runs) > 0
 
     async def _continue_run_workflow(self, run_id: int):
-        """Continue the workflow for a recovered run."""
+        """
+        DEPRECATED: This function uses the old bulk query system and is replaced by the job-based pipeline.
+        Only called from _check_and_recover_incomplete_runs_sequential which is disabled.
+        Continue the workflow for a recovered run.
+        """
         try:
             logger.info(f"[Run {run_id}] Continuing workflow from recovery...")
 
@@ -6058,6 +5007,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
     async def _execute_hash_verification_workflow(self, run_id: int):
         """
+        DEPRECATED: This function uses the old bulk query system and is replaced by the job-based pipeline.
+        Only called from _check_and_recover_incomplete_runs_sequential which is disabled.
         Execute the complete hash verification workflow for a run.
         This is extracted from the main validator_execute flow and reusable for recovery.
         """
@@ -6147,31 +5098,20 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         "nonce": str(uuid.uuid4()),
                         "data": status_payload_data.model_dump(),
                     }
-                    endpoint = "/weather-get-input-status"
+                    endpoint = "/weather-poll-job-status"
 
-                    all_responses = await self.validator.query_miners(
-                        payload=status_payload, endpoint=endpoint, hotkeys=[miner_hk]
+                    from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import poll_miner_job_status
+                    status_response = await poll_miner_job_status(
+                        validator=self.validator,
+                        miner_hotkey=miner_hk,
+                        job_id=miner_job_id,
+                        db_manager=self.db_manager,
                     )
 
-                    status_response = all_responses.get(miner_hk)
-
-                    if status_response:
-                        parsed_response = status_response
-                        if (
-                            isinstance(status_response, dict)
-                            and "text" in status_response
-                        ):
-                            try:
-                                parsed_response = loads(status_response["text"])
-                            except (Exception, TypeError) as json_err:
-                                logger.warning(
-                                    f"[Run {run_id}] Failed to parse status response text for {miner_hk[:8]}: {json_err}"
-                                )
-                                parsed_response = {
-                                    "status": "parse_error",
-                                    "message": str(json_err),
-                                }
-
+                    if status_response and status_response.get("success"):
+                        # Extract the data from the standardized response format
+                        parsed_response = status_response.get("data", {})
+                        
                         logger.debug(
                             f"[Run {run_id}] Received status from {miner_hk[:8]}: {parsed_response}"
                         )
@@ -6289,7 +5229,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                             logger.warning(
                                 f"[Run {run_id}] Hash MISMATCH for response ID {resp_id}. Miner: {miner_hash[:10]}... Validator: {validator_input_hash[:10]}... (Miner status: {miner_status})"
                             )
-                            new_db_status = "input_hash_mismatch"
+                            new_db_status = "failed"
                             hash_match = False
                     elif miner_status == WeatherTaskStatus.FETCH_ERROR.value:
                         new_db_status = "input_fetch_error"
@@ -6351,15 +5291,15 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 f"[Run {run_id}] Miner for response ID {resp_id} exhausted all 3 retries (status: {miner_status}). "
                                 f"Marking as input timeout after final retry at 15 minutes."
                             )
-                            new_db_status = "input_hash_timeout"
+                            new_db_status = "failed"
                     elif miner_status in [
                         "validator_poll_failed",
                         "validator_poll_error",
                     ]:
-                        new_db_status = "input_poll_error"
+                        new_db_status = "failed"
                         # The detailed error message is already captured in error_msg from status_data.get('message')
                     else:
-                        new_db_status = "input_fetch_error"
+                        new_db_status = "failed"
 
                     if new_db_status:
                         update_query = """
@@ -6551,6 +5491,15 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
     async def _create_scoring_job(self, run_id: int, score_type: str) -> bool:
         """Create a persistent scoring job record."""
         try:
+            # Also enqueue into generic validator_jobs for unified dispatch
+            job_type = (
+                "weather.scoring.day1_qc" if score_type == "day1_qc" else "weather.scoring.era5_final"
+            )
+            payload = {"run_id": run_id, "score_type": score_type}
+            _ = await self.db_manager.enqueue_validator_job(
+                job_type=job_type, payload=payload, priority=50, run_id=run_id
+            )
+            # Keep existing table updated for compatibility
             query = """
             INSERT INTO weather_scoring_jobs 
             (run_id, score_type, status, created_at)
@@ -6566,7 +5515,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     "created_at": datetime.now(timezone.utc),
                 },
             )
-            logger.info(f"[Run {run_id}] Created {score_type} scoring job")
+            logger.info(f"[Run {run_id}] Created {score_type} scoring job (+ generic queue)")
             return True
         except Exception as e:
             logger.error(
@@ -6578,6 +5527,21 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
     async def _start_scoring_job(self, run_id: int, score_type: str) -> bool:
         """Mark a scoring job as started."""
         try:
+            # Update generic queue status if exists (best-effort)
+            try:
+                jtype = (
+                    "weather.scoring.day1_qc" if score_type == "day1_qc" else "weather.scoring.era5_final"
+                )
+                await self.db_manager.execute(
+                    """
+                    UPDATE validator_jobs
+                    SET status = 'in_progress', started_at = COALESCE(started_at, NOW())
+                    WHERE run_id = :rid AND job_type = :jtype AND status IN ('pending','retry_scheduled')
+                    """,
+                    {"rid": run_id, "jtype": jtype},
+                )
+            except Exception:
+                pass
             query = """
             UPDATE weather_scoring_jobs 
             SET status = 'in_progress', started_at = :started_at
@@ -6610,6 +5574,31 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         """Mark a scoring job as completed."""
         try:
             status = "completed" if success else "failed"
+            # Best-effort finish generic queue item if exists
+            try:
+                jtype = (
+                    "weather.scoring.day1_qc" if score_type == "day1_qc" else "weather.scoring.era5_final"
+                )
+                if success:
+                    await self.db_manager.execute(
+                        """
+                        UPDATE validator_jobs
+                        SET status = 'completed', completed_at = NOW(), lease_expires_at = NULL
+                        WHERE run_id = :rid AND job_type = :jtype
+                        """,
+                        {"rid": run_id, "jtype": jtype},
+                    )
+                else:
+                    await self.db_manager.execute(
+                        """
+                        UPDATE validator_jobs
+                        SET status = 'failed', last_error = :err, completed_at = NOW(), lease_expires_at = NULL
+                        WHERE run_id = :rid AND job_type = :jtype
+                        """,
+                        {"rid": run_id, "jtype": jtype, "err": (error_message or "")[:10000]},
+                    )
+            except Exception:
+                pass
             query = """
             UPDATE weather_scoring_jobs 
             SET status = :status, completed_at = :completed_at, error_message = :error_msg

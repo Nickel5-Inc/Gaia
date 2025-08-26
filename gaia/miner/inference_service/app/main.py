@@ -9,21 +9,19 @@ import logging
 import os
 import pickle
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple
 
 import uvicorn
 import yaml
-from fastapi import FastAPI, HTTPException, Request, Security, status
-from fastapi.responses import StreamingResponse, Response
+from fastapi import FastAPI, HTTPException, Request, status, Response
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 import pandas as pd
-
+import runpod 
 
 from pathlib import Path
 import uuid
 import tarfile
-import runpod
 import subprocess
 import shutil
 import tempfile
@@ -96,7 +94,7 @@ _logger = logging.getLogger(__name__)  # Logger for this specific module
 _logger.info(f"Initial logging configured with level: {_log_level_str}")
 
 # --- Actual imports from local modules ---
-from .data_preprocessor import prepare_input_batch_from_payload
+
 from . import inference_runner as ir_module  # Import the module itself
 from .inference_runner import (
     initialize_inference_runner,
@@ -283,41 +281,7 @@ async def _execute_runpodctl_receive(
         return False
 
 
-async def _execute_runpodctl_send(
-    file_path: Path, timeout_seconds: int = 600
-) -> Optional[str]:
-    """Sends a file using runpodctl and returns the one-time code."""
-    if not file_path.is_file():
-        _logger.error(f"[RunpodctlSend] File not found for sending: {file_path}")
-        return None
-    command = ["runpodctl", "send", str(file_path)]
-    _logger.info(f"Attempting to send file with runpodctl: {file_path}")
-    success, stdout, stderr = await _run_subprocess_command(
-        command, timeout_seconds=timeout_seconds
-    )
-    if success:
-        # Expected output:
-        # Sending 'your_file.tar.gz' (1.2 MiB)
-        # Code is: 1234-some-random-words
-        # On the other computer run
-        # runpodctl receive 1234-some-random-words
-        lines = stdout.splitlines()
-        for line in lines:
-            if "Code is:" in line:
-                code = line.split("Code is:", 1)[1].strip()
-                _logger.info(
-                    f"runpodctl send successful for {file_path}. Code: {code}. Full stdout: {stdout}"
-                )
-                return code
-        _logger.error(
-            f"runpodctl send for {file_path} appeared successful but code line not found in stdout: {stdout}"
-        )
-        return None
-    else:
-        _logger.error(
-            f"runpodctl send failed for {file_path}. Stdout: {stdout}, Stderr: {stderr}"
-        )
-        return None
+
 
 
 # --- R2 Helper Functions ---
@@ -579,7 +543,6 @@ async def health_check():
 
 async def _process_and_upload_steps(
     predictions: List[Batch],
-    input_batch_base_time: pd.Timestamp,
     job_run_uuid: str,
     config: Dict[str, Any],
 ) -> Tuple[int, Optional[str], Optional[str]]:
@@ -829,7 +792,6 @@ async def _perform_inference_and_upload(
     # New direct-to-R2 upload logic
     num_steps, output_prefix, error_msg = await _process_and_upload_steps(
         predictions=prediction_steps_batch_list,
-        input_batch_base_time=base_time_for_coords,
         job_run_uuid=job_run_uuid,
         config=app_config,
     )
@@ -1390,7 +1352,10 @@ async def initialize_app_for_runpod():
                     r2_config = Config(
                         signature_version="s3v4",
                         max_pool_connections=200,  # Increased from 50 to prevent connection pool exhaustion
-                        retries={"max_attempts": 5, "mode": "adaptive"},
+                        retries={
+                            "max_attempts": 5,
+                            "mode": "adaptive"
+                        },
                         tcp_keepalive=True,
                         region_name="auto",
                         connect_timeout=10,

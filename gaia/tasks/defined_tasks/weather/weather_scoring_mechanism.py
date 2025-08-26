@@ -2,6 +2,7 @@ import asyncio
 import traceback
 import gc
 import os
+import sys
 import json
 import time
 from datetime import datetime, timezone, timedelta
@@ -12,14 +13,15 @@ import xarray as xr
 import pandas as pd
 import xskillscore as xs
 
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from typing import TYPE_CHECKING, Any, Optional, Dict, List, Tuple
 
 if TYPE_CHECKING:
     from .weather_task import WeatherTask
 
 from .processing.weather_logic import _request_fresh_token
-from .utils.remote_access import open_verified_remote_zarr_dataset
+from .utils.remote_access import open_verified_remote_zarr_dataset, get_last_verified_open_error
+from .utils.hashing import verify_minimal_chunks_and_reconstruct_manifest_hash, is_rehash_verified, get_last_manifest_log
 
 from .weather_scoring.metrics import (
     calculate_bias_corrected_forecast,
@@ -67,8 +69,52 @@ async def evaluate_miner_forecast_day1(
     # Start timing for this miner's scoring
     scoring_start_time = time.time()
     logger.info(
-        f"[Day1Score] Starting for miner {miner_hotkey} (Resp: {response_id}, Run: {run_id}, Job: {job_id}, UID: {miner_uid})"
+        f"[Day1Score] Starting for miner {miner_hotkey[:8]}...{miner_hotkey[-8:]} (Resp: {response_id}, Run: {run_id}, Job: {job_id}, UID: {miner_uid})"
     )
+    
+    # CRITICAL: Validate job_id ownership across miner records
+    if job_id:
+        try:
+            logger.info(
+                f"[Day1Score] Job {job_id} assigned to miner UID {miner_uid} with hotkey {miner_hotkey[:8]}...{miner_hotkey[-8:]}. "
+                f"Validating job ownership..."
+            )
+            
+            # CRITICAL: Check if this job_id appears in multiple miner records (data corruption)
+            job_ownership_check = await task_instance.db_manager.fetch_all(
+                """
+                SELECT miner_uid, miner_hotkey, status, response_time 
+                FROM weather_miner_responses 
+                WHERE job_id = :job_id
+                ORDER BY response_time DESC
+                """,
+                {"job_id": job_id}
+            )
+            
+            if len(job_ownership_check) > 1:
+                logger.error(
+                    f"[DATA CORRUPTION] Job {job_id} appears in {len(job_ownership_check)} different miner records:"
+                )
+                for i, record in enumerate(job_ownership_check):
+                    logger.error(
+                        f"  [{i+1}] UID {record['miner_uid']}, hotkey {record['miner_hotkey'][:8]}...{record['miner_hotkey'][-8:]}, "
+                        f"status: {record['status']}, time: {record['response_time']}"
+                    )
+                logger.error(f"[DATA CORRUPTION] This job should only belong to ONE miner!")
+            elif len(job_ownership_check) == 1:
+                owner = job_ownership_check[0]
+                if owner["miner_uid"] != miner_uid or owner["miner_hotkey"] != miner_hotkey:
+                    logger.error(
+                        f"[DATA CORRUPTION] Job {job_id} ownership mismatch: "
+                        f"Current scoring: UID {miner_uid}, hotkey {miner_hotkey[:8]}...{miner_hotkey[-8:]} "
+                        f"Database record: UID {owner['miner_uid']}, hotkey {owner['miner_hotkey'][:8]}...{owner['miner_hotkey'][-8:]}"
+                    )
+            else:
+                logger.info(f"[Day1Score] Job {job_id} ownership validated - single record found")
+        except Exception as e:
+            logger.warning(f"[Day1Score] Could not validate job ownership: {e}")
+    else:
+        logger.warning(f"[Day1Score] No job_id provided, cannot validate ownership")
 
     day1_results = {
         "response_id": response_id,
@@ -156,30 +202,113 @@ async def evaluate_miner_forecast_day1(
             task_instance.config.get("verification_timeout_seconds", 300) / 2
         )
 
-        miner_forecast_ds = await asyncio.wait_for(
-            open_verified_remote_zarr_dataset(
+        # Efficient verification & single open for Day1 as well
+        miner_forecast_ds = None
+        if not is_rehash_verified(zarr_store_url, claimed_manifest_content_hash):
+            # Determine times/vars for Day1 minimal verification
+            lead_times_to_score_hours: List[int] = day1_scoring_config.get(
+                "lead_times_hours",
+                task_instance.config.get("initial_scoring_lead_hours", [6, 12]),
+            )
+            times_to_evaluate = [
+                run_gfs_init_time + timedelta(hours=h) for h in lead_times_to_score_hours
+            ]
+            variables_to_score: List[Dict] = day1_scoring_config.get(
+                "variables_levels_to_score", []
+            )
+            variables = [vc["name"] for vc in variables_to_score if isinstance(vc, dict) and "name" in vc]
+            levels = None
+            try:
+                if any(vc.get("level") in ("all", None) and vc.get("name") in ("t","u","v","q","z") for vc in variables_to_score if isinstance(vc, dict)):
+                    levels = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
+            except Exception:
+                levels = None
+            ok_min, min_details, preopened_ds = await verify_minimal_chunks_and_reconstruct_manifest_hash(
                 zarr_store_url=zarr_store_url,
                 claimed_manifest_content_hash=claimed_manifest_content_hash,
                 miner_hotkey_ss58=miner_hotkey,
-                storage_options=storage_options,
-                job_id=f"{job_id}_day1_score",
-            ),
-            timeout=verification_timeout_seconds,
-        )
+                variables=variables,
+                times=[pd.Timestamp(t) for t in times_to_evaluate],
+                levels=levels,
+                headers=storage_options.get("headers"),
+                job_id=f"{job_id}_day1_minrehash",
+            )
+            if ok_min and preopened_ds is not None:
+                miner_forecast_ds = preopened_ds
+            else:
+                # Strict single-pass fallback: skip minimal verify and attempt strict verified open directly
+                logger.warning(
+                    f"[Day1Score] Minimal verify failed or preopen None (error={min_details.get('error') if isinstance(min_details, dict) else 'unknown'}). "
+                    f"Attempting strict verified open without minimal subset." 
+                )
+                miner_forecast_ds = await asyncio.wait_for(
+                    open_verified_remote_zarr_dataset(
+                        zarr_store_url=zarr_store_url,
+                        claimed_manifest_content_hash=claimed_manifest_content_hash,
+                        miner_hotkey_ss58=miner_hotkey,
+                        storage_options=storage_options,
+                        job_id=f"{job_id}_day1_strict_open",
+                    ),
+                    timeout=verification_timeout_seconds,
+                )
+        if miner_forecast_ds is None:
+            try:
+                miner_forecast_ds = await asyncio.wait_for(
+                    open_verified_remote_zarr_dataset(
+                        zarr_store_url=zarr_store_url,
+                        claimed_manifest_content_hash=claimed_manifest_content_hash,
+                        miner_hotkey_ss58=miner_hotkey,
+                        storage_options=storage_options,
+                        job_id=f"{job_id}_day1_score",
+                    ),
+                    timeout=verification_timeout_seconds,
+                )
+            except Exception as open_err:
+                logger.error(
+                    f"[Day1Score] Exception during verified open for {miner_hotkey} at {zarr_store_url}: {open_err}",
+                    exc_info=True,
+                )
+                miner_forecast_ds = None
 
         if miner_forecast_ds is None:
             logger.error(
-                f"[Day1Score] Failed to open verified Zarr dataset for miner {miner_hotkey} - manifest verification failed"
+                f"[Day1Score] Failed to open verified Zarr dataset for miner {miner_hotkey} - manifest verification failed\n"
+                f"  URL: {zarr_store_url}\n  ClaimedHash: {claimed_manifest_content_hash}"
             )
+            try:
+                # If minimal verification was attempted, log its details and traceback
+                if 'min_details' in locals() and min_details is not None:
+                    logger.error(f"[Day1Score] Minimal verification details: {json.dumps(min_details, default=str)[:2000]}")
+                    if isinstance(min_details, dict) and min_details.get('open_exception'):
+                        logger.error("[Day1Score] Minimal verification subset open traceback follows:\n" + str(min_details.get('open_exception')))
+                # Also log the last manifest verification log for more context
+                last_log = get_last_manifest_log(f"{job_id}_day1_minrehash") or get_last_manifest_log(f"{job_id}_day1_score")
+                if last_log:
+                    logger.error(f"[Day1Score] Last manifest verify log: {json.dumps(last_log, default=str)[:2000]}")
+                # Capture last verified open error
+                last_open_err = get_last_verified_open_error(f"{job_id}_day1_score")
+                if last_open_err:
+                    logger.error(f"[Day1Score] Last verified open error: {last_open_err}")
+            except Exception:
+                pass
             # Import the cleanup function
             from .processing.weather_logic import _check_run_completion
 
             # Mark this miner as failed but don't crash the entire batch
             await task_instance.db_manager.execute(
                 """UPDATE weather_miner_responses 
-                   SET status = 'verification_failed', error_message = 'Manifest verification failed during day1 scoring'
+                   SET status = 'verification_failed', 
+                       error_message = 'Manifest verification failed during day1 scoring',
+                       kerchunk_json_url = :url,
+                       verification_hash_claimed = :hash,
+                       verification_passed = false
                    WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey""",
-                {"run_id": run_id, "miner_hotkey": miner_hotkey},
+                {
+                    "run_id": run_id, 
+                    "miner_hotkey": miner_hotkey,
+                    "url": zarr_store_url,
+                    "hash": claimed_manifest_content_hash
+                },
             )
             # Check if this was the last miner in the run
             await _check_run_completion(task_instance, run_id)
@@ -187,6 +316,21 @@ async def evaluate_miner_forecast_day1(
             day1_results["overall_day1_score"] = 0.0
             day1_results["qc_passed_all_vars_leads"] = False
             return day1_results  # Return graceful failure rather than exception
+        else:
+            # Verification succeeded - update tracking
+            await task_instance.db_manager.execute(
+                """UPDATE weather_miner_responses 
+                   SET kerchunk_json_url = :url,
+                       verification_hash_claimed = :hash,
+                       verification_passed = true
+                   WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey""",
+                {
+                    "run_id": run_id, 
+                    "miner_hotkey": miner_hotkey,
+                    "url": zarr_store_url,
+                    "hash": claimed_manifest_content_hash
+                },
+            )
 
         hardcoded_valid_times: Optional[List[datetime]] = day1_scoring_config.get(
             "hardcoded_valid_times_for_eval"
@@ -212,27 +356,184 @@ async def evaluate_miner_forecast_day1(
         variables_to_score: List[Dict] = day1_scoring_config.get(
             "variables_levels_to_score", []
         )
+        
+        # CRITICAL: Debug scoring configuration to understand why scores are 0
+        logger.info(
+            f"[Day1Score] Miner {miner_hotkey[:8]}...{miner_hotkey[-8:]}: Scoring configuration:"
+            f"\n  Variables to score: {len(variables_to_score)} variables"
+            f"\n  Times to evaluate: {len(times_to_evaluate)} time steps"
+            f"\n  Lead times: {day1_scoring_config.get('lead_times_hours', 'not set')}"
+        )
+        
+        if not variables_to_score:
+            logger.error(
+                f"[Day1Score] Miner {miner_hotkey[:8]}...{miner_hotkey[-8:]}: "
+                f"No variables configured for scoring! This will result in 0 score. "
+                f"Check day1_variables_levels_to_score configuration."
+            )
+        
+        if not times_to_evaluate:
+            logger.error(
+                f"[Day1Score] Miner {miner_hotkey[:8]}...{miner_hotkey[-8:]}: "
+                f"No time steps to evaluate! This will result in 0 score. "
+                f"Check lead_times_hours configuration."
+            )
+
+        # CRITICAL FIX: Apply variable mapping to ALL datasets for consistency
+        logger.info(
+            f"[Day1Score] Miner {miner_hotkey[:8]}...{miner_hotkey[-8:]}: "
+            f"Applying variable mapping to all datasets for consistency..."
+        )
+        
+        # Define the variable mapping from raw GFS names to scoring names
+        var_mapping = {
+            "tmp2m": "2t",
+            "ugrd10m": "10u", 
+            "vgrd10m": "10v",
+            "prmslmsl": "msl",
+            "tmpprs": "t",
+            "ugrdprs": "u",
+            "vgrdprs": "v", 
+            "spfhprs": "q",
+            "hgtprs": "z_height",
+        }
+        
+        def apply_variable_mapping(dataset, dataset_name):
+            """Apply variable mapping and coordinate renaming to a dataset"""
+            logger.info(f"[Day1Score] Original {dataset_name} variables: {list(dataset.data_vars)}")
+            logger.info(f"[Day1Score] Original {dataset_name} coordinates: {list(dataset.coords.keys())}")
+            
+            # Apply variable renaming
+            vars_to_rename = {k: v for k, v in var_mapping.items() if k in dataset.data_vars}
+            if vars_to_rename:
+                logger.info(f"[Day1Score] Renaming {dataset_name} variables: {vars_to_rename}")
+                dataset = dataset.rename(vars_to_rename)
+                
+                # Convert geopotential height to geopotential if present
+                if "z_height" in dataset.data_vars:
+                    logger.info(f"[Day1Score] Converting {dataset_name} geopotential height to geopotential...")
+                    G = 9.80665  # Standard gravity
+                    z_height_var = dataset["z_height"]
+                    geopotential = G * z_height_var
+                    dataset["z"] = geopotential
+                    dataset["z"].attrs = {
+                        "units": "m2 s-2",
+                        "long_name": "Geopotential",
+                        "standard_name": "geopotential"
+                    }
+                    dataset = dataset.drop_vars("z_height")
+            
+            # CRITICAL: Apply coordinate renaming for pressure levels
+            coord_mapping = {
+                "lev": "pressure_level",
+                "latitude": "lat", 
+                "longitude": "lon"
+            }
+            
+            coords_to_rename = {k: v for k, v in coord_mapping.items() if k in dataset.coords}
+            if coords_to_rename:
+                logger.info(f"[Day1Score] Renaming {dataset_name} coordinates: {coords_to_rename}")
+                dataset = dataset.rename(coords_to_rename)
+                    
+            logger.info(f"[Day1Score] Final {dataset_name} variables: {list(dataset.data_vars)}")
+            logger.info(f"[Day1Score] Final {dataset_name} coordinates: {list(dataset.coords.keys())}")
+            
+            return dataset
+        
+        try:
+            # Apply mapping to all three datasets
+            miner_forecast_ds = apply_variable_mapping(miner_forecast_ds, "miner_forecast")
+            gfs_analysis_data_for_run = apply_variable_mapping(gfs_analysis_data_for_run, "gfs_analysis")
+            gfs_reference_forecast_for_run = apply_variable_mapping(gfs_reference_forecast_for_run, "gfs_reference")
+                
+        except Exception as e:
+            logger.error(f"[Day1Score] Failed to apply variable mapping: {e}")
+            day1_results["error_message"] = f"Variable mapping failed: {str(e)}"
+            day1_results["overall_day1_score"] = -np.inf
+            return day1_results
 
         aggregated_skill_scores = []
         aggregated_acc_scores = []
 
-        # OPTIMIZATION 8: PARALLEL TIME STEP PROCESSING
-        # Process all time steps simultaneously instead of sequentially for major additional speedup
-        # Expected speedup: 2x for 2 time steps (5s → 2.5s)
+        # OPTIMIZED DAY1 QUALITY CONTROL: Fast sequential processing for essential variables
+        # Day1 scoring focuses on atmospheric validity and GFS clone detection, not comprehensive analysis
+        # Using minimal variable set (5 variables) for maximum speed while maintaining quality control
 
         logger.info(
-            f"[Day1Score] Miner {miner_hotkey}: Starting PARALLEL processing of {len(times_to_evaluate)} time steps"
+            f"[Day1Score] Miner {miner_hotkey}: Starting OPTIMIZED DAY1 QC processing - {len(variables_to_score)} variables, {len(times_to_evaluate)} time steps"
         )
         parallel_timesteps_start = time.time()
 
-        # Create parallel tasks for all time steps
-        timestep_tasks = []
-        for valid_time_dt in times_to_evaluate:
+        # SEQUENTIAL PRE-LOADING: Load variables one by one to avoid overwhelming the system
+        # This prevents the massive memory spike of loading everything at once
+        logger.info(f"[Day1Score] Miner {miner_hotkey}: Using sequential pre-loading strategy...")
+        
+        try:
+            variables_needed = [var_config["name"] for var_config in variables_to_score]
+            variables_in_dataset = [var for var in variables_needed if var in miner_forecast_ds.data_vars]
+            
+            if variables_in_dataset:
+                # Convert times to proper format for selection
+                time_coords = []
+                for dt in times_to_evaluate:
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    else:
+                        dt = dt.astimezone(timezone.utc)
+                    time_coords.append(pd.Timestamp(dt))
+                
+                # Create focused subset
+                miner_subset = miner_forecast_ds[variables_in_dataset].sel(time=time_coords, method="nearest")
+                
+                # SEQUENTIAL LOADING: Load each variable separately to control memory usage
+                logger.info(f"[Day1Score] Pre-loading {len(variables_in_dataset)} variables sequentially...")
+                preload_start = time.time()
+                
+                loaded_vars = {}
+                for i, var_name in enumerate(variables_in_dataset):
+                    try:
+                        var_start = time.time()
+                        # Load this variable's data
+                        var_data = await asyncio.to_thread(lambda v=var_name: miner_subset[v].load())
+                        loaded_vars[var_name] = var_data
+                        var_time = time.time() - var_start
+                        logger.debug(f"[Day1Score] Loaded variable {var_name} in {var_time:.2f}s ({i+1}/{len(variables_in_dataset)})")
+                        
+                        # Small delay between variables to avoid overwhelming the server
+                        if i < len(variables_in_dataset) - 1:
+                            await asyncio.sleep(0.1)
+                            
+                    except Exception as var_err:
+                        logger.warning(f"[Day1Score] Failed to pre-load variable {var_name}: {var_err}")
+                        # Continue with lazy loading for this variable
+                        loaded_vars[var_name] = miner_subset[var_name]
+                
+                # Create new dataset with loaded variables
+                if loaded_vars:
+                    miner_forecast_ds = xr.Dataset(loaded_vars, attrs=miner_subset.attrs)
+                    # Copy coordinates
+                    for coord_name, coord_data in miner_subset.coords.items():
+                        if coord_name not in miner_forecast_ds.coords:
+                            miner_forecast_ds = miner_forecast_ds.assign_coords({coord_name: coord_data})
+                
+                preload_time = time.time() - preload_start
+                logger.info(f"[Day1Score] Miner {miner_hotkey}: Sequential pre-loading completed in {preload_time:.2f}s")
+                logger.info(f"[Day1Score] Loaded {len(loaded_vars)}/{len(variables_in_dataset)} variables successfully")
+            else:
+                logger.warning(f"[Day1Score] Miner {miner_hotkey}: No scoring variables found in dataset")
+                
+        except Exception as setup_err:
+            logger.warning(f"[Day1Score] Miner {miner_hotkey}: Sequential pre-loading failed: {setup_err}")
+            logger.warning("Falling back to standard lazy loading")
+
+        # Process time steps sequentially for better CPU efficiency
+        timestep_results = []
+        for i, valid_time_dt in enumerate(times_to_evaluate):
             effective_lead_h = int(
                 (valid_time_dt - run_gfs_init_time).total_seconds() / 3600
             )
 
-            # Normalize timezone for parallel processing
+            # Normalize timezone for processing
             if (
                 valid_time_dt.tzinfo is None
                 or valid_time_dt.tzinfo.utcoffset(valid_time_dt) is None
@@ -245,43 +546,33 @@ async def evaluate_miner_forecast_day1(
             time_key_for_results = effective_lead_h
             day1_results["lead_time_scores"][time_key_for_results] = {}
 
-            # Create parallel task for this time step
-            task = asyncio.create_task(
-                _process_single_timestep_parallel(
-                    valid_time_dt=valid_time_dt,
-                    effective_lead_h=effective_lead_h,
-                    variables_to_score=variables_to_score,
-                    miner_forecast_ds=miner_forecast_ds,
-                    gfs_analysis_data_for_run=gfs_analysis_data_for_run,
-                    gfs_reference_forecast_for_run=gfs_reference_forecast_for_run,
-                    era5_climatology=era5_climatology,
-                    precomputed_climatology_cache=precomputed_climatology_cache,
-                    day1_scoring_config=day1_scoring_config,
-                    run_gfs_init_time=run_gfs_init_time,
-                    miner_hotkey=miner_hotkey,
-                ),
-                name=f"timestep_{effective_lead_h}h_{miner_hotkey[:8]}",
+            logger.info(f"[Day1Score] Miner {miner_hotkey}: Processing time step {i+1}/{len(times_to_evaluate)}: +{effective_lead_h}h")
+            
+            # Process this time step sequentially
+            timestep_result = await _process_single_timestep_sequential(
+                valid_time_dt=valid_time_dt,
+                effective_lead_h=effective_lead_h,
+                variables_to_score=variables_to_score,
+                miner_forecast_ds=miner_forecast_ds,
+                gfs_analysis_data_for_run=gfs_analysis_data_for_run,
+                gfs_reference_forecast_for_run=gfs_reference_forecast_for_run,
+                era5_climatology=era5_climatology,
+                precomputed_climatology_cache=precomputed_climatology_cache,
+                day1_scoring_config=day1_scoring_config,
+                run_gfs_init_time=run_gfs_init_time,
+                miner_hotkey=miner_hotkey,
             )
-            timestep_tasks.append((effective_lead_h, task))
+            timestep_results.append(timestep_result)
 
-        # Execute all time steps in parallel and collect results
-        logger.debug(
-            f"[Day1Score] Miner {miner_hotkey}: Executing {len(timestep_tasks)} time step tasks in parallel..."
-        )
-
-        # Get just the tasks for asyncio.gather
-        tasks_only = [task for _, task in timestep_tasks]
-        timestep_results = await asyncio.gather(*tasks_only, return_exceptions=True)
-
-        parallel_timesteps_time = time.time() - parallel_timesteps_start
+        sequential_timesteps_time = time.time() - parallel_timesteps_start
         logger.info(
-            f"[Day1Score] Miner {miner_hotkey}: PARALLEL time step processing completed in {parallel_timesteps_time:.2f}s"
+            f"[Day1Score] Miner {miner_hotkey}: SEQUENTIAL time step processing completed in {sequential_timesteps_time:.2f}s"
         )
 
-        # Process results from parallel time step execution
-        for i, (effective_lead_h, _) in enumerate(timestep_tasks):
-            result = timestep_results[i]
-            time_key_for_results = effective_lead_h
+        # Process results from sequential time step execution
+        for i, result in enumerate(timestep_results):
+            # Get the effective lead hour from the result
+            time_key_for_results = result.get("effective_lead_h", i)
 
             if isinstance(result, Exception):
                 logger.error(
@@ -458,8 +749,8 @@ async def evaluate_miner_forecast_day1(
 
         # Log total scoring time for this miner
         total_scoring_time = time.time() - scoring_start_time
-        logger.info(
-            f"[Day1Score] TIMING: Miner {miner_hotkey} scoring completed in {total_scoring_time:.2f} seconds"
+        logger.success(
+            f"[Day1Score] ✅ TIMING: Miner {miner_hotkey} scoring completed in {total_scoring_time:.2f} seconds"
         )
 
     logger.info(
@@ -501,7 +792,7 @@ async def _process_single_variable_parallel(
     var_name = var_config["name"]
     var_level = var_config.get("level")
     standard_name_for_clim = var_config.get("standard_name", var_name)
-    var_key = f"{var_name}{var_level}" if var_level else var_name
+    var_key = f"{var_name}{var_level}" if var_level and var_level != "all" else var_name
 
     result = {
         "status": "processing",
@@ -516,6 +807,44 @@ async def _process_single_variable_parallel(
     }
 
     try:
+        # CRITICAL: Early coordinate validation to prevent downstream errors
+        try:
+            # Validate that required coordinates exist in datasets
+            if var_level and var_level != "all":
+                # Check pressure level coordinates
+                miner_pressure_dim = None
+                for dim_name in ["pressure_level", "lev", "plev", "level"]:
+                    if dim_name in miner_forecast_lead.dims:
+                        miner_pressure_dim = dim_name
+                        break
+                
+                if not miner_pressure_dim:
+                    raise KeyError(f"No pressure level dimension found in miner data for {var_key}. Available dims: {list(miner_forecast_lead.dims)}")
+                
+                # Validate pressure level exists
+                if miner_pressure_dim in miner_forecast_lead.coords:
+                    pressure_levels = miner_forecast_lead.coords[miner_pressure_dim].values
+                    if var_level not in pressure_levels:
+                        raise KeyError(f"Pressure level {var_level} not found in {miner_pressure_dim}. Available: {pressure_levels}")
+                        
+            # Validate spatial coordinates
+            for coord_name in ["lat", "lon", "latitude", "longitude"]:
+                if coord_name in ["lat", "latitude"] and coord_name not in miner_forecast_lead.coords:
+                    continue  # Will be handled by standardization
+                if coord_name in ["lon", "longitude"] and coord_name not in miner_forecast_lead.coords:
+                    continue  # Will be handled by standardization
+                    
+        except KeyError as coord_err:
+            import traceback
+            tb_str = traceback.format_exc()
+            logger.error(
+                f"[Day1Score] Miner {miner_hotkey}: Coordinate validation failed for {var_key}: {coord_err}\n"
+                f"Full traceback:\n{tb_str}"
+            )
+            result["status"] = "error"
+            result["error_message"] = f"Coordinate validation failed: {coord_err}"
+            return result
+        
         logger.debug(
             f"[Day1Score] Miner {miner_hotkey}: PARALLEL scoring Var: {var_key} at Valid Time: {valid_time_dt}"
         )
@@ -655,7 +984,8 @@ async def _process_single_variable_parallel(
                 if cache_key in cached_pressure_dims:
                     return cached_pressure_dims[cache_key]
 
-                for dim_name in ["pressure_level", "plev", "level"]:
+                # Check for renamed coordinate first, then fallbacks
+                for dim_name in ["pressure_level", "lev", "plev", "level"]:
                     if dim_name in data_array.dims:
                         cached_pressure_dims[cache_key] = dim_name
                         return dim_name
@@ -684,37 +1014,47 @@ async def _process_single_variable_parallel(
                 result["qc_failure_reason"] = "Missing pressure dimensions"
                 return result
 
-            miner_var_da_selected = miner_var_da_unaligned.sel(
-                {miner_pressure_dim: var_level}, method="nearest"
-            )
-            truth_var_da_selected = truth_var_da_unaligned.sel(
-                {truth_pressure_dim: var_level}, method="nearest"
-            )
-            ref_var_da_selected = ref_var_da_unaligned.sel(
-                {ref_pressure_dim: var_level}, method="nearest"
-            )
+            if var_level == "all":
+                # Keep all pressure levels for comprehensive scoring
+                miner_var_da_selected = miner_var_da_unaligned
+                truth_var_da_selected = truth_var_da_unaligned  
+                ref_var_da_selected = ref_var_da_unaligned
+                logger.info(f"Scoring {var_key} across all pressure levels")
+            else:
+                # Select specific pressure level
+                miner_var_da_selected = miner_var_da_unaligned.sel(
+                    {miner_pressure_dim: var_level}, method="nearest"
+                )
+                truth_var_da_selected = truth_var_da_unaligned.sel(
+                    {truth_pressure_dim: var_level}, method="nearest"
+                )
+                ref_var_da_selected = ref_var_da_unaligned.sel(
+                    {ref_pressure_dim: var_level}, method="nearest"
+                )
 
-            if abs(truth_var_da_selected[truth_pressure_dim].item() - var_level) > 10:
-                logger.warning(
-                    f"Truth data for {var_key} level {var_level} too far ({truth_var_da_selected[truth_pressure_dim].item()}). Skipping."
-                )
-                result["status"] = "skipped"
-                result["qc_failure_reason"] = "Truth data level too far from target"
-                return result
-            if abs(miner_var_da_selected[miner_pressure_dim].item() - var_level) > 10:
-                logger.warning(
-                    f"Miner data for {var_key} level {var_level} too far ({miner_var_da_selected[miner_pressure_dim].item()}). Skipping."
-                )
-                result["status"] = "skipped"
-                result["qc_failure_reason"] = "Miner data level too far from target"
-                return result
-            if abs(ref_var_da_selected[ref_pressure_dim].item() - var_level) > 10:
-                logger.warning(
-                    f"GFS Ref data for {var_key} level {var_level} too far ({ref_var_da_selected[ref_pressure_dim].item()}). Skipping."
-                )
-                result["status"] = "skipped"
-                result["qc_failure_reason"] = "Reference data level too far from target"
-                return result
+            # Skip level validation for "all" case since we're using all levels
+            if var_level != "all":
+                if abs(truth_var_da_selected[truth_pressure_dim].item() - var_level) > 10:
+                    logger.warning(
+                        f"Truth data for {var_key} level {var_level} too far ({truth_var_da_selected[truth_pressure_dim].item()}). Skipping."
+                    )
+                    result["status"] = "skipped"
+                    result["qc_failure_reason"] = "Truth data level too far from target"
+                    return result
+                if abs(miner_var_da_selected[miner_pressure_dim].item() - var_level) > 10:
+                    logger.warning(
+                        f"Miner data for {var_key} level {var_level} too far ({miner_var_da_selected[miner_pressure_dim].item()}). Skipping."
+                    )
+                    result["status"] = "skipped"
+                    result["qc_failure_reason"] = "Miner data level too far from target"
+                    return result
+                if abs(ref_var_da_selected[ref_pressure_dim].item() - var_level) > 10:
+                    logger.warning(
+                        f"GFS Ref data for {var_key} level {var_level} too far ({ref_var_da_selected[ref_pressure_dim].item()}). Skipping."
+                    )
+                    result["status"] = "skipped"
+                    result["qc_failure_reason"] = "Reference data level too far from target"
+                    return result
         else:
             miner_var_da_selected = miner_var_da_unaligned
             truth_var_da_selected = truth_var_da_unaligned
@@ -799,9 +1139,33 @@ async def _process_single_variable_parallel(
         )
 
         broadcasted_weights_final = None
+        # CRITICAL: Only use dimensions that exist in ALL arrays for MSE calculation
+        # This prevents the "tuple.index(x): x not in tuple" error
+        common_dims = set(truth_var_da_final.dims) & set(miner_var_da_aligned.dims) & set(ref_var_da_aligned.dims)
+        
+        # CRITICAL: Remove duplicate pressure level dimensions if they exist
+        # This prevents the (13, 13) matrix issue when both 'plev' and 'pressure_level' exist
+        pressure_dims_in_common = [d for d in common_dims if d in ("pressure_level", "plev", "lev", "level")]
+        if len(pressure_dims_in_common) > 1:
+            logger.warning(
+                f"[Day1Score] Multiple pressure dimensions detected: {pressure_dims_in_common}. "
+                f"Using only 'pressure_level' to prevent duplication."
+            )
+            # Remove old pressure dimension names, keep only 'pressure_level'
+            common_dims = common_dims - set(pressure_dims_in_common) | {"pressure_level"}
+        
         spatial_dims_for_metric = [
-            d for d in truth_var_da_final.dims if d in ("lat", "lon")
+            d for d in common_dims if d not in ("time",)
         ]
+        
+        # Debug: Log the dimensions being used for MSE calculation
+        logger.debug(
+            f"[Day1Score] Dimension analysis for {var_key}:\n"
+            f"  Truth dims: {truth_var_da_final.dims}\n"
+            f"  Miner dims: {miner_var_da_aligned.dims}\n"
+            f"  Ref dims: {ref_var_da_aligned.dims}\n"
+            f"  MSE reduction dims: {spatial_dims_for_metric}"
+        )
 
         actual_lat_dim_in_target = "lat" if "lat" in truth_var_da_final.dims else None
 
@@ -810,17 +1174,27 @@ async def _process_single_variable_parallel(
                 # OPTIMIZATION 2: Use cached latitude weights if grid dimensions match
                 current_grid_dims = (truth_var_da_final.dims, truth_var_da_final.shape)
 
+                # Check if we can reuse cached weights, but ensure dimension compatibility
+                is_current_pressure_level = "pressure_level" in truth_var_da_final.dims or any(dim in truth_var_da_final.dims for dim in ["lev", "plev", "level"])
+                
                 if (
                     cached_lat_weights is not None
                     and cached_grid_dims == current_grid_dims
                 ):
-                    # Reuse cached weights - this saves significant computation time
-                    broadcasted_weights_final = cached_lat_weights
-                    # OPTIMIZATION 5B: Reduce frequent debug logging - only log cache events for first use
-                    if is_first_var:
-                        logger.debug(
-                            f"[Day1Score] For {var_key}, using CACHED latitude weights. Shape: {broadcasted_weights_final.shape}"
-                        )
+                    # Check if cached weights are compatible with current variable type
+                    cached_is_pressure_level = len(cached_lat_weights.dims) > 2  # More than lat, lon
+                    
+                    if is_current_pressure_level == cached_is_pressure_level:
+                        # Compatible - reuse cached weights
+                        broadcasted_weights_final = cached_lat_weights
+                        if is_first_var:
+                            logger.debug(
+                                f"[Day1Score] For {var_key}, using CACHED latitude weights. Shape: {broadcasted_weights_final.shape}"
+                            )
+                    else:
+                        # Incompatible - need to recalculate
+                        logger.debug(f"[Day1Score] Cached weights incompatible for {var_key} (pressure level mismatch), recalculating")
+                        cached_lat_weights = None  # Force recalculation
                 else:
                     # Calculate weights and cache them for subsequent variables
                     target_lat_coord = truth_var_da_final[actual_lat_dim_in_target]
@@ -828,10 +1202,21 @@ async def _process_single_variable_parallel(
                     one_d_lat_weights_target = _calculate_latitude_weights(
                         target_lat_coord
                     )
-                    # OPTIMIZATION 3B: xr.broadcast is just memory operations - run in main thread
-                    _, broadcasted_weights_final = xr.broadcast(
-                        truth_var_da_final, one_d_lat_weights_target
-                    )
+                    # CRITICAL: For pressure-level variables, only broadcast weights to spatial dims (lat, lon)
+                    # to avoid dimension mismatch errors in xskillscore
+                    if "pressure_level" in truth_var_da_final.dims or any(dim in truth_var_da_final.dims for dim in ["lev", "plev", "level"]):
+                        # For pressure-level variables, create weights only for spatial dimensions
+                        spatial_truth = truth_var_da_final.isel({dim: 0 for dim in truth_var_da_final.dims if dim not in ("lat", "lon")})
+                        _, broadcasted_weights_final = xr.broadcast(
+                            spatial_truth, one_d_lat_weights_target
+                        )
+                        logger.debug(f"[Day1Score] Created spatial-only weights for pressure-level variable {var_key}: {broadcasted_weights_final.dims}")
+                    else:
+                        # For surface variables, broadcast normally
+                        _, broadcasted_weights_final = xr.broadcast(
+                            truth_var_da_final, one_d_lat_weights_target
+                        )
+                        logger.debug(f"[Day1Score] Created full weights for surface variable {var_key}: {broadcasted_weights_final.dims}")
 
                     # Cache for subsequent variables in this time step
                     cached_lat_weights = broadcasted_weights_final
@@ -841,8 +1226,14 @@ async def _process_single_variable_parallel(
                     )
 
             except Exception as e_broadcast_weights:
+                import traceback
+                tb_str = traceback.format_exc()
                 logger.error(
-                    f"[Day1Score] Failed to create/broadcast latitude weights based on target_grid_da_std for {var_key}: {e_broadcast_weights}. Proceeding without weights for this variable."
+                    f"[Day1Score] Failed to create/broadcast latitude weights for {var_key}:\n"
+                    f"Error: {e_broadcast_weights}\n"
+                    f"Truth data dims: {truth_var_da_final.dims}, shape: {truth_var_da_final.shape}\n"
+                    f"Is pressure level: {is_current_pressure_level}\n"
+                    f"Full traceback:\n{tb_str}"
                 )
                 broadcasted_weights_final = None
         else:
@@ -851,10 +1242,45 @@ async def _process_single_variable_parallel(
             )
 
         def _get_metric_scalar_value(metric_fn, *args, **kwargs):
-            res = metric_fn(*args, **kwargs)
-            if hasattr(res, "compute"):
-                res = res.compute()
-            return float(res.item())
+            try:
+                res = metric_fn(*args, **kwargs)
+                if hasattr(res, "compute"):
+                    res = res.compute()
+                
+                # Handle non-scalar results
+                if hasattr(res, "size") and res.size > 1:
+                    logger.warning(
+                        f"[Day1Score] Metric result has {res.size} elements (dims: {getattr(res, 'dims', 'unknown')}), "
+                        f"shape: {getattr(res, 'shape', 'unknown')} - taking mean to get scalar"
+                    )
+                    if hasattr(res, "mean"):
+                        res = res.mean()
+                    else:
+                        import numpy as np
+                        res = np.mean(res)
+                
+                # Convert to scalar
+                if hasattr(res, "item"):
+                    return float(res.item())
+                else:
+                    return float(res)
+                    
+            except Exception as metric_err:
+                import traceback
+                tb_str = traceback.format_exc()
+                # Escape traceback to prevent loguru formatting issues
+                tb_escaped = tb_str.replace('<', '\\<').replace('>', '\\>')
+                
+                logger.error(
+                    f"[Day1Score] Metric calculation failed for {var_key}:\n"
+                    f"Function: {metric_fn.__name__ if hasattr(metric_fn, '__name__') else str(metric_fn)}\n"
+                    f"Args shapes: {[getattr(arg, 'shape', 'no shape') for arg in args if hasattr(arg, 'shape')]}\n"
+                    f"Args dims: {[getattr(arg, 'dims', 'no dims') for arg in args if hasattr(arg, 'dims')]}\n"
+                    f"Kwargs: {list(kwargs.keys())}\n"
+                    f"Error: {metric_err}\n"
+                    f"Full traceback:\n{tb_escaped}"
+                )
+                raise
 
         # OPTIMIZATION 3D: MSE calculation is vectorized and fast - run in main thread
         clone_distance_mse_val = _get_metric_scalar_value(
@@ -905,7 +1331,7 @@ async def _process_single_variable_parallel(
                 clim_var_to_interpolate = _standardize_spatial_dims(clim_var_da_raw)
                 if var_level:
                     clim_pressure_dim = None
-                    for dim_name in ["pressure_level", "plev", "level"]:
+                    for dim_name in ["pressure_level", "lev", "plev", "level"]:
                         if dim_name in clim_var_to_interpolate.dims:
                             clim_pressure_dim = dim_name
                             break
@@ -925,16 +1351,36 @@ async def _process_single_variable_parallel(
 
             clim_hour_rounded = (clim_hour // 6) * 6
 
-            clim_var_da_raw = era5_climatology[standard_name_for_clim].sel(
-                dayofyear=clim_dayofyear, hour=clim_hour_rounded, method="nearest"
-            )
+            try:
+                clim_var_da_raw = era5_climatology[standard_name_for_clim].sel(
+                    dayofyear=clim_dayofyear, hour=clim_hour_rounded, method="nearest"
+                )
+            except (TypeError, ValueError) as sel_error:
+                logger.error(
+                    f"[Day1Score] Climatology selection failed for {standard_name_for_clim}: {sel_error}\n"
+                    f"dayofyear: {clim_dayofyear} (type: {type(clim_dayofyear)})\n"
+                    f"hour: {clim_hour_rounded} (type: {type(clim_hour_rounded)})\n"
+                    f"Available dayofyear coords: {list(era5_climatology[standard_name_for_clim].coords.get('dayofyear', []))[:5]}...\n"
+                    f"Available hour coords: {list(era5_climatology[standard_name_for_clim].coords.get('hour', []))[:5]}..."
+                )
+                # Try alternative selection without method parameter
+                try:
+                    logger.info(f"[Day1Score] Attempting fallback selection for {standard_name_for_clim}")
+                    clim_var_da_raw = era5_climatology[standard_name_for_clim].isel(
+                        dayofyear=min(int(clim_dayofyear) - 1, len(era5_climatology[standard_name_for_clim].coords.get('dayofyear', [])) - 1),
+                        hour=min(int(clim_hour_rounded) // 6, len(era5_climatology[standard_name_for_clim].coords.get('hour', [])) - 1)
+                    )
+                except Exception as fallback_error:
+                    logger.error(f"[Day1Score] Fallback climatology selection also failed: {fallback_error}")
+                    raise sel_error
+            
             # OPTIMIZATION 4C: Optimize climatology processing chain
             clim_var_to_interpolate = _standardize_spatial_dims(clim_var_da_raw)
 
             if var_level:
                 # Handle different pressure level dimension names in climatology data
                 clim_pressure_dim = None
-                for dim_name in ["pressure_level", "plev", "level"]:
+                for dim_name in ["pressure_level", "lev", "plev", "level"]:
                     if dim_name in clim_var_to_interpolate.dims:
                         clim_pressure_dim = dim_name
                         break
@@ -993,35 +1439,162 @@ async def _process_single_variable_parallel(
             miner_var_da_aligned, truth_var_da_final
         )
 
-        # MSE Skill Score
-        skill_score = await calculate_mse_skill_score(
-            forecast_bc_da,
-            truth_var_da_final,
-            ref_var_da_aligned,
-            broadcasted_weights_final,
-        )
+        # Check if this is a pressure-level variable for detailed scoring
+        if var_level == "all" and "pressure_level" in miner_var_da_aligned.dims:
+            # Per-pressure-level scoring for atmospheric variables
+            logger.info(f"Calculating detailed per-pressure-level metrics for {var_name}")
+            
+            from .weather_scoring.metrics import (
+                calculate_mse_skill_score_by_pressure_level,
+                calculate_acc_by_pressure_level,
+                calculate_rmse_by_pressure_level
+            )
+            
+            # Single vectorized calculations that preserve pressure level dimension
+            skill_scores_by_level = await calculate_mse_skill_score_by_pressure_level(
+                forecast_bc_da, truth_var_da_final, ref_var_da_aligned, broadcasted_weights_final
+            )
+            acc_scores_by_level = await calculate_acc_by_pressure_level(
+                miner_var_da_aligned, truth_var_da_final, clim_var_da_aligned, broadcasted_weights_final
+            )
+            rmse_scores_by_level = await calculate_rmse_by_pressure_level(
+                miner_var_da_aligned, truth_var_da_final, broadcasted_weights_final
+            )
+            # Compute MAE per pressure level
+            try:
+                spatial_dims = [d for d in truth_var_da_final.dims if d.lower() in ("latitude", "longitude", "lat", "lon")]
+                abs_err = abs(miner_var_da_aligned - truth_var_da_final)
+                if broadcasted_weights_final is not None:
+                    weighted_sum = await asyncio.to_thread(
+                        lambda: (abs_err * broadcasted_weights_final).sum(dim=spatial_dims)
+                    )
+                    weights_sum = await asyncio.to_thread(
+                        lambda: broadcasted_weights_final.sum(dim=spatial_dims)
+                    )
+                    mae_da = weighted_sum / weights_sum
+                else:
+                    mae_da = await asyncio.to_thread(abs_err.mean, spatial_dims)
+                per_level_mae = {}
+                if "pressure_level" in mae_da.dims:
+                    for level in mae_da.coords["pressure_level"]:
+                        per_level_mae[int(level.item())] = float(mae_da.sel(pressure_level=level).item())
+                else:
+                    per_level_mae[None] = float(mae_da.item())
+            except Exception:
+                per_level_mae = {}
+            # Calculate per-level bias (weighted mean error over spatial dims)
+            try:
+                spatial_dims = [d for d in truth_var_da_final.dims if d.lower() in ("latitude", "longitude", "lat", "lon")]
+                diff_da = miner_var_da_aligned - truth_var_da_final
+                if broadcasted_weights_final is not None:
+                    # Weighted mean over spatial dims
+                    weighted_sum = await asyncio.to_thread(
+                        lambda: (diff_da * broadcasted_weights_final).sum(dim=spatial_dims)
+                    )
+                    weights_sum = await asyncio.to_thread(
+                        lambda: broadcasted_weights_final.sum(dim=spatial_dims)
+                    )
+                    bias_da = weighted_sum / weights_sum
+                else:
+                    bias_da = await asyncio.to_thread(diff_da.mean, spatial_dims)
+                per_level_bias = {}
+                if "pressure_level" in bias_da.dims:
+                    for level in bias_da.coords["pressure_level"]:
+                        per_level_bias[int(level.item())] = float(bias_da.sel(pressure_level=level).item())
+                else:
+                    # Fallback single bias
+                    per_level_bias[None] = float(bias_da.item())
+            except Exception as e_bias:
+                logger.warning(f"[Day1Score] Failed to compute per-level bias for {var_name}: {e_bias}")
+                per_level_bias = {}
+            
+            # Apply clone penalty tracking only (do not subtract from skill metric), calculate averages for backward compatibility
+            avg_skill_score = 0.0
+            avg_acc_score = 0.0
+            avg_rmse_score = 0.0
+            valid_levels = 0
+            
+            for level in skill_scores_by_level.keys():
+                if level in acc_scores_by_level and level in rmse_scores_by_level:
+                    avg_skill_score += skill_scores_by_level[level]
+                    avg_acc_score += acc_scores_by_level[level]
+                    avg_rmse_score += rmse_scores_by_level[level]
+                    valid_levels += 1
+            
+            # Store averages for backward compatibility
+            result["skill_score"] = avg_skill_score / valid_levels if valid_levels > 0 else -np.inf
+            result["acc_score"] = avg_acc_score / valid_levels if valid_levels > 0 else -np.inf
+            result["rmse"] = avg_rmse_score / valid_levels if valid_levels > 0 else np.inf
+            
+            # Store detailed pressure-level results for component scoring
+            result["pressure_level_scores"] = {
+                "skill": skill_scores_by_level,
+                "acc": acc_scores_by_level,
+                "rmse": rmse_scores_by_level,
+                "mae": per_level_mae,
+                "bias": per_level_bias
+            }
+            
+            logger.info(f"Extracted detailed metrics for {valid_levels} pressure levels")
+            
+        else:
+            # Traditional single-level scoring for surface variables or specific pressure levels
+            skill_score = await calculate_mse_skill_score(
+                forecast_bc_da,
+                truth_var_da_final,
+                ref_var_da_aligned,
+                broadcasted_weights_final,
+            )
+            
+            # Do NOT subtract clone penalty from skill metric; record penalty separately
+            result["skill_score"] = skill_score
 
-        # clone penalty
-        skill_score_after_penalty = skill_score - clone_penalty
-        result["skill_score"] = skill_score_after_penalty
+            # Also compute climatology-referenced skill to match ERA5 method
+            try:
+                skill_score_clim = await calculate_mse_skill_score(
+                    forecast_bc_da,
+                    truth_var_da_final,
+                    clim_var_da_aligned,
+                    broadcasted_weights_final,
+                )
+                result["skill_score_climatology"] = skill_score_clim
+            except Exception:
+                pass
 
-        # ACC
-        acc_score = await calculate_acc(
-            miner_var_da_aligned,
-            truth_var_da_final,
-            clim_var_da_aligned,
-            broadcasted_weights_final,
-        )
-        result["acc_score"] = acc_score
+            # ACC
+            acc_score = await calculate_acc(
+                miner_var_da_aligned,
+                truth_var_da_final,
+                clim_var_da_aligned,
+                broadcasted_weights_final,
+            )
+            result["acc_score"] = acc_score
+            # RMSE, MAE and Bias for surface variables
+            try:
+                from .weather_scoring.metrics import calculate_rmse, calculate_bias
+                rmse_val = await calculate_rmse(miner_var_da_aligned, truth_var_da_final, broadcasted_weights_final)
+                result["rmse"] = rmse_val
+                # MAE calculation
+                abs_err = abs(miner_var_da_aligned - truth_var_da_final)
+                if broadcasted_weights_final is not None:
+                    mae_val = float(((abs_err * broadcasted_weights_final).sum() / broadcasted_weights_final.sum()).item())
+                else:
+                    mae_val = float(abs_err.mean().item())
+                result["mae"] = mae_val
+                bias_val = await calculate_bias(miner_var_da_aligned, truth_var_da_final, broadcasted_weights_final)
+                result["bias"] = bias_val
+            except Exception as e_rmse_bias:
+                logger.warning(f"[Day1Score] Failed to compute RMSE/Bias for {var_name}: {e_rmse_bias}")
 
         # ACC Lower Bound Check
+        current_acc_score = result.get("acc_score", -np.inf)
         if (
             effective_lead_h == 12
-            and np.isfinite(acc_score)
-            and acc_score < day1_scoring_config.get("acc_lower_bound_d1", 0.6)
+            and np.isfinite(current_acc_score)
+            and current_acc_score < day1_scoring_config.get("acc_lower_bound_d1", 0.6)
         ):
             logger.warning(
-                f"[Day1Score] Miner {miner_hotkey}: ACC for {var_key} at valid time {valid_time_dt} (Eff. Lead 12h) ({acc_score:.3f}) is below threshold."
+                f"[Day1Score] Miner {miner_hotkey}: ACC for {var_key} at valid time {valid_time_dt} (Eff. Lead 12h) ({current_acc_score:.3f}) is below threshold."
             )
 
         # Mark as successful
@@ -1033,12 +1606,32 @@ async def _process_single_variable_parallel(
         return result
 
     except Exception as e_var:
+        import traceback
+        tb_str = traceback.format_exc()
+        error_msg = str(e_var)
+        
+        # Escape any format string characters in the error message to prevent logging errors
+        safe_error_msg = error_msg.replace('{', '{{').replace('}', '}}').replace("'", "''")
+        safe_tb_str = tb_str.replace('{', '{{').replace('}', '}}').replace("'", "''")
+        
         logger.error(
-            f"[Day1Score] Miner {miner_hotkey}: Error in parallel scoring {var_key} at {valid_time_dt}: {e_var}",
-            exc_info=True,
+            f"[Day1Score] Miner {miner_hotkey}: Error in parallel scoring {var_key} at {valid_time_dt}:\n"
+            f"Error: {safe_error_msg}\n"
+            f"Variable config: {var_config}\n"
+            f"Data shapes - Miner: {getattr(miner_forecast_lead, 'shape', 'unknown')}, "
+            f"Truth: {getattr(gfs_analysis_lead, 'shape', 'unknown')}, "
+            f"Ref: {getattr(gfs_reference_lead, 'shape', 'unknown')}\n"
+            f"Full traceback:\n{safe_tb_str}"
         )
         result["status"] = "error"
-        result["error_message"] = str(e_var)
+        result["error_message"] = error_msg
+        result["debug_info"] = {
+            "var_config": var_config,
+            "miner_shape": getattr(miner_forecast_lead, 'shape', None),
+            "truth_shape": getattr(gfs_analysis_lead, 'shape', None),
+            "ref_shape": getattr(gfs_reference_lead, 'shape', None),
+            "traceback": tb_str
+        }
         return result
     finally:
         # CRITICAL ABC MEMORY LEAK FIX: Clean up all temporary xarray ABC objects
@@ -1102,6 +1695,467 @@ async def _process_single_variable_parallel(
 
         except Exception as cleanup_err:
             logger.debug(f"[Day1Score] Variable {var_key} cleanup error: {cleanup_err}")
+
+
+async def _process_single_variable_parallel_preloaded(
+    var_config: Dict,
+    miner_var_da: xr.DataArray,
+    truth_var_da: xr.DataArray,
+    ref_var_da: xr.DataArray,
+    era5_climatology: xr.Dataset,
+    precomputed_climatology_cache: Optional[Dict],
+    day1_scoring_config: Dict,
+    valid_time_dt: datetime,
+    effective_lead_h: int,
+    miner_hotkey: str,
+    cached_pressure_dims: Dict,
+    cached_lat_weights: Optional[xr.DataArray],
+    cached_grid_dims: Optional[tuple],
+    variables_to_score: List[Dict],
+) -> Dict:
+    """
+    Process a single variable for parallel execution using pre-loaded DataArrays.
+    
+    This is an optimized version of _process_single_variable_parallel that works
+    with pre-loaded variable data to prevent duplicate HTTP requests.
+
+    Returns a dictionary with:
+    - status: 'success', 'skipped', or 'error'
+    - var_key: Variable identifier
+    - skill_score: Calculated skill score (if successful)
+    - acc_score: Calculated ACC score (if successful)
+    - clone_distance_mse: MSE distance from reference
+    - clone_penalty_applied: Applied clone penalty
+    - sanity_checks: Sanity check results
+    - error_message: Error details (if failed)
+    - qc_failure_reason: QC failure reason (if applicable)
+    """
+    var_name = var_config["name"]
+    var_level = var_config.get("level")
+    standard_name_for_clim = var_config.get("standard_name", var_name)
+    var_key = f"{var_name}{var_level}" if var_level and var_level != "all" else var_name
+
+    result = {
+        "status": "processing",
+        "var_key": var_key,
+        "skill_score": None,
+        "acc_score": None,
+        "clone_distance_mse": None,
+        "clone_penalty_applied": None,
+        "sanity_checks": {},
+        "error_message": None,
+        "qc_failure_reason": None,
+    }
+
+    try:
+        logger.debug(
+            f"[Day1Score] Miner {miner_hotkey}: PARALLEL scoring (preloaded) Var: {var_key} at Valid Time: {valid_time_dt}"
+        )
+
+        # Use pre-loaded DataArrays directly - no need to extract from datasets
+        miner_var_da_unaligned = miner_var_da
+        truth_var_da_unaligned = truth_var_da
+        ref_var_da_unaligned = ref_var_da
+
+        # Calculate ranges for logging and unit checks
+        miner_min, miner_max, miner_mean = (
+            float(miner_var_da_unaligned.min()),
+            float(miner_var_da_unaligned.max()),
+            float(miner_var_da_unaligned.mean()),
+        )
+        truth_min, truth_max, truth_mean = (
+            float(truth_var_da_unaligned.min()),
+            float(truth_var_da_unaligned.max()),
+            float(truth_var_da_unaligned.mean()),
+        )
+        ref_min, ref_max, ref_mean = (
+            float(ref_var_da_unaligned.min()),
+            float(ref_var_da_unaligned.max()),
+            float(ref_var_da_unaligned.mean()),
+        )
+
+        # Only log detailed diagnostics for first variable or when potential issues detected
+        is_first_var = (
+            var_config == variables_to_score[0] if variables_to_score else True
+        )
+        has_potential_issue = (
+            (var_name == "z" and miner_mean < 10000)
+            or (var_name == "2t" and (miner_mean < 200 or miner_mean > 350))
+            or (var_name == "msl" and (miner_mean < 50000 or miner_mean > 150000))
+        )
+
+        if is_first_var or has_potential_issue:
+            logger.info(
+                f"[Day1Score] Miner {miner_hotkey}: RAW DATA DIAGNOSTICS (preloaded) for {var_key} at {valid_time_dt}:"
+            )
+            logger.info(
+                f"[Day1Score] Miner {miner_hotkey} {var_key}: range=[{miner_min:.1f}, {miner_max:.1f}], mean={miner_mean:.1f}, units={miner_var_da_unaligned.attrs.get('units', 'unknown')}"
+            )
+            logger.info(
+                f"[Day1Score] Truth {var_key}: range=[{truth_min:.1f}, {truth_max:.1f}], mean={truth_mean:.1f}, units={truth_var_da_unaligned.attrs.get('units', 'unknown')}"
+            )
+            logger.info(
+                f"[Day1Score] Ref   {var_key}: range=[{ref_min:.1f}, {ref_max:.1f}], mean={ref_mean:.1f}, units={ref_var_da_unaligned.attrs.get('units', 'unknown')}"
+            )
+        else:
+            logger.debug(
+                f"[Day1Score] Miner {miner_hotkey} {var_key}: mean={miner_mean:.1f}"
+            )
+
+        # Apply the same unit conversion logic as the original function
+        if var_name == "z" and var_level == 500:
+            miner_ratio = miner_mean / 9.80665
+            truth_ratio = truth_mean / 9.80665
+            logger.info(
+                f"[Day1Score] Miner {miner_hotkey}: z500 UNIT CHECK - If geopotential (m²/s²): miner_mean/g={miner_ratio:.1f}m, truth_mean/g={truth_ratio:.1f}m"
+            )
+
+            if miner_mean < 10000:
+                logger.warning(
+                    f"[Day1Score] Miner {miner_hotkey}: POTENTIAL UNIT MISMATCH: z500 mean ({miner_mean:.1f}) suggests geopotential height (m) rather than geopotential (m²/s²)"
+                )
+            elif truth_mean > 40000 and miner_mean > 40000:
+                logger.info(
+                    f"[Day1Score] Unit check OK: Both miner and truth z500 appear to be geopotential (m²/s²)"
+                )
+
+        elif var_name == "2t":
+            if miner_mean < 200 or miner_mean > 350:
+                logger.warning(
+                    f"[Day1Score] Miner {miner_hotkey}: POTENTIAL UNIT ISSUE: 2t mean ({miner_mean:.1f}) outside expected range for Kelvin"
+                )
+
+        elif var_name == "msl":
+            if miner_mean < 50000 or miner_mean > 150000:
+                logger.warning(
+                    f"[Day1Score] Miner {miner_hotkey}: POTENTIAL UNIT ISSUE: msl mean ({miner_mean:.1f}) outside expected range for Pa"
+                )
+
+        # Apply automatic unit conversions
+        if var_name == "z" and miner_mean < 10000 and truth_mean > 40000:
+            logger.warning(
+                f"[Day1Score] Miner {miner_hotkey}: AUTOMATIC UNIT CONVERSION: Converting miner z from geopotential height (m) to geopotential (m²/s²)"
+            )
+            miner_var_da_unaligned = miner_var_da_unaligned * 9.80665
+            miner_var_da_unaligned.attrs["units"] = "m2 s-2"
+            miner_var_da_unaligned.attrs["long_name"] = (
+                "Geopotential (auto-converted from height)"
+            )
+            logger.info(
+                f"[Day1Score] Miner {miner_hotkey}: After conversion: z range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}"
+            )
+
+        elif var_name in ["2t", "t"] and miner_mean < 100 and truth_mean > 200:
+            logger.warning(
+                f"[Day1Score] Miner {miner_hotkey}: AUTOMATIC UNIT CONVERSION: Converting miner {var_name} from Celsius to Kelvin"
+            )
+            miner_var_da_unaligned = miner_var_da_unaligned + 273.15
+            miner_var_da_unaligned.attrs["units"] = "K"
+            miner_var_da_unaligned.attrs["long_name"] = (
+                f'{miner_var_da_unaligned.attrs.get("long_name", var_name)} (auto-converted from Celsius)'
+            )
+            logger.info(
+                f"[Day1Score] Miner {miner_hotkey}: After conversion: {var_name} range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}"
+            )
+
+        elif var_name == "msl" and miner_mean < 2000 and truth_mean > 50000:
+            logger.warning(
+                f"[Day1Score] Miner {miner_hotkey}: AUTOMATIC UNIT CONVERSION: Converting miner msl from hPa to Pa"
+            )
+            miner_var_da_unaligned = miner_var_da_unaligned * 100.0
+            miner_var_da_unaligned.attrs["units"] = "Pa"
+            miner_var_da_unaligned.attrs["long_name"] = (
+                "Mean sea level pressure (auto-converted from hPa)"
+            )
+            logger.info(
+                f"[Day1Score] Miner {miner_hotkey}: After conversion: msl range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}"
+            )
+
+        # Handle pressure level selection
+        if var_level:
+            def find_pressure_dim_cached(data_array, dataset_name="dataset"):
+                cache_key = (dataset_name, tuple(data_array.dims))
+                if cache_key in cached_pressure_dims:
+                    return cached_pressure_dims[cache_key]
+
+                for dim_name in ["pressure_level", "lev", "plev", "level"]:
+                    if dim_name in data_array.dims:
+                        cached_pressure_dims[cache_key] = dim_name
+                        return dim_name
+
+                logger.warning(
+                    f"No pressure level dimension found in {dataset_name} for {var_key} level {var_level}. Available dims: {data_array.dims}"
+                )
+                cached_pressure_dims[cache_key] = None
+                return None
+
+            miner_pressure_dim = find_pressure_dim_cached(
+                miner_var_da_unaligned, "miner"
+            )
+            truth_pressure_dim = find_pressure_dim_cached(
+                truth_var_da_unaligned, "truth"
+            )
+            ref_pressure_dim = find_pressure_dim_cached(
+                ref_var_da_unaligned, "reference"
+            )
+
+            if not all([miner_pressure_dim, truth_pressure_dim, ref_pressure_dim]):
+                logger.warning(
+                    f"Missing pressure dimensions for {var_key} level {var_level}. Skipping."
+                )
+                result["status"] = "skipped"
+                result["qc_failure_reason"] = "Missing pressure dimensions"
+                return result
+
+            if var_level == "all":
+                miner_var_da_selected = miner_var_da_unaligned
+                truth_var_da_selected = truth_var_da_unaligned  
+                ref_var_da_selected = ref_var_da_unaligned
+                logger.info(f"Scoring {var_key} across all pressure levels")
+            else:
+                miner_var_da_selected = miner_var_da_unaligned.sel(
+                    {miner_pressure_dim: var_level}, method="nearest"
+                )
+                truth_var_da_selected = truth_var_da_unaligned.sel(
+                    {truth_pressure_dim: var_level}, method="nearest"
+                )
+                ref_var_da_selected = ref_var_da_unaligned.sel(
+                    {ref_pressure_dim: var_level}, method="nearest"
+                )
+
+                # Validate level selection
+                if var_level != "all":
+                    if abs(truth_var_da_selected[truth_pressure_dim].item() - var_level) > 10:
+                        logger.warning(
+                            f"Truth data for {var_key} level {var_level} too far ({truth_var_da_selected[truth_pressure_dim].item()}). Skipping."
+                        )
+                        result["status"] = "skipped"
+                        result["qc_failure_reason"] = "Truth data level too far from target"
+                        return result
+                    if abs(miner_var_da_selected[miner_pressure_dim].item() - var_level) > 10:
+                        logger.warning(
+                            f"Miner data for {var_key} level {var_level} too far ({miner_var_da_selected[miner_pressure_dim].item()}). Skipping."
+                        )
+                        result["status"] = "skipped"
+                        result["qc_failure_reason"] = "Miner data level too far from target"
+                        return result
+                    if abs(ref_var_da_selected[ref_pressure_dim].item() - var_level) > 10:
+                        logger.warning(
+                            f"GFS Ref data for {var_key} level {var_level} too far ({ref_var_da_selected[ref_pressure_dim].item()}). Skipping."
+                        )
+                        result["status"] = "skipped"
+                        result["qc_failure_reason"] = "Reference data level too far from target"
+                        return result
+        else:
+            miner_var_da_selected = miner_var_da_unaligned
+            truth_var_da_selected = truth_var_da_unaligned
+            ref_var_da_selected = ref_var_da_unaligned
+
+        # Continue with the same processing logic as the original function
+        # (spatial standardization, interpolation, metrics calculation, etc.)
+        # This is a large block of code that should be identical to the original function
+        # from line ~935 onwards in _process_single_variable_parallel
+        
+        target_grid_da = truth_var_da_selected
+        temp_spatial_dims = [
+            d
+            for d in target_grid_da.dims
+            if d.lower() in ("latitude", "longitude", "lat", "lon")
+        ]
+        actual_lat_dim_in_target_for_ordering = next(
+            (d for d in temp_spatial_dims if d.lower() in ("latitude", "lat")), None
+        )
+
+        if actual_lat_dim_in_target_for_ordering:
+            lat_coord_values = target_grid_da[
+                actual_lat_dim_in_target_for_ordering
+            ].values
+            if len(lat_coord_values) > 1 and lat_coord_values[0] < lat_coord_values[-1]:
+                logger.info(
+                    f"[Day1Score] Latitude coordinate '{actual_lat_dim_in_target_for_ordering}' in target_grid_da is ascending. Flipping to descending order for consistency."
+                )
+                target_grid_da = target_grid_da.isel(
+                    {actual_lat_dim_in_target_for_ordering: slice(None, None, -1)}
+                )
+
+        def _standardize_spatial_dims(data_array: xr.DataArray) -> xr.DataArray:
+            if not isinstance(data_array, xr.DataArray):
+                return data_array
+            rename_dict = {}
+            for dim_name in data_array.dims:
+                if dim_name.lower() in ("latitude", "lat_0"):
+                    rename_dict[dim_name] = "lat"
+                elif dim_name.lower() in ("longitude", "lon_0"):
+                    rename_dict[dim_name] = "lon"
+            if rename_dict:
+                logger.debug(
+                    f"[Day1Score] Standardizing spatial dims for variable {var_key}: Renaming {rename_dict}"
+                )
+                return data_array.rename(rename_dict)
+            return data_array
+
+        target_grid_da_std = _standardize_spatial_dims(target_grid_da)
+        truth_var_da_final = target_grid_da_std
+
+        # Interpolate to common grid
+        miner_var_da_aligned = await asyncio.to_thread(
+            lambda: _standardize_spatial_dims(miner_var_da_selected).interp_like(
+                target_grid_da_std, method="linear"
+            )
+        )
+
+        ref_var_da_aligned = await asyncio.to_thread(
+            lambda: _standardize_spatial_dims(ref_var_da_selected).interp_like(
+                target_grid_da_std, method="linear"
+            )
+        )
+
+        # Continue with the remaining processing logic from the original function
+        # Calculate latitude weights and perform metrics calculations
+        
+        broadcasted_weights_final = None
+        common_dims = set(truth_var_da_final.dims) & set(miner_var_da_aligned.dims) & set(ref_var_da_aligned.dims)
+        
+        # Remove duplicate pressure level dimensions if they exist
+        pressure_dims_in_common = [d for d in common_dims if d in ("pressure_level", "plev", "lev", "level")]
+        if len(pressure_dims_in_common) > 1:
+            common_dims = common_dims - set(pressure_dims_in_common) | {"pressure_level"}
+        
+        spatial_dims_for_metric = [d for d in common_dims if d not in ("time",)]
+
+        actual_lat_dim_in_target = "lat" if "lat" in truth_var_da_final.dims else None
+
+        if actual_lat_dim_in_target:
+            try:
+                target_lat_coord = truth_var_da_final[actual_lat_dim_in_target]
+                one_d_lat_weights_target = _calculate_latitude_weights(target_lat_coord)
+                
+                # Create a template with only the spatial dimensions that will be used in MSE
+                template_dims = {dim: truth_var_da_final.sizes[dim] for dim in spatial_dims_for_metric}
+                template_coords = {dim: truth_var_da_final.coords[dim] for dim in spatial_dims_for_metric if dim in truth_var_da_final.coords}
+                template_da = xr.DataArray(
+                    data=np.ones([template_dims[dim] for dim in spatial_dims_for_metric]),
+                    dims=spatial_dims_for_metric,
+                    coords=template_coords
+                )
+                
+                _, broadcasted_weights_final = xr.broadcast(template_da, one_d_lat_weights_target)
+            except Exception as e_broadcast_weights:
+                logger.error(f"[Day1Score] Failed to create latitude weights for {var_key}: {e_broadcast_weights}")
+                broadcasted_weights_final = None
+
+        # Calculate clone distance MSE
+        mse_result = xs.mse(
+            miner_var_da_aligned,
+            ref_var_da_aligned,
+            dim=spatial_dims_for_metric,
+            weights=broadcasted_weights_final,
+            skipna=True,
+        ).compute()
+        
+        # Ensure we get a scalar value - if there are remaining dimensions, take the mean
+        if mse_result.size == 1:
+            clone_distance_mse_val = mse_result.item()
+        else:
+            # If there are still dimensions remaining, reduce them to get a scalar
+            clone_distance_mse_val = float(mse_result.mean().values)
+            
+        result["clone_distance_mse"] = clone_distance_mse_val
+
+        # Clone penalty calculation
+        delta_thresholds_config = day1_scoring_config.get("clone_delta_thresholds", {})
+        delta_for_var = delta_thresholds_config.get(var_key)
+        clone_penalty = 0.0
+
+        if delta_for_var is not None and clone_distance_mse_val < delta_for_var:
+            gamma = day1_scoring_config.get("clone_penalty_gamma", 1.0)
+            clone_penalty = gamma * (1.0 - (clone_distance_mse_val / delta_for_var))
+            clone_penalty = max(0.0, clone_penalty)
+            result["qc_failure_reason"] = f"Clone penalty triggered for {var_key}"
+        result["clone_penalty_applied"] = clone_penalty
+
+        # Simplified climatology processing for now - use fallback computation
+        clim_dayofyear = pd.Timestamp(valid_time_dt).dayofyear
+        clim_hour = valid_time_dt.hour
+        clim_hour_rounded = (clim_hour // 6) * 6
+
+        clim_var_da_raw = era5_climatology[standard_name_for_clim].sel(
+            dayofyear=clim_dayofyear, hour=clim_hour_rounded, method="nearest"
+        )
+        clim_var_to_interpolate = _standardize_spatial_dims(clim_var_da_raw)
+
+        if var_level and var_level != "all":
+            for dim_name in ["pressure_level", "lev", "plev", "level"]:
+                if dim_name in clim_var_to_interpolate.dims:
+                    # Ensure var_level is numeric for pressure level selection
+                    try:
+                        numeric_level = float(var_level)
+                        clim_var_to_interpolate = clim_var_to_interpolate.sel(
+                            **{dim_name: numeric_level}, method="nearest"
+                        )
+                        break
+                    except (ValueError, TypeError):
+                        logger.warning(f"Could not convert var_level {var_level} to numeric for {var_key}")
+                        break
+
+        clim_var_da_aligned = await asyncio.to_thread(
+            lambda: clim_var_to_interpolate.interp_like(truth_var_da_final, method="linear")
+        )
+
+        # Sanity checks
+        sanity_results = await perform_sanity_checks(
+            forecast_da=miner_var_da_aligned,
+            reference_da_for_corr=ref_var_da_aligned,
+            variable_name=var_key,
+            climatology_bounds_config=day1_scoring_config.get("climatology_bounds", {}),
+            pattern_corr_threshold=day1_scoring_config.get("pattern_correlation_threshold", 0.3),
+            lat_weights=broadcasted_weights_final,
+        )
+        result["sanity_checks"] = sanity_results
+
+        if not sanity_results.get("climatology_passed") or not sanity_results.get("pattern_correlation_passed"):
+            result["status"] = "skipped"
+            result["qc_failure_reason"] = f"Sanity check failed for {var_key}"
+            return result
+
+        # Bias correction and metrics calculation
+        forecast_bc_da = await calculate_bias_corrected_forecast(miner_var_da_aligned, truth_var_da_final)
+
+        # Calculate skill score and ACC
+        skill_score = await calculate_mse_skill_score(
+            forecast_bc_da, truth_var_da_final, ref_var_da_aligned, broadcasted_weights_final
+        )
+        skill_score_after_penalty = skill_score - clone_penalty
+        result["skill_score"] = skill_score_after_penalty
+
+        acc_score = await calculate_acc(
+            miner_var_da_aligned, truth_var_da_final, clim_var_da_aligned, broadcasted_weights_final
+        )
+        result["acc_score"] = acc_score
+
+        result["status"] = "success"
+        
+        logger.debug(
+            f"[Day1Score] Miner {miner_hotkey}: PARALLEL Variable (preloaded) {var_key} scored successfully"
+        )
+
+        return result
+
+    except Exception as e_var:
+        import traceback
+        tb_str = traceback.format_exc()
+        error_msg = str(e_var)
+        
+        logger.error(
+            f"[Day1Score] Miner {miner_hotkey}: Error in parallel preloaded scoring {var_key} at {valid_time_dt}:\n"
+            f"Error: {error_msg}\n"
+            f"Variable config: {var_config}\n"
+            f"Full traceback:\n{tb_str}".replace("{", "{{").replace("}", "}}"),
+            exc_info=True,
+        )
+        result["status"] = "error"
+        result["error_message"] = error_msg
+        return result
 
 
 async def precompute_climatology_cache(
@@ -1193,7 +2247,7 @@ async def precompute_climatology_cache(
             var_name = var_config["name"]
             var_level = var_config.get("level")
             standard_name_for_clim = var_config.get("standard_name", var_name)
-            var_key = f"{var_name}{var_level}" if var_level else var_name
+            var_key = f"{var_name}{var_level}" if var_level and var_level != "all" else var_name
 
             cache_key = f"{var_name}_{var_level}_{valid_time_dt.isoformat()}"
 
@@ -1215,7 +2269,7 @@ async def precompute_climatology_cache(
                 # Handle pressure levels if needed
                 if var_level:
                     clim_pressure_dim = None
-                    for dim_name in ["pressure_level", "plev", "level"]:
+                    for dim_name in ["pressure_level", "lev", "plev", "level"]:
                         if dim_name in clim_var_to_interpolate.dims:
                             clim_pressure_dim = dim_name
                             break
@@ -1398,11 +2452,23 @@ async def precompute_climatology_cache(
                         clim_hour = valid_time_dt.hour
                         clim_hour_rounded = (clim_hour // 6) * 6
 
-                        clim_var_da_raw = era5_climatology[standard_name_for_clim].sel(
-                            dayofyear=clim_dayofyear,
-                            hour=clim_hour_rounded,
-                            method="nearest",
-                        )
+                        try:
+                            clim_var_da_raw = era5_climatology[standard_name_for_clim].sel(
+                                dayofyear=clim_dayofyear,
+                                hour=clim_hour_rounded,
+                                method="nearest",
+                            )
+                        except (TypeError, ValueError) as sel_error:
+                            logger.error(
+                                f"[CachePrecompute] Fallback climatology selection failed for {standard_name_for_clim}: {sel_error}\n"
+                                f"dayofyear: {clim_dayofyear} (type: {type(clim_dayofyear)})\n"
+                                f"hour: {clim_hour_rounded} (type: {type(clim_hour_rounded)})"
+                            )
+                            # Try alternative selection without method parameter
+                            clim_var_da_raw = era5_climatology[standard_name_for_clim].isel(
+                                dayofyear=min(int(clim_dayofyear) - 1, len(era5_climatology[standard_name_for_clim].coords.get('dayofyear', [])) - 1),
+                                hour=min(int(clim_hour_rounded) // 6, len(era5_climatology[standard_name_for_clim].coords.get('hour', [])) - 1)
+                            )
 
                         clim_var_to_interpolate = _standardize_spatial_dims_cache(
                             clim_var_da_raw
@@ -1476,8 +2542,8 @@ async def _preload_all_time_slices(
     Expected benefit: Reduces repeated dataset access overhead
     """
     logger.info(
-        f"[Day1Score] Miner {miner_hotkey}: Pre-loading all {len(times_to_evaluate)} time slices for faster access"
-    )
+    f"[Day1Score] Miner {miner_hotkey}: Pre-loading all {len(times_to_evaluate)} time slices to reduce HTTP requests"
+)
     preload_start = time.time()
 
     try:
@@ -1540,7 +2606,7 @@ async def _async_dataset_select(dataset, time_coord, method="nearest"):
     return await asyncio.to_thread(lambda: dataset.sel(time=time_coord, method=method))
 
 
-async def _process_single_timestep_parallel(
+async def _process_single_timestep_sequential(
     valid_time_dt: datetime,
     effective_lead_h: int,
     variables_to_score: List[Dict],
@@ -1585,6 +2651,16 @@ async def _process_single_timestep_parallel(
         valid_time_np = np.datetime64(valid_time_dt.replace(tzinfo=None))
 
         try:
+            # Log available timesteps for debugging
+            if effective_lead_h == 6:  # Only log once to avoid spam
+                analysis_times = gfs_analysis_data_for_run.time.values[:10] if hasattr(gfs_analysis_data_for_run, 'time') else []
+                logger.info(
+                    f"[Day1Score] Available GFS analysis timesteps (first 10): {analysis_times}"
+                )
+                logger.info(
+                    f"[Day1Score] Trying to select time: {valid_time_np} for lead {effective_lead_h}h"
+                )
+            
             gfs_analysis_lead = gfs_analysis_data_for_run.sel(
                 time=valid_time_np, method="nearest"
             )
@@ -1595,20 +2671,24 @@ async def _process_single_timestep_parallel(
             selected_time_gfs_analysis = np.datetime64(
                 gfs_analysis_lead.time.data.item(), "ns"
             )
-            if abs(selected_time_gfs_analysis - valid_time_np) > np.timedelta64(1, "h"):
+            # GFS data comes in 6-hour intervals, so we should accept up to 3 hours difference
+            # This handles cases where the exact timestep might not be available
+            if abs(selected_time_gfs_analysis - valid_time_np) > np.timedelta64(3, "h"):
                 timestep_results["skip_reason"] = (
-                    f"GFS Analysis time {selected_time_gfs_analysis} too far from target {valid_time_np}"
+                    f"GFS Analysis time {selected_time_gfs_analysis} too far from target {valid_time_np} (>3h difference)"
                 )
                 return timestep_results
 
             selected_time_gfs_reference = np.datetime64(
                 gfs_reference_lead.time.data.item(), "ns"
             )
+            # GFS data comes in 6-hour intervals, so we should accept up to 3 hours difference
+            # This handles cases where the exact timestep might not be available
             if abs(selected_time_gfs_reference - valid_time_np) > np.timedelta64(
-                1, "h"
+                3, "h"
             ):
                 timestep_results["skip_reason"] = (
-                    f"GFS Reference time {selected_time_gfs_reference} too far from target {valid_time_np}"
+                    f"GFS Reference time {selected_time_gfs_reference} too far from target {valid_time_np} (>3h difference)"
                 )
                 return timestep_results
 
@@ -1709,12 +2789,43 @@ async def _process_single_timestep_parallel(
         cached_grid_dims = None
         cached_pressure_dims = {}
 
-        # Create parallel tasks for all variables in this time step
-        variable_tasks = []
-        for var_config in variables_to_score:
+        # OPTIMIZED CACHING: Since data is pre-loaded, create simple variable references
+        # The miner forecast data has already been downloaded and cached in memory
+        logger.debug(f"[Day1Score] Creating variable references for {len(variables_to_score)} variables (data pre-loaded)")
+        preloaded_variables = {}
+        
+        try:
+            # Create references to pre-loaded variables
+            vars_to_cache = [
+                var_config["name"] for var_config in variables_to_score
+                if var_config["name"] in miner_forecast_lead.data_vars
+            ]
+            
+            if vars_to_cache:
+                for var_name in vars_to_cache:
+                    try:
+                        preloaded_variables[var_name] = {
+                            "miner": miner_forecast_lead[var_name],  # Pre-loaded DataArray
+                            "truth": gfs_analysis_lead[var_name],    # Local data
+                            "ref": gfs_reference_lead[var_name],     # Local data
+                        }
+                        logger.debug(f"[Day1Score] Cached reference for pre-loaded variable {var_name}")
+                    except KeyError:
+                        logger.warning(f"[Day1Score] Variable {var_name} not found in datasets")
+                        continue
+                
+                logger.debug(f"[Day1Score] Created references for {len(preloaded_variables)}/{len(vars_to_cache)} pre-loaded variables")
+            
+        except Exception as cache_err:
+            logger.warning(f"[Day1Score] Failed to create variable references: {cache_err}")
+            # Fall back to direct dataset access
+            preloaded_variables = {}
+
+        # Process variables sequentially for better CPU efficiency
+        for j, var_config in enumerate(variables_to_score):
             var_name = var_config["name"]
             var_level = var_config.get("level")
-            var_key = f"{var_name}{var_level}" if var_level else var_name
+            var_key = f"{var_name}{var_level}" if var_level and var_level != "all" else var_name
 
             # Initialize result structure for this variable
             timestep_results["variables"][var_key] = {
@@ -1725,9 +2836,30 @@ async def _process_single_timestep_parallel(
                 "clone_penalty_applied": None,
             }
 
-            # Create parallel task for this variable
-            task = asyncio.create_task(
-                _process_single_variable_parallel(
+            logger.debug(f"[Day1Score] Miner {miner_hotkey}: Processing variable {j+1}/{len(variables_to_score)}: {var_key}")
+
+            # Use pre-loaded variables if available, otherwise pass datasets
+            if var_name in preloaded_variables:
+                task_datasets = preloaded_variables[var_name]
+                result = await _process_single_variable_parallel_preloaded(
+                    var_config=var_config,
+                    miner_var_da=task_datasets["miner"],
+                    truth_var_da=task_datasets["truth"],
+                    ref_var_da=task_datasets["ref"],
+                    era5_climatology=era5_climatology,
+                    precomputed_climatology_cache=precomputed_climatology_cache,
+                    day1_scoring_config=day1_scoring_config,
+                    valid_time_dt=valid_time_dt,
+                    effective_lead_h=effective_lead_h,
+                    miner_hotkey=miner_hotkey,
+                    cached_pressure_dims=cached_pressure_dims,
+                    cached_lat_weights=cached_lat_weights,
+                    cached_grid_dims=cached_grid_dims,
+                    variables_to_score=variables_to_score,
+                )
+            else:
+                # Fallback to original method
+                result = await _process_single_variable_parallel(
                     var_config=var_config,
                     miner_forecast_lead=miner_forecast_lead,
                     gfs_analysis_lead=gfs_analysis_lead,
@@ -1742,35 +2874,27 @@ async def _process_single_timestep_parallel(
                     cached_lat_weights=cached_lat_weights,
                     cached_grid_dims=cached_grid_dims,
                     variables_to_score=variables_to_score,
-                ),
-                name=f"var_{var_key}_{effective_lead_h}h_{miner_hotkey[:8]}",
-            )
-            variable_tasks.append((var_key, task))
-
-        # Execute all variables in parallel for this time step
-        logger.debug(
-            f"[Day1Score] Miner {miner_hotkey}: Executing {len(variable_tasks)} variable tasks for time step {valid_time_dt}"
-        )
-
-        # Get just the tasks for asyncio.gather
-        tasks_only = [task for _, task in variable_tasks]
-        variable_results = await asyncio.gather(*tasks_only, return_exceptions=True)
-
-        timestep_time = time.time() - timestep_start
-        logger.info(
-            f"[Day1Score] Miner {miner_hotkey}: PARALLEL time step {valid_time_dt} completed in {timestep_time:.2f}s"
-        )
-
-        # Process results from parallel variable execution
-        for i, (var_key, _) in enumerate(variable_tasks):
-            result = variable_results[i]
-
-            if isinstance(result, Exception):
-                logger.error(
-                    f"[Day1Score] Miner {miner_hotkey}: PARALLEL task failed for {var_key} at {valid_time_dt}: {result}"
                 )
-                timestep_results["variables"][var_key]["error"] = str(result)
+
+            # Process result immediately
+            if isinstance(result, Exception):
+                error_msg = str(result)
+                logger.error(
+                    f"[Day1Score] Miner {miner_hotkey}: Variable processing failed for {var_key} at {valid_time_dt}: {error_msg}",
+                    exc_info=result if hasattr(result, '__traceback__') else None
+                )
+                
+                timestep_results["variables"][var_key]["error"] = error_msg
                 timestep_results["qc_passed"] = False
+                
+                # CRITICAL: If this is a coordinate/data structure error, fail fast
+                if any(coord_err in error_msg.lower() for coord_err in ['pressure_level', 'coordinate', 'dimension', 'keyerror']):
+                    logger.error(
+                        f"[Day1Score] Miner {miner_hotkey}: CRITICAL coordinate error for {var_key} - failing entire timestep to prevent cascade failures"
+                    )
+                    timestep_results["error_message"] = f"Critical coordinate error in {var_key}: {error_msg}"
+                    return timestep_results  # Early termination
+                
                 continue
 
             if not isinstance(result, dict):

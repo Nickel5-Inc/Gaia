@@ -1,6 +1,6 @@
 import os
 import sys
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from unittest.mock import patch
 
 #####Temp Health Check to run on local

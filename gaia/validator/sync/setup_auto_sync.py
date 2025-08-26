@@ -27,7 +27,7 @@ project_root = Path(__file__).parents[3]
 sys.path.insert(0, str(project_root))
 
 from gaia.validator.sync.auto_sync_manager import get_auto_sync_manager
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 

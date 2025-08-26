@@ -1,6 +1,8 @@
 import gc
 import logging
 import sys
+import math
+import multiprocessing as mp
 from datetime import datetime, timezone, timedelta
 import os
 import time
@@ -30,15 +32,7 @@ os.environ["NODE_TYPE"] = "validator"
 
 import asyncio
 
-# === PERFORMANCE OPTIMIZATION INTEGRATION ===
-try:
-    from gaia.utils import performance
 
-    print("🚀 [PERFORMANCE] High-performance libraries integration activated")
-    # Performance status will be logged when the module is imported
-except Exception as e:
-    print(f"⚠️ [PERFORMANCE] Performance optimization integration failed: {e}")
-# === END PERFORMANCE OPTIMIZATION INTEGRATION ===
 
 # === WEIGHT TRACING INTEGRATION ===
 try:
@@ -53,10 +47,10 @@ try:
         sys.path.insert(0, root_dir)
     # Enable PyTorch CUDA memory allocation configuration
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    import runtime_weight_tracer
+    
 
     print("🔍 [MAIN] Weight tracing available - enabling...")
-    runtime_weight_tracer.enable_weight_tracing()
+    
     print("✅ [MAIN] Weight tracing enabled successfully")
 except Exception as e:
     print(f"⚠️ [MAIN] Weight tracing not available: {e}")
@@ -69,12 +63,12 @@ from typing import Any, Optional, List, Dict, Set
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 import httpx
-from fiber.chain import chain_utils, interface
+from fiber.chain import chain_utils
 from fiber.chain import weights as w
 
 # Note: get_nodes_for_netuid replaced with process-isolated _fetch_nodes_process_isolated
 from fiber.chain.chain_utils import query_substrate
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 # Patch query_substrate to handle ProcessIsolatedSubstrate results
 _original_query_substrate = query_substrate
@@ -158,14 +152,12 @@ from fiber.encrypted.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
 from fiber.chain.interface import get_substrate
 from substrateinterface import SubstrateInterface
-
-# Geomagnetic and soil moisture tasks disabled
 from gaia.APIcalls.miner_score_sender import MinerScoreSender
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-from gaia.tasks.base.miner_performance_calculator import (
-    MinerPerformanceCalculator,
-    calculate_daily_stats,
-)
+try:
+    mp.set_start_method("spawn", force=True)
+except Exception:
+    pass
 from argparse import ArgumentParser
 import pandas as pd
 import json
@@ -174,7 +166,7 @@ import base64
 import math
 from gaia.validator.utils.auto_updater import perform_update
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import declarative_base
 from sqlalchemy import text
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -190,6 +182,9 @@ from gaia.validator.utils.substrate_manager import (
     force_substrate_cleanup,
 )
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+from gaia.tasks.defined_tasks.weather.pipeline.workers import process_one
+from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
+from gaia.tasks.defined_tasks.weather.pipeline.steps.aggregate_step import compute_subnet_stats
 from gaia.utils import consensus_metrics
 import importlib as _il
 import base64 as _b64
@@ -310,6 +305,14 @@ async def perform_handshake_with_retry(
 
     # If we get here, all attempts failed
     raise last_exception or Exception("Handshake failed after all retry attempts")
+
+
+def _weather_worker_entrypoint() -> None:
+    # Child process entrypoint for per-miner worker
+    import asyncio
+    from gaia.tasks.defined_tasks.weather.pipeline.worker_main import main as worker_main
+
+    asyncio.run(worker_main())
 
 
 class GaiaValidator:
@@ -495,7 +498,7 @@ class GaiaValidator:
         """
         Initialize the GaiaValidator with provided arguments.
         """
-        print("[STARTUP DEBUG] Starting GaiaValidator.__init__")
+        logger.debug("Starting GaiaValidator initialization")
 
         # CRITICAL: Check for asyncio compatibility issues that break multiprocessing
         self._check_and_fix_asyncio_compatibility()
@@ -509,6 +512,10 @@ class GaiaValidator:
             self._clear_pycache_files()
 
         self.args = args
+        # Initialize early to avoid attribute errors during partial startup
+        self._cleanup_done = False
+        self.validator_uid = None
+
         self.metagraph = None
         self.config = None
         self.database_manager = ValidatorDatabaseManager()
@@ -517,16 +524,16 @@ class GaiaValidator:
         self._background_tasks = set()  # Track all background tasks
         self._task_cleanup_lock = asyncio.Lock()
 
+        # Lightweight DB accessor queue and worker to offload blocking DB/chain ops
+        self._db_work_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+        self._db_results: dict[str, asyncio.Future] = {}
+
         # Only initialize weather task - geomagnetic and soil moisture tasks disabled
         self.weather_task = WeatherTask(
             db_manager=self.database_manager,
             node_type="validator",
             test_mode=args.test,
         )
-
-        # Initialize performance calculator for tracking miner statistics
-        self.performance_calculator = None  # Will be initialized when database is ready
-        self.last_performance_calculation = 0  # Track last calculation time
 
         # Initialize weight perturbation manager for anti-weight-copying defense
         self.perturbation_manager = None  # Will be initialized when database is ready
@@ -544,6 +551,15 @@ class GaiaValidator:
         self.current_block = 0
         self.nodes = {}
         self.memray_tracker: Optional[memray.Tracker] = None  # For programmatic memray
+
+        # Feature-flagged per-miner worker loop (defaults off)
+        # Enable per-miner execution via multi-process workers by default
+        self._per_miner_exec_enabled = True
+        self._per_miner_task: Optional[asyncio.Task] = None  # legacy in-process loop (unused now)
+
+        # Weather worker pool management (multi-process)
+        self._weather_worker_processes: list[mp.Process] = []
+        self._weather_worker_num: int = self._compute_weather_worker_procs()
 
         # Initialize HTTP clients first
         # Client for miner communication with SSL verification disabled
@@ -589,6 +605,7 @@ class GaiaValidator:
 
         self.last_successful_weight_set = time.time()
         self.last_successful_dereg_check = time.time()
+
         self.last_successful_db_check = time.time()
         self.last_metagraph_sync = time.time()
 
@@ -603,6 +620,8 @@ class GaiaValidator:
                 "timeouts": {
                     "default": 1800,  # 30 minutes
                     "weight_setting": 300,  # 5 minutes
+                    "monitoring": 7200,  # 2 hours for idle monitoring loops
+                    "monitoring_idle": 86400,  # 24 hours for idle monitoring (essentially no timeout)
                 },
                 "resources": {
                     "memory_start": 0,
@@ -665,16 +684,17 @@ class GaiaValidator:
             "VALIDATOR_PM2_RESTART_ENABLED", "true"
         ).lower() in ["true", "1", "yes"]
 
-        # REALISTIC MEMORY THRESHOLDS - Appropriate for 32GB systems running weather scoring
+        # WORKER-OPTIMIZED MEMORY THRESHOLDS - For 48GB systems with 9 workers @ 3GB each
+        # Available for main process: 48GB - (9×3GB workers) - 3GB system = 18GB max
         self.memory_warning_threshold_mb = int(
-            os.getenv("VALIDATOR_MEMORY_WARNING_THRESHOLD_MB", "20000")
-        )  # 20GB (62% of 32GB) - informational only
+            os.getenv("VALIDATOR_MEMORY_WARNING_THRESHOLD_MB", "10000")
+        )  # 10GB (56% of 18GB available) - informational only
         self.memory_emergency_threshold_mb = int(
-            os.getenv("VALIDATOR_MEMORY_EMERGENCY_THRESHOLD_MB", "25000")
-        )  # 25GB (78% of 32GB) - light GC, close monitoring
+            os.getenv("VALIDATOR_MEMORY_EMERGENCY_THRESHOLD_MB", "13000")
+        )  # 13GB (72% of 18GB available) - aggressive cleanup
         self.memory_critical_threshold_mb = int(
-            os.getenv("VALIDATOR_MEMORY_CRITICAL_THRESHOLD_MB", "29000")
-        )  # 29GB (90% of 32GB) - restart to avoid OOM
+            os.getenv("VALIDATOR_MEMORY_CRITICAL_THRESHOLD_MB", "15000")
+        )  # 15GB (83% of 18GB available) - restart to avoid worker interference
 
         # Memory monitoring state
         self.last_memory_log_time = 0
@@ -688,7 +708,7 @@ class GaiaValidator:
             db_manager=self.database_manager,
             test_mode=self.args.test if hasattr(self.args, "test") else False,
         )
-        logger.info("BaseModelEvaluator initialized")
+        logger.debug("BaseModelEvaluator initialized")
 
         # DB Sync components
         self.auto_sync_manager = None  # Streamlined sync system using pgBackRest + R2
@@ -735,7 +755,7 @@ class GaiaValidator:
             None  # Initialize for the snapshot taker task
         )
 
-        print("[STARTUP DEBUG] Validating task weight schedule")
+        logger.debug("Validating task weight schedule")
         for dt_thresh, weights_dict in self.task_weight_schedule:
             if not math.isclose(sum(weights_dict.values()), 1.0):
                 logger.error(
@@ -743,9 +763,20 @@ class GaiaValidator:
                 )
 
         # Initialize substrate connection manager (will be set up in setup_neuron)
-        print("[STARTUP DEBUG] Initializing substrate manager")
+        logger.debug("Initializing substrate manager")
 
-        print("[STARTUP DEBUG] GaiaValidator.__init__ completed")
+        logger.debug("GaiaValidator initialization completed")
+
+    def _compute_weather_worker_procs(self) -> int:
+        try:
+            cores = os.cpu_count() or 2
+        except Exception:
+            cores = 2
+        # Use up to 80% of cores, rounded down, with at least 1 core reserved for main/system
+        pct_target = max(0, math.floor(0.8 * cores))
+        reserve_cap = max(0, cores - 1)
+        procs = min(pct_target, reserve_cap)
+        return max(1, procs)
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -910,21 +941,32 @@ class GaiaValidator:
             )
             logger.info(f"Using netuid: {self.netuid}")
 
+            # Handle dot notation arguments properly
+            cli_chain_endpoint = getattr(self.args, 'subtensor.chain_endpoint', None)
+            env_chain_endpoint = os.getenv("SUBTENSOR_ADDRESS", "wss://test.finney.opentensor.ai:443/")
             self.subtensor_chain_endpoint = (
-                self.args.subtensor.chain_endpoint
-                if hasattr(self.args, "subtensor")
-                and hasattr(self.args.subtensor, "chain_endpoint")
-                else os.getenv(
-                    "SUBTENSOR_ADDRESS", "wss://test.finney.opentensor.ai:443/"
-                )
+                cli_chain_endpoint
+                if cli_chain_endpoint is not None
+                else env_chain_endpoint
             )
 
+            # Handle dot notation arguments properly
+            cli_network = getattr(self.args, 'subtensor.network', None)
+            env_network = os.getenv("SUBTENSOR_NETWORK", "test")
             self.subtensor_network = (
-                self.args.subtensor.network
-                if hasattr(self.args, "subtensor")
-                and hasattr(self.args.subtensor, "network")
-                else os.getenv("SUBTENSOR_NETWORK", "test")
+                cli_network
+                if cli_network is not None
+                else env_network
             )
+            
+            # CRITICAL: Log the actual values being used for debugging
+            logger.info(f"🔗 Subtensor Configuration:")
+            logger.info(f"   CLI chain_endpoint: {cli_chain_endpoint}")
+            logger.info(f"   ENV SUBTENSOR_ADDRESS: {env_chain_endpoint}")
+            logger.info(f"   Final chain_endpoint: {self.subtensor_chain_endpoint}")
+            logger.info(f"   CLI network: {cli_network}")
+            logger.info(f"   ENV SUBTENSOR_NETWORK: {env_network}")
+            logger.info(f"   Final network: {self.subtensor_network}")
 
             self.wallet_name = (
                 self.args.wallet
@@ -1023,6 +1065,7 @@ class GaiaValidator:
                 f"Initial block number type: {type(self.current_block)}, value: {self.current_block}"
             )
             self.last_set_weights_block = self.current_block - 300
+            logger.info(f"[WeightScheduler] Initial setup - Current block: {self.current_block}, Last weight block: {self.last_set_weights_block}, Blocks since: {self.current_block - self.last_set_weights_block}")
 
             if self.validator_uid is None:
                 self.validator_uid = self.substrate.query(
@@ -2380,6 +2423,7 @@ class GaiaValidator:
             if health["status"] == "idle":
                 continue
 
+            # Use operation-specific timeout (e.g., "monitoring" has extended timeout)
             timeout = health["timeouts"].get(
                 health.get("current_operation"), health["timeouts"]["default"]
             )
@@ -2965,26 +3009,43 @@ class GaiaValidator:
             # MEMORY LEAK FIX: Clean up background tasks first
             await self._cleanup_background_tasks()
 
+            # Stop weather worker processes
+            if getattr(self, "_weather_worker_processes", None):
+                logger.info("Stopping weather worker processes...")
+                # First try to terminate gracefully
+                for p in self._weather_worker_processes:
+                    try:
+                        if p.is_alive():
+                            p.terminate()
+                            logger.debug(f"Sent SIGTERM to worker process {p.name} (pid={p.pid})")
+                    except Exception as e:
+                        logger.debug(f"Could not terminate process {p.name}: {e}")
+                
+                # Wait for processes to exit gracefully
+                for p in self._weather_worker_processes:
+                    try:
+                        p.join(timeout=2)
+                        if not p.is_alive():
+                            logger.debug(f"Worker process {p.name} exited gracefully")
+                    except Exception:
+                        pass
+                
+                # Force kill any remaining processes
+                for p in self._weather_worker_processes:
+                    try:
+                        if p.is_alive():
+                            logger.warning(f"Force killing worker process {p.name} (pid={p.pid})")
+                            p.kill()
+                            p.join(timeout=1)
+                    except Exception as e:
+                        logger.debug(f"Could not kill process {p.name}: {e}")
+                
+                self._weather_worker_processes.clear()
+                logger.info("Weather worker processes stopped")
+
             # First clean up database resources
             if hasattr(self, "database_manager"):
-                await self.database_manager.execute(
-                    """
-                    UPDATE geomagnetic_predictions 
-                    SET status = 'pending'
-                    WHERE status = 'processing'
-                    """
-                )
-                logger.info("Reset in-progress prediction statuses")
-
-                await self.database_manager.execute(
-                    """
-                    DELETE FROM score_table 
-                    WHERE task_name = 'geomagnetic' 
-                    AND status = 'processing'
-                    """
-                )
-                logger.info("Cleaned up incomplete scoring operations")
-
+                # Weather-only: no legacy geomagnetic cleanups
                 # Close database connections
                 await self.database_manager.close_all_connections()
                 logger.info("Closed database connections")
@@ -3155,6 +3216,67 @@ class GaiaValidator:
         except Exception as e:
             logger.error(f"Failed to recover {task_name}: {e}")
             logger.error(traceback.format_exc())
+
+    async def _monitor_worker_processes(self):
+        """Monitor worker processes and restart any that have died."""
+        import multiprocessing as mp
+        import time
+        
+        logger.info("Worker process monitoring started")
+        
+        while True:
+            try:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                logger.debug("Worker monitoring: Checking worker health...")
+                
+                if not self._weather_worker_processes:
+                    continue
+                    
+                dead_workers = []
+                total_workers = self._weather_worker_num
+                
+                # Check which workers are dead
+                for i, process in enumerate(self._weather_worker_processes):
+                    if not process.is_alive():
+                        exit_code = process.exitcode
+                        logger.warning(f"Worker {process.name} (pid={process.pid}) has died with exit code {exit_code}")
+                        dead_workers.append((i, process))
+                
+                # Restart dead workers
+                if dead_workers:
+                    logger.info(f"Restarting {len(dead_workers)} dead worker(s)")
+                    
+                    for i, dead_process in dead_workers:
+                        try:
+                            # Clean up the dead process
+                            dead_process.join(timeout=1)
+                            
+                            # Create a new worker with the same name format
+                            worker_num = i + 1
+                            name = f"worker-{worker_num}/{total_workers}"
+                            new_process = mp.Process(name=name, target=_weather_worker_entrypoint, daemon=True)
+                            new_process.start()
+                            
+                            # Replace the dead process in the list
+                            self._weather_worker_processes[i] = new_process
+                            
+                            logger.info(f"✅ Restarted worker {name} (new pid={new_process.pid})")
+                            
+                        except Exception as e:
+                            logger.error(f"Failed to restart worker {dead_process.name}: {e}")
+                
+                # Log worker health summary periodically (every 5 minutes)
+                if hasattr(self, '_last_worker_health_log'):
+                    if time.time() - self._last_worker_health_log > 300:
+                        alive_count = sum(1 for p in self._weather_worker_processes if p.is_alive())
+                        logger.info(f"Worker health: {alive_count}/{len(self._weather_worker_processes)} workers alive")
+                        self._last_worker_health_log = time.time()
+                else:
+                    self._last_worker_health_log = time.time()
+                    
+            except Exception as e:
+                logger.error(f"Error in worker monitoring: {e}", exc_info=True)
+                await asyncio.sleep(60)  # Wait longer before retrying on error
 
     async def cleanup_stale_history_on_startup(self):
         """
@@ -3446,32 +3568,8 @@ class GaiaValidator:
 
     async def main(self):
         """Main execution loop for the validator."""
-
-        memray_active = False
-        memray_output_file_path = "validator_memray_output.bin"
-
-        if os.getenv("ENABLE_MEMRAY_TRACKING", "false").lower() == "true":
-            try:
-                # memray is already imported at the top
-                logger.info(
-                    f"Programmatic Memray tracking enabled. Output will be saved to: {memray_output_file_path}"
-                )
-                self.memray_tracker = memray.Tracker(
-                    destination=memray.FileDestination(
-                        path=memray_output_file_path, overwrite=True
-                    ),
-                    native_traces=True,
-                )
-                memray_active = True
-            except (
-                ImportError
-            ):  # Should not happen if import is at top, but good for safety
-                logger.warning(
-                    "Memray library seemed to be missing despite top-level import. Programmatic Memray tracking is disabled."
-                )
-            except Exception as e:
-                logger.error(f"Failed to initialize Memray tracker: {e}")
-                self.memray_tracker = None  # Ensure it's None if init fails
+        # Mark that main has started so outer finally doesn't trigger shutdown prematurely
+        self._main_started = True
 
         async def run_validator_logic():
             # Suppress gcsfs/aiohttp cleanup warnings that can block PM2 restart
@@ -3508,35 +3606,76 @@ class GaiaValidator:
 
                 logger.info("Metagraph initialized.")
 
-                logger.info("Initializing database connection...")
-                await self.database_manager.initialize_database()
-                logger.info("Database tables initialized.")
+                # Ensure database is fully ready before starting worker pool
+                async def _wait_for_database_ready(min_ok: int = 3, max_wait_sec: int = 180) -> None:
+                    ok_count = 0
+                    start = time.time()
+                    backoff = 1.0
+                    while ok_count < min_ok:
+                        if time.time() - start > max_wait_sec:
+                            break
+                        try:
+                            await self.database_manager.initialize_database()
+                            # lightweight ping
+                            await self.database_manager.fetch_one("SELECT 1")
+                            ok_count += 1
+                            await asyncio.sleep(0.5)
+                            backoff = 1.0
+                        except Exception as e:
+                            ok_count = 0
+                            msg = str(e)
+                            if any(s in msg for s in ["shutting down", "starting up", "CannotConnectNow"]):
+                                await asyncio.sleep(backoff)
+                                backoff = min(backoff * 1.5, 5.0)
+                            else:
+                                # Other errors: brief wait and retry
+                                await asyncio.sleep(1.0)
 
-                # Initialize performance calculator with database manager
-                try:
-                    self.performance_calculator = MinerPerformanceCalculator(
-                        self.database_manager
-                    )
-                    # Set validator context for pathway tracking
-                    if (
-                        hasattr(self, "config")
-                        and self.config
-                        and hasattr(self.config.wallet, "hotkey")
-                    ):
-                        validator_hotkey = self.config.wallet.hotkey.ss58_address
-                        self.performance_calculator.set_validator_context(
-                            validator_hotkey
-                        )
-                        logger.info(
-                            f"Performance calculator initialized with validator context: {validator_hotkey[:8]}..."
-                        )
-                    else:
-                        logger.info(
-                            "Performance calculator initialized (no validator hotkey available)"
-                        )
-                except Exception as e:
-                    logger.error(f"Failed to initialize performance calculator: {e}")
-                    # Continue without performance calculator - it's not critical
+                logger.info("Waiting for database to be ready before starting workers...")
+                await _wait_for_database_ready()
+
+                # Start DB accessor task
+                async def _db_accessor_worker():
+                    sem = asyncio.Semaphore(4)  # Cap concurrent ops inside accessor
+                    while not self._shutdown_event.is_set():
+                        try:
+                            work = await self._db_work_queue.get()
+                            if work is None:
+                                break
+                            op_id = work.get("id")
+                            fut: asyncio.Future = self._db_results.pop(op_id, None)
+                            if fut is None:
+                                continue
+                            async with sem:
+                                try:
+                                    kind = work.get("kind")
+                                    if kind == "fetch_one":
+                                        res = await self.database_manager.fetch_one(work["query"], work.get("params"))
+                                    elif kind == "fetch_all":
+                                        res = await self.database_manager.fetch_all(work["query"], work.get("params"))
+                                    elif kind == "execute":
+                                        res = await self.database_manager.execute(work["query"], work.get("params"))
+                                    elif kind == "metagraph_sync":
+                                        # Offload metagraph sync here if needed
+                                        await self._sync_metagraph()
+                                        res = True
+                                    else:
+                                        res = None
+                                    if not fut.done():
+                                        fut.set_result(res)
+                                except Exception as e:
+                                    if fut and not fut.done():
+                                        fut.set_exception(e)
+                        except asyncio.CancelledError:
+                            break
+                        except Exception:
+                            await asyncio.sleep(0.01)
+
+                if not hasattr(self, "_db_accessor_task") or self._db_accessor_task is None:
+                    self._db_accessor_task = asyncio.create_task(_db_accessor_worker(), name="db_accessor_worker")
+
+                # Defer starting worker pool until after AutoSyncManager setup below
+
 
                 # Initialize weight perturbation manager for anti-weight-copying defense
                 try:
@@ -3579,9 +3718,6 @@ class GaiaValidator:
                 # Initialize DB Sync Components - AFTER DB init
                 await self._initialize_db_sync_components()
 
-                # logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER ")
-                await handle_db_wipe(self.database_manager)
-
                 # Perform startup history cleanup AFTER db init and wipe check
                 await self.cleanup_stale_history_on_startup()
 
@@ -3617,13 +3753,7 @@ class GaiaValidator:
                 await self.start_watchdog()
                 logger.info("Watchdog started.")
 
-                if not memray_active:  # Start tracemalloc only if memray is not active
-                    logger.info("Starting tracemalloc for memory analysis...")
-                    tracemalloc.start(25)  # Start tracemalloc, 25 frames for traceback
 
-                logger.info("Initializing baseline models...")
-                await self.basemodel_evaluator.initialize_models()
-                logger.info("Baseline models initialization complete")
 
                 # Start auto-updater as independent task (not in main loop to avoid self-cancellation)
                 logger.info("Starting independent auto-updater task...")
@@ -3632,31 +3762,168 @@ class GaiaValidator:
                 )
                 logger.info("Auto-updater task started independently")
 
+                # Lightweight recurring job enqueuer
+                async def _enqueue_recurring_jobs():
+                    # CRITICAL: Wait for database to be fully stable before enqueuing jobs
+                    logger.info("⏳ Job enqueuer waiting 30 seconds for database stability...")
+                    await asyncio.sleep(30)  # Wait for database to be fully ready
+                    
+                    db = self.database_manager
+                    import datetime as _dt
+                    
+                    logger.info("🚀 Job enqueuer starting after database stability wait")
+                    
+                    # CRITICAL: Enqueue essential jobs after stability wait
+                    startup_now = _dt.datetime.now(_dt.timezone.utc)
+                    logger.info("🚀 Enqueuing critical startup jobs (metagraph sync, node table population)")
+                    await db.enqueue_singleton_job(
+                        singleton_key="metagraph_sync",
+                        job_type="metagraph.sync",
+                        payload={},
+                        priority=150,
+                        scheduled_at=startup_now,
+                    )
+                    await db.enqueue_singleton_job(
+                        singleton_key="miners_handle_deregistrations",
+                        job_type="miners.handle_deregistrations",
+                        payload={},
+                        priority=160,
+                        scheduled_at=startup_now,
+                    )
+                    
+                    while not self._shutdown_event.is_set():
+                        try:
+                            now = _dt.datetime.now(_dt.timezone.utc)
+                            # Stats aggregation and subnet snapshot every 10 minutes
+                            await db.enqueue_singleton_job(
+                                singleton_key="stats_aggregate",
+                                job_type="stats.aggregate",
+                                payload={"ts": now.isoformat()},
+                                priority=120,
+                                scheduled_at=now,
+                            )
+                            await db.enqueue_singleton_job(
+                                singleton_key="stats_subnet_snapshot",
+                                job_type="stats.subnet_snapshot",
+                                payload={"ts": now.isoformat()},
+                                priority=130,
+                                scheduled_at=now,
+                            )
+                            # Weights: handle directly in main validator process (has substrate access)
+                            try:
+                                current_block = self._get_current_block_cached()
+                                target_block_interval = 250  # Target ~250 blocks between weight sets
+                                
+                                # Get last weight set block from chain for accurate scheduling
+                                if self.validator_uid is not None:
+                                    try:
+                                        # Import here to avoid circular imports
+                                        from gaia.validator.weights.weight_service import get_last_weight_set_block_from_chain
+                                        last_weight_block_chain = await get_last_weight_set_block_from_chain(
+                                            self.substrate, self.netuid, int(self.validator_uid)
+                                        )
+                                        blocks_since_weights = current_block - last_weight_block_chain
+                                        
+                                        logger.debug(f"[WeightScheduler] Current block: {current_block}, Chain last weight block: {last_weight_block_chain}, Blocks since: {blocks_since_weights}")
+                                        
+                                        if blocks_since_weights >= target_block_interval:
+                                            logger.info(f"[WeightScheduler] Setting weights directly - {blocks_since_weights} blocks since last set (target: {target_block_interval})")
+                                            # Execute weight setting directly in main process (has substrate access)
+                                            from gaia.validator.weights.weight_service import commit_weights_if_eligible
+                                            weight_success = await commit_weights_if_eligible(self)
+                                            if weight_success:
+                                                logger.success("[WeightScheduler] ✅ Weight setting completed successfully")
+                                            else:
+                                                logger.info("[WeightScheduler] ⏳ Weight setting not eligible yet")
+                                        else:
+                                            logger.debug(f"[WeightScheduler] Not scheduling - only {blocks_since_weights} blocks since last set (need {target_block_interval})")
+                                    except Exception as chain_error:
+                                        logger.warning(f"[WeightScheduler] Failed to get chain weight data: {chain_error}")
+                                        # Fallback to local tracking
+                                        blocks_since_weights = current_block - self.last_set_weights_block
+                                        logger.debug(f"[WeightScheduler] Fallback - Current block: {current_block}, Local last weight block: {self.last_set_weights_block}, Blocks since: {blocks_since_weights}")
+                                        
+                                        if blocks_since_weights >= target_block_interval:
+                                            logger.info(f"[WeightScheduler] Setting weights directly (fallback) - {blocks_since_weights} blocks since last set")
+                                            from gaia.validator.weights.weight_service import commit_weights_if_eligible
+                                            weight_success = await commit_weights_if_eligible(self)
+                                            if weight_success:
+                                                logger.success("[WeightScheduler] ✅ Weight setting completed successfully (fallback)")
+                                            else:
+                                                logger.info("[WeightScheduler] ⏳ Weight setting not eligible yet (fallback)")
+                                else:
+                                    logger.debug("[WeightScheduler] Validator UID not available, skipping weight scheduling")
+                            except Exception as e:
+                                logger.error(f"[WeightScheduler] Error in block-based weight scheduling: {e}")
+                            
+                            # Sleep for 30 minutes between checks since 250 blocks ≈ 50 minutes (12s/block)
+                            # This reduces unnecessary substrate queries while still being responsive
+                            await asyncio.sleep(1800)  # 30 minutes
+                            
+                            
+                            now = _dt.datetime.now(_dt.timezone.utc)
+                            
+                            # Metagraph sync and miner dereg handling every 5 minutes
+                            if now.minute % 5 == 0:
+                                await db.enqueue_singleton_job(
+                                    singleton_key="metagraph_sync",
+                                    job_type="metagraph.sync",
+                                    payload={},
+                                    priority=150,
+                                    scheduled_at=now,
+                                )
+                                await db.enqueue_singleton_job(
+                                    singleton_key="miners_handle_deregistrations",
+                                    job_type="miners.handle_deregistrations",
+                                    payload={},
+                                    priority=160,
+                                    scheduled_at=now,
+                                )
+                            # ERA5 token refresh hourly on top of the hour
+                            if now.minute == 0:
+                                await db.enqueue_singleton_job(
+                                    singleton_key="era5_refresh_token",
+                                    job_type="era5.refresh_token",
+                                    payload={},
+                                    priority=170,
+                                    scheduled_at=now,
+                                )
+                            # Ops status and DB monitor every 15 minutes
+                            if now.minute % 15 == 0:
+                                await db.enqueue_singleton_job(
+                                    singleton_key="ops_status_snapshot",
+                                    job_type="ops.status_snapshot",
+                                    payload={},
+                                    priority=180,
+                                    scheduled_at=now,
+                                )
+                                await db.enqueue_singleton_job(
+                                    singleton_key="db_monitor",
+                                    job_type="db.monitor",
+                                    payload={},
+                                    priority=181,
+                                    scheduled_at=now,
+                                )
+                        except Exception:
+                            pass
+                        await asyncio.sleep(60)
+
+                # Job enqueuer will be started after AutoSyncManager setup
+
                 tasks_lambdas = [  # Renamed to avoid conflict if tasks variable is used elsewhere
                     lambda: self.weather_task.validator_execute(self),
+                    # initiate_fetch_retry_loop removed - now handled by workers
                     lambda: self.status_logger(),
                     lambda: self.main_scoring(),
-                    lambda: self.handle_miner_deregistration_loop(),
+                    # Deregistration moved to workers via miners.handle_deregistrations singleton job
                     # The MinerScoreSender task will be added conditionally below
                     lambda: self.manage_earthdata_token(),
                     lambda: self.monitor_client_health(),  # Added HTTP client monitoring
                     # lambda: self.database_monitor(),
                     # Periodic substrate cleanup removed - using isolated substrate interface instead  # Added substrate cleanup task
                     lambda: self.aggressive_memory_cleanup(),  # Added aggressive memory cleanup task
-                    # lambda: self.plot_database_metrics_periodically() # Added plotting task
+  
                 ]
-                # Using process-isolated substrate manager - ABC tracking no longer needed
-                # Process isolation prevents ABC object accumulation completely
-                logger.info(
-                    "🛡️  Using process-isolated substrate manager - ABC memory leaks prevented by process isolation"
-                )
-
-                if (
-                    not memray_active
-                ):  # Add tracemalloc snapshot taker only if memray is not active
-                    tasks_lambdas.append(lambda: self.memory_snapshot_taker())
-                # ABC monitor disabled - causes 28s freeze doing isinstance(obj, ABC) on all objects
-                # tasks_lambdas.append(lambda: self.abc_object_monitor())
 
                 # Add DB Sync tasks conditionally
                 if self.auto_sync_manager:
@@ -3677,6 +3944,55 @@ class GaiaValidator:
                             logger.info(
                                 "✅ AutoSyncManager setup and scheduling completed successfully!"
                             )
+                            # Start per-miner worker PROCESS POOL only AFTER AutoSyncManager setup
+                            if self._per_miner_exec_enabled and not self._weather_worker_processes:
+                                procs = self._weather_worker_num
+                                logger.info(f"Starting weather worker pool with {procs} processes (80% of cores, floored)")
+                                for i in range(procs):
+                                    name = f"worker-{i+1}/{procs}"
+                                    p = mp.Process(name=name, target=_weather_worker_entrypoint, daemon=True)
+                                    p.start()
+                                    self._weather_worker_processes.append(p)
+                                
+                                # NOW start job enqueuer after workers are ready and database is stable
+                                logger.info("🚀 Starting job enqueuer after AutoSyncManager setup and worker pool initialization")
+                                self.create_tracked_task(_enqueue_recurring_jobs(), "job_enqueuer")
+                                
+                                # Start worker monitoring to restart any workers that exit
+                                logger.info("🔧 Starting worker monitoring task")
+                                self.create_tracked_task(self._monitor_worker_processes(), "worker_monitor")
+
+                                # Start periodic stats aggregation loop alongside worker pool
+                                async def _stats_aggregation_loop():
+                                    interval_sec = 600  # active by default, run every 10 minutes
+                                    manager = WeatherStatsManager(
+                                        self.database_manager,
+                                        validator_hotkey=(
+                                            getattr(getattr(self.validator_wallet, "hotkey", None), "ss58_address", None)
+                                            if hasattr(self, "validator_wallet") and self.validator_wallet is not None
+                                            else "unknown_validator"
+                                        ),
+                                    )
+                                    while True:
+                                        try:
+                                            await manager.aggregate_miner_stats()
+                                            try:
+                                                await manager.get_overall_miner_ranks()
+                                            except Exception:
+                                                pass
+                                            try:
+                                                net = await compute_subnet_stats(self.database_manager)
+                                                logger.info(
+                                                    f"[stats] subnet snapshot: active_miners={net.get('active_miners')}, avg_forecast_score={net.get('avg_forecast_score')}, avg_host_reliability_ratio={net.get('avg_host_reliability_ratio')}"
+                                                )
+                                            except Exception:
+                                                pass
+                                        except Exception as agg_err:
+                                            logger.debug(f"Stats aggregation error: {agg_err}")
+                                        await asyncio.sleep(interval_sec)
+
+                                if getattr(self, "_stats_agg_task", None) is None:
+                                    self._stats_agg_task = asyncio.create_task(_stats_aggregation_loop(), name="stats_aggregation_loop")
                         else:
                             logger.warning(
                                 "⚠️ AutoSyncManager setup failed - attempting fallback scheduling for basic monitoring..."
@@ -3717,6 +4033,9 @@ class GaiaValidator:
                     logger.info(
                         "AutoSyncManager is not active for this node (initialization failed or not configured)."
                     )
+                    # Start job enqueuer since AutoSyncManager didn't start it
+                    logger.info("🚀 Starting job enqueuer (AutoSyncManager not active)")
+                    self.create_tracked_task(_enqueue_recurring_jobs(), "job_enqueuer")
 
                 # Conditionally add miner_score_sender task
                 score_sender_on_str = os.getenv("SCORE_SENDER_ON", "False")
@@ -3864,215 +4183,36 @@ class GaiaValidator:
                 if not self._cleanup_done:
                     await self._initiate_shutdown()
 
-        if memray_active and self.memray_tracker:
-            with self.memray_tracker:  # This starts the tracking
-                logger.info("Memray tracker is active and wrapping validator logic.")
-                await run_validator_logic()
-            logger.info(
-                f"Memray tracking finished. Output file '{memray_output_file_path}' should be written."
-            )
-        else:
-            logger.info(
-                "Memray tracking is not active. Running validator logic directly."
-            )
-            await run_validator_logic()
+        
+        await run_validator_logic()
 
     async def main_scoring(self):
-        """Run scoring every subnet tempo blocks."""
-        weight_setter = FiberWeightSetter(
-            netuid=self.netuid,
-            wallet_name=self.wallet_name,
-            hotkey_name=self.hotkey_name,
-            network=self.subtensor_network,
-            # Substrate manager removed - using fresh connections only
-        )
+        """Simplified scoring supervision - weight setting handled by recurring jobs."""
+        
+        # Set initial status
+        await self.update_task_status("scoring", "active", "cron_mode")
+        logger.info("🎯 Scoring system running in cron mode - weight setting handled by recurring jobs")
 
         while True:
             try:
-                await self.update_task_status("scoring", "active")
-
                 # Check for seed generation (primary validator only, every minute)
-                # Seeds are generated at :10 for activation at :00 next hour
                 if self.perturbation_manager:
                     current_time = time.time()
-                    if (
-                        current_time - self.last_seed_rotation_check > 60
-                    ):  # Check every minute
+                    if current_time - self.last_seed_rotation_check > 60:  # Check every minute
                         try:
-                            generated = (
-                                await self.perturbation_manager.rotate_seed_if_needed()
-                            )
+                            generated = await self.perturbation_manager.rotate_seed_if_needed()
                             if generated:
-                                logger.info(
-                                    "Future perturbation seed generated (primary validator)"
-                                )
-                                logger.info(
-                                    "Seed will be synced at :39 and activate at :00 next hour"
-                                )
+                                logger.info("Future perturbation seed generated (primary validator)")
+                                logger.info("Seed will be synced at :39 and activate at :00 next hour")
                             self.last_seed_rotation_check = current_time
                         except Exception as e:
                             logger.error(f"Error checking seed generation: {e}")
 
-                async def scoring_cycle():
-                    try:
-                        validator_uid = self.validator_uid
-
-                        if validator_uid is None:
-                            try:
-                                self.validator_uid = self.substrate.query(
-                                    "SubtensorModule",
-                                    "Uids",
-                                    [self.netuid, self.keypair.ss58_address],
-                                )
-                                validator_uid = int(self.validator_uid)
-                            except Exception as e:
-                                logger.error(f"Error getting validator UID: {e}")
-                                logger.error(traceback.format_exc())
-                                await self.update_task_status("scoring", "error")
-                                return False
-
-                        validator_uid = int(validator_uid)
-
-                        # Get current block info using shared cache
-                        current_block = self._get_current_block_cached()
-
-                        # Get last update info
-                        last_updated_value = self.substrate.query(
-                            "SubtensorModule", "LastUpdate", [self.netuid]
-                        )
-
-                        if last_updated_value is not None and validator_uid < len(
-                            last_updated_value
-                        ):
-                            last_updated = int(last_updated_value[validator_uid])
-                            blocks_since_update = current_block - last_updated
-                            logger.info(
-                                f"Calculated blocks since update: {blocks_since_update} (current: {current_block}, last: {last_updated})"
-                            )
-                        else:
-                            blocks_since_update = None
-                            logger.warning("Could not determine last update value")
-
-                        # Check if we can set weights (using cached block)
-                        min_interval = w.min_interval_to_set_weights(
-                            self.substrate, self.netuid
-                        )
-                        if min_interval is not None:
-                            min_interval = int(min_interval)
-
-                        if current_block - self.last_set_weights_block < min_interval:
-                            logger.info(
-                                f"Recently set weights {current_block - self.last_set_weights_block} blocks ago"
-                            )
-                            await self.update_task_status("scoring", "idle", "waiting")
-                            # Longer sleep when waiting for weight setting interval
-                            await asyncio.sleep(120)  # Increased from 60 to 120 seconds
-                            return True
-
-                        # Only enter weight_setting state when actually setting weights
-                        if min_interval is None or (
-                            blocks_since_update is not None
-                            and blocks_since_update >= min_interval
-                        ):
-                            logger.info(
-                                f"Setting weights: {blocks_since_update}/{min_interval} blocks"
-                            )
-                            can_set = w.can_set_weights(
-                                self.substrate, self.netuid, validator_uid
-                            )
-
-                            if can_set:
-                                await self.update_task_status(
-                                    "scoring", "processing", "weight_setting"
-                                )
-
-                                # Calculate weights with timeout
-                                normalized_weights = await asyncio.wait_for(
-                                    self._calc_task_weights(), timeout=120
-                                )
-
-                                if normalized_weights:
-                                    # Apply weight perturbation for anti-weight-copying defense
-                                    if self.perturbation_manager:
-                                        try:
-                                            import numpy as np
-
-                                            weights_array = np.array(normalized_weights)
-                                            perturbed_weights = await self.perturbation_manager.get_perturbed_weights(
-                                                weights_array
-                                            )
-                                            normalized_weights = (
-                                                perturbed_weights.tolist()
-                                            )
-                                            logger.info(
-                                                "Applied weight perturbation for anti-weight-copying defense"
-                                            )
-                                        except Exception as e:
-                                            logger.error(
-                                                f"Failed to apply weight perturbation: {e}"
-                                            )
-                                            # Continue with unperturbed weights
-
-                                    # Set weights with timeout
-                                    success = await asyncio.wait_for(
-                                        weight_setter.set_weights(normalized_weights),
-                                        timeout=480,
-                                    )
-
-                                    if success:
-                                        await self.update_last_weights_block()
-                                        self.last_successful_weight_set = time.time()
-                                        logger.info("✅ Successfully set weights")
-
-                                        # Invalidate shared block cache after weight setting
-                                        self._shared_block_cache["block_number"] = None
-
-                                        # Calculate performance statistics after successful weight setting
-                                        await self._calculate_performance_statistics()
-
-                                        # MEMORY LEAK FIX: Aggressive substrate cleanup after successful weight setting
-                                        try:
-                                            substrate_cleanup_count = (
-                                                self._aggressive_substrate_cleanup(
-                                                    "post_weight_setting"
-                                                )
-                                            )
-                                            if substrate_cleanup_count > 0:
-                                                logger.info(
-                                                    f"Post-weight-setting cleanup: cleared {substrate_cleanup_count} substrate cache objects"
-                                                )
-                                        except Exception as substrate_cleanup_err:
-                                            logger.debug(
-                                                f"Error during post-weight-setting substrate cleanup: {substrate_cleanup_err}"
-                                            )
-
-                                        await self.update_task_status("scoring", "idle")
-
-                                        # Clean up any stale operations
-                                        await self.database_manager.cleanup_stale_operations(
-                                            "score_table"
-                                        )
-                        else:
-                            logger.info(
-                                f"Waiting for weight setting: {blocks_since_update}/{min_interval} blocks"
-                            )
-                            await self.update_task_status("scoring", "idle", "waiting")
-
-                        return True
-
-                    except asyncio.TimeoutError as e:
-                        logger.error(f"Timeout in scoring cycle: {str(e)}")
-                        return False
-                    except Exception as e:
-                        logger.error(f"Error in scoring cycle: {str(e)}")
-                        logger.error(traceback.format_exc())
-                        return False
-                    finally:
-                        # Sleep removed - now handled in main loop for consistent timing
-                        pass
-
-                # Run scoring cycle with overall timeout
-                await asyncio.wait_for(scoring_cycle(), timeout=900)
+                # Update status - monitoring has extended timeout to prevent false alerts
+                await self.update_task_status("scoring", "active", "monitoring")
+                
+                # Sleep for 2 minutes between checks (much simpler than complex timeout logic)
+                await asyncio.sleep(120)
 
             except asyncio.TimeoutError:
                 logger.error("Weight setting operation timed out - restarting cycle")
@@ -4168,9 +4308,21 @@ class GaiaValidator:
                 try:
                     # Use shared block cache to reduce redundant queries
                     self.current_block = self._get_current_block_cached()
-                    blocks_since_weights = (
-                        self.current_block - self.last_set_weights_block
-                    )
+                    
+                    # Use chain-based weight tracking for accurate status (same as scheduler)
+                    try:
+                        if self.validator_uid is not None:
+                            from gaia.validator.weights.weight_service import get_last_weight_set_block_from_chain
+                            last_weight_block_chain = await get_last_weight_set_block_from_chain(
+                                self.substrate, self.netuid, int(self.validator_uid)
+                            )
+                            blocks_since_weights = self.current_block - last_weight_block_chain
+                        else:
+                            # Fallback to local tracking if validator_uid not available
+                            blocks_since_weights = self.current_block - self.last_set_weights_block
+                    except Exception as chain_weight_error:
+                        # Fallback to local tracking if chain query fails
+                        blocks_since_weights = self.current_block - self.last_set_weights_block
                 except Exception as block_error:
 
                     try:
@@ -4437,44 +4589,6 @@ class GaiaValidator:
                                     except Exception as e_hist_del:
                                         logger.warning(
                                             f"  Could not clear {table_name} for old hotkey {original_hotkey}: {e_hist_del}"
-                                        )
-
-                                # 2.1. Delete from miner performance stats tables by UID and hotkey
-                                try:
-                                    if (
-                                        hasattr(self, "performance_calculator")
-                                        and self.performance_calculator
-                                    ):
-                                        # Use the performance calculator's cleanup method
-                                        cleanup_success = await self.performance_calculator.cleanup_specific_miner(
-                                            int(uid_to_process), original_hotkey
-                                        )
-                                        if cleanup_success:
-                                            logger.info(
-                                                f"  Deleted performance stats for UID {uid_to_process} and old hotkey {original_hotkey} due to hotkey change."
-                                            )
-                                    else:
-                                        # Fallback to direct database query if calculator not available
-                                        perf_stats_exists = await self.database_manager.fetch_one(
-                                            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'miner_performance_stats')"
-                                        )
-                                        if (
-                                            perf_stats_exists
-                                            and perf_stats_exists["exists"]
-                                        ):
-                                            await self.database_manager.execute(
-                                                "DELETE FROM miner_performance_stats WHERE miner_uid = :uid OR miner_hotkey = :hotkey",
-                                                {
-                                                    "uid": int(uid_to_process),
-                                                    "hotkey": original_hotkey,
-                                                },
-                                            )
-                                            logger.info(
-                                                f"  Deleted performance stats for UID {uid_to_process} and old hotkey {original_hotkey} due to hotkey change."
-                                            )
-                                except Exception as e_perf_del:
-                                    logger.warning(
-                                        f"  Could not clear miner_performance_stats for UID {uid_to_process}: {e_perf_del}"
                                     )
 
                                 # 3. Clean up weather-specific tables for this UID
@@ -4563,24 +4677,6 @@ class GaiaValidator:
                                 logger.error(
                                     f"Error processing hotkey change for UID {uid_to_process}: {str(e)}",
                                     exc_info=True,
-                                )
-
-                    # --- Step 2.5: Bulk cleanup of performance stats for any remaining deregistered miners ---
-                    if (
-                        hasattr(self, "performance_calculator")
-                        and self.performance_calculator
-                    ):
-                        try:
-                            cleaned_count = (
-                                await self.performance_calculator.cleanup_deregistered_miners()
-                            )
-                            if cleaned_count > 0:
-                                logger.info(
-                                    f"🧹 Bulk cleanup removed performance data for {cleaned_count} deregistered miners"
-                                )
-                        except Exception as perf_cleanup_err:
-                            logger.warning(
-                                f"Error during bulk performance stats cleanup: {perf_cleanup_err}"
                             )
 
                     # --- Step 3: Update info for existing miners where hotkey didn't change ---
@@ -4707,8 +4803,7 @@ class GaiaValidator:
                                     f"Added {successful_adds} new miners to the database (fallback)"
                                 )
 
-                    # === NEW: Chain Integration - Update performance stats with consensus data ===
-                    await self._integrate_chain_consensus_data(chain_nodes_info)
+                
 
                     logger.info("Miner state synchronization cycle completed.")
 
@@ -5146,11 +5241,11 @@ class GaiaValidator:
                 self._log_memory_usage("calc_weights_before_db_fetch")
 
                 # Debug weather query parameters
-                logger.info(
-                    f"Weather query debug - current time: {now}, lookback time: {weather_lookback}, days back: {(now - weather_lookback).days}"
-                )
-                logger.info(f"Weather query: {weather_query}")
-                logger.info(f"Weather params: {weather_params}")
+                # logger.info(
+                #     f"Weather query debug - current time: {now}, lookback time: {weather_lookback}, days back: {(now - weather_lookback).days}"
+                # )
+                # logger.info(f"Weather query: {weather_query}")
+                # logger.info(f"Weather params: {weather_params}")
 
                 weather_results, validator_nodes_list = await asyncio.gather(
                     self.database_manager.fetch_all(weather_query, weather_params),
@@ -5247,19 +5342,7 @@ class GaiaValidator:
                         f"Processing {total_records} total database records for weight calculation"
                     )
 
-                    # Trigger performance statistics calculation after gathering all task scores
-                    # This ensures performance stats are updated when new scores are available
-                    try:
-                        logger.info(
-                            "🔄 Triggering performance statistics calculation after score gathering..."
-                        )
-                        await self._calculate_performance_statistics(
-                            force_calculation=False
-                        )
-                    except Exception as perf_err:
-                        logger.error(
-                            f"Error calculating performance statistics: {perf_err}"
-                        )
+                
 
                     # Force garbage collection before the heavy sync calculation
                     collected = gc.collect()
@@ -5292,19 +5375,6 @@ class GaiaValidator:
                         f"Weather-only scoring: captured pathway tracking for {len(pathway_tracking)} miners"
                     )
 
-                    # Store pathway tracking in performance calculator for later integration
-                    if self.performance_calculator and pathway_tracking:
-                        # Store current pathway tracking data in the calculator
-                        if not hasattr(
-                            self.performance_calculator, "_current_pathway_data"
-                        ):
-                            self.performance_calculator._current_pathway_data = {}
-                        self.performance_calculator._current_pathway_data.update(
-                            pathway_tracking
-                        )
-                        logger.debug(
-                            "Pathway tracking data stored in performance calculator"
-                        )
                 elif weight_result is None:
                     # Expected when no scores exist - set fallback weights: 100% to UID 252, 0% to all others
                     logger.info(
@@ -5461,163 +5531,8 @@ class GaiaValidator:
 
         logger.info("DB Sync initialization completed (not active).")
 
-    async def _calculate_performance_statistics(self, force_calculation: bool = False):
-        """Calculate and store miner performance statistics periodically."""
-        try:
-            # Only calculate if performance calculator is initialized and enough time has passed
-            if not self.performance_calculator:
-                logger.debug(
-                    "Performance calculator not initialized, skipping statistics calculation"
-                )
-                return
 
-            current_time = time.time()
-            # Calculate daily stats once every 30 minutes (1800 seconds) - more frequent for better responsiveness
-            if (
-                not force_calculation
-                and current_time - self.last_performance_calculation < 1800
-            ):
-                logger.debug(
-                    f"Skipping performance calculation - only {current_time - self.last_performance_calculation:.0f}s since last calculation"
-                )
-                return
-
-            logger.info("🔄 Calculating miner performance statistics...")
-
-            # Calculate daily statistics for today
-            today = datetime.now(timezone.utc).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-
-            # Use daily stats calculation function with database manager
-            daily_performances = await calculate_daily_stats(
-                self.database_manager, today
-            )
-
-            if daily_performances:
-                logger.info(
-                    f"✅ Calculated performance stats for {len(daily_performances)} miners"
-                )
-
-                # Log summary of top performers
-                top_performers = [
-                    p for p in daily_performances if p.overall_avg_score is not None
-                ][:5]
-                if top_performers:
-                    logger.info("🏆 Top performers today:")
-                    for i, perf in enumerate(top_performers):
-                        logger.info(
-                            f"  {i+1}. {perf.miner_hotkey[:12]}... - Score: {perf.overall_avg_score:.3f}, Tasks: {perf.total_attempted}"
-                        )
-            else:
-                logger.info("No miner performance data available for today")
-
-            # Clean up performance data for deregistered miners
-            try:
-                cleaned_count = (
-                    await self.performance_calculator.cleanup_deregistered_miners()
-                )
-                if cleaned_count > 0:
-                    logger.info(
-                        f"🧹 Cleaned up performance data for {cleaned_count} deregistered miners"
-                    )
-            except Exception as cleanup_err:
-                logger.error(f"Error during deregistered miner cleanup: {cleanup_err}")
-
-            # Update last calculation time
-            self.last_performance_calculation = current_time
-
-        except Exception as e:
-            logger.error(f"Error calculating performance statistics: {e}")
-            logger.error(traceback.format_exc())
-
-    async def _integrate_chain_consensus_data(self, chain_nodes_info: Dict[int, Any]):
-        """
-        Integrate chain consensus data (incentive values, block info) into performance statistics.
-        This method captures the final chain consensus results and stores them for analysis.
-        """
-        try:
-            if not self.performance_calculator:
-                logger.debug(
-                    "Performance calculator not available for chain integration"
-                )
-                return
-
-            # Get current block information using the existing cached method
-            current_block = None
-            try:
-                current_block = self._get_current_block_cached()
-            except Exception as block_err:
-                logger.debug(f"Could not get current block number: {block_err}")
-                # Fallback to current_block attribute if cache method fails
-                if hasattr(self, "current_block"):
-                    current_block = self.current_block
-
-            # Prepare consensus data for miners with incentive values
-            consensus_updates = {}
-            valid_miners = 0
-
-            for uid, chain_node in chain_nodes_info.items():
-                try:
-                    if (
-                        hasattr(chain_node, "incentive")
-                        and chain_node.incentive is not None
-                        and float(chain_node.incentive) > 0
-                    ):
-
-                        consensus_updates[uid] = {
-                            "incentive": float(chain_node.incentive),
-                            "consensus_block": current_block,
-                            "validator_hotkey": (
-                                self.validator_hotkey
-                                if hasattr(self, "validator_hotkey")
-                                else None
-                            ),
-                        }
-                        valid_miners += 1
-
-                except Exception as miner_err:
-                    logger.debug(
-                        f"Error processing consensus data for UID {uid}: {miner_err}"
-                    )
-                    continue
-
-            if consensus_updates:
-                # Store consensus data in performance calculator for integration
-                if not hasattr(self.performance_calculator, "_current_consensus_data"):
-                    self.performance_calculator._current_consensus_data = {}
-                self.performance_calculator._current_consensus_data.update(
-                    consensus_updates
-                )
-
-                logger.info(
-                    f"📊 Captured chain consensus data for {valid_miners} miners (block: {current_block})"
-                )
-
-                # Calculate consensus ranks based on incentive values
-                incentive_values = [
-                    (uid, data["incentive"]) for uid, data in consensus_updates.items()
-                ]
-                incentive_values.sort(
-                    key=lambda x: x[1], reverse=True
-                )  # Sort by incentive descending
-
-                # Add consensus ranks
-                for rank, (uid, incentive) in enumerate(incentive_values, 1):
-                    consensus_updates[uid]["consensus_rank"] = rank
-
-                logger.debug(
-                    f"Chain consensus integration: Top 5 miners by incentive: "
-                    f"{[(uid, f'{inc:.4f}') for uid, inc in incentive_values[:5]]}"
-                )
-            else:
-                logger.debug(
-                    "No miners with valid incentive values found for consensus integration"
-                )
-
-        except Exception as e:
-            logger.warning(f"Error during chain consensus integration: {e}")
-            # Don't let this break the main loop
+ 
 
     async def database_monitor(self):
         """Periodically query and log database statistics from a consistent snapshot."""
@@ -6131,72 +6046,7 @@ class GaiaValidator:
                 logger.debug(f"Error monitoring client health: {e}")
                 await asyncio.sleep(300)
 
-    async def memory_snapshot_taker(self):
-        """Periodically takes memory snapshots and logs differences."""
-        # Register this task for global memory cleanup coordination
-        try:
-            from gaia.utils.global_memory_manager import register_thread_cleanup
-
-            def cleanup_snapshot_caches():
-                # Clear any caches that accumulate during memory snapshot processing
-                import gc
-
-                collected = gc.collect()
-                logger.debug(
-                    f"[MemorySnapshotTaker] Performed cleanup, collected {collected} objects"
-                )
-
-            register_thread_cleanup("memory_snapshot_taker", cleanup_snapshot_caches)
-            logger.debug("[MemorySnapshotTaker] Registered for global memory cleanup")
-        except Exception as e:
-            logger.debug(f"[MemorySnapshotTaker] Failed to register cleanup: {e}")
-
-        logger.info("Starting memory snapshot taker task...")
-
-        snapshot_interval_seconds = 300  # 5 minutes
-        logger.info(
-            f"Memory snapshots will be taken every {snapshot_interval_seconds} seconds."
-        )
-
-        while not self._shutdown_event.is_set():
-            try:
-                await asyncio.sleep(snapshot_interval_seconds)
-                if self._shutdown_event.is_set():
-                    break
-
-                logger.info("--- Taking Tracemalloc Snapshot ---")
-                current_snapshot = tracemalloc.take_snapshot()
-
-                logger.info("Top 10 current memory allocations (by line number):")
-                for stat in current_snapshot.statistics("lineno")[:10]:
-                    logger.info(f"  {stat}")
-                    # Uncomment for full traceback of top allocations if needed
-                    # logger.info(f"    Traceback for allocation at {stat.traceback[0]}:")
-                    # for line in stat.traceback.format():
-                    #    logger.info(f"      {line}")
-
-                if self.tracemalloc_snapshot1:
-                    logger.info("Comparing to previous snapshot...")
-                    top_stats = current_snapshot.compare_to(
-                        self.tracemalloc_snapshot1, "lineno"
-                    )
-                    logger.info("Top 10 memory differences since last snapshot:")
-                    for stat in top_stats[:10]:
-                        logger.info(f"  {stat}")
-                        # Uncomment for full traceback of significant differences
-                        # logger.info(f"    Traceback for diff at {stat.traceback[0]}:")
-                        # for line in stat.traceback.format():
-                        #    logger.info(f"      {line}")
-
-                self.tracemalloc_snapshot1 = current_snapshot
-                logger.info("--- Tracemalloc Snapshot Processed ---")
-
-            except asyncio.CancelledError:
-                logger.info("Memory snapshot taker task cancelled.")
-                break
-            except Exception as e:
-                logger.error(f"Error in memory_snapshot_taker: {e}", exc_info=True)
-                await asyncio.sleep(60)  # Wait a bit before retrying if an error occurs
+    
 
     async def periodic_substrate_cleanup(self):
         """Placeholder - substrate cleanup no longer needed with isolated substrate interface."""
@@ -6223,19 +6073,19 @@ class GaiaValidator:
                     process = psutil.Process()
                     memory_before = process.memory_info().rss / (1024 * 1024)
 
-                    # PERFORMANCE-FIRST: Only clear caches when memory pressure requires it
+                    # WORKER-OPTIMIZED: Only clear caches when memory pressure requires it
                     cleanup_level = "none"
                     if (
-                        memory_before > 25000
-                    ):  # > 25GB (78% of 32GB) - Emergency cleanup
+                        memory_before > 13000
+                    ):  # > 13GB (72% of 18GB available) - Emergency cleanup
                         cleanup_level = "aggressive"
                     elif (
-                        memory_before > 22000
-                    ):  # > 22GB (69% of 32GB) - Moderate cleanup
+                        memory_before > 11000
+                    ):  # > 11GB (61% of 18GB available) - Moderate cleanup
                         cleanup_level = "moderate"
-                    elif memory_before > 18000:  # > 18GB (56% of 32GB) - Light cleanup
+                    elif memory_before > 9000:  # > 9GB (50% of 18GB available) - Light cleanup
                         cleanup_level = "light"
-                    # Below 18GB: NO cache clearing - preserve performance for optimal operation
+                    # Below 9GB: NO cache clearing - preserve performance for optimal operation
 
                     # Only perform cleanup when memory pressure actually requires it
                     collected = 0
@@ -6378,10 +6228,10 @@ class GaiaValidator:
 
                     # Emergency action if memory is still very high after cleanup
                     if (
-                        memory_after > 25000
-                    ):  # > 25GB after cleanup (emergency threshold)
+                        memory_after > 13000
+                    ):  # > 13GB after cleanup (emergency threshold for worker architecture)
                         logger.error(
-                            f"🚨 CRITICAL: Memory still very high after cleanup: {memory_after:.1f}MB"
+                            f"🚨 CRITICAL: Memory still very high after cleanup: {memory_after:.1f}MB - worker interference risk"
                         )
                         # Could trigger more drastic measures here if needed
 
@@ -6752,103 +6602,7 @@ class GaiaValidator:
             logger.debug(f"Error in comprehensive memory cleanup: {e}")
             return 0
 
-    async def abc_object_monitor(self):
-        """Monitor and cleanup ABC (Abstract Base Class) object accumulation."""
-        # Register this monitor for global memory cleanup coordination
-        try:
-            from gaia.utils.global_memory_manager import register_thread_cleanup
-
-            def cleanup_abc_caches():
-                # Clear any caches that accumulate during ABC monitoring
-                import gc
-
-                collected = gc.collect()
-                logger.debug(
-                    f"[ABCObjectMonitor] Performed cleanup, collected {collected} objects"
-                )
-
-            register_thread_cleanup("abc_object_monitor", cleanup_abc_caches)
-            logger.debug("[ABCObjectMonitor] Registered for global memory cleanup")
-        except Exception as e:
-            logger.debug(f"[ABCObjectMonitor] Failed to register cleanup: {e}")
-
-        import weakref
-        import gc
-        from abc import ABC
-
-        last_abc_count = 0
-
-        while True:
-            try:
-                await asyncio.sleep(180)  # Check every 3 minutes
-
-                # Get detailed ABC statistics if tracker is available
-                try:
-                    from gaia.utils.abc_debugger import get_abc_stats, print_abc_report
-
-                    abc_stats = get_abc_stats()
-                    current_abc_count = abc_stats["total_in_memory"]
-
-                    # Enhanced logging with detailed tracking
-                    if current_abc_count > 10000:
-                        logger.warning(
-                            f"High ABC object count: {current_abc_count} objects"
-                        )
-                        # Print detailed report for troubleshooting
-                        if current_abc_count > 20000:
-                            logger.warning("Printing detailed ABC object analysis:")
-                            print_abc_report()
-
-                except ImportError:
-                    # Fallback to basic counting if debugger not available
-                    current_abc_objects = []
-                    for obj in gc.get_objects():
-                        if isinstance(obj, ABC):
-                            current_abc_objects.append(obj)
-                    current_abc_count = len(current_abc_objects)
-
-                abc_growth = current_abc_count - last_abc_count
-
-                if current_abc_count > 10000:  # High ABC object count
-                    logger.warning(
-                        f"High ABC object count: {current_abc_count} objects "
-                        f"(growth: +{abc_growth} since last check)"
-                    )
-
-                    # Lightweight substrate cleanup instead of aggressive ABC cleanup
-                    if current_abc_count > 50000:  # Critical threshold
-                        logger.error(
-                            f"CRITICAL ABC object accumulation: {current_abc_count} objects"
-                        )
-
-                        # Use lightweight substrate cleanup instead of expensive GC passes
-                        try:
-                            from gaia.utils.abc_debugger import (
-                                lightweight_substrate_cleanup,
-                            )
-
-                            cleanup_count = lightweight_substrate_cleanup()
-                            logger.info(
-                                f"Lightweight substrate cleanup removed {cleanup_count} cache objects"
-                            )
-                        except ImportError:
-                            # Fallback to single GC pass
-                            collected = gc.collect()
-                            logger.info(f"Fallback GC collected {collected} objects")
-
-                last_abc_count = current_abc_count
-
-                if current_abc_count > 1000:  # Log if significant
-                    logger.debug(
-                        f"ABC object monitor: {current_abc_count} ABC objects tracked"
-                    )
-
-            except asyncio.CancelledError:
-                logger.info("ABC object monitor task cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Error in ABC object monitor: {e}")
-                await asyncio.sleep(60)
+   
 
 
 if __name__ == "__main__":
@@ -6863,35 +6617,22 @@ if __name__ == "__main__":
             logger.info(
                 "🚀 Using uvloop for enhanced async performance (2-4x faster than default asyncio)"
             )
-            print(
-                "[STARTUP DEBUG] uvloop event loop policy installed - significant performance boost expected"
-            )
-            print(
-                "[STARTUP DEBUG] uvloop is particularly beneficial for validator workloads with many concurrent network operations"
-            )
+            logger.debug("uvloop event loop policy installed - significant performance boost expected")
         else:
             logger.info(
                 f"⚡ uvloop available but not recommended for {platform.system()}, using default asyncio"
             )
-            print(
-                f"[STARTUP DEBUG] uvloop available but skipping on {platform.system()} - using standard asyncio"
-            )
+            logger.debug(f"uvloop available but skipping on {platform.system()} - using standard asyncio")
     except ImportError:
         logger.info(
             "⚡ uvloop not available - install with 'pip install uvloop' for 2-4x async performance boost"
         )
-        print(
-            "[STARTUP DEBUG] uvloop not available - consider installing for significant performance improvements"
-        )
-        print(
-            "[STARTUP DEBUG] uvloop provides major benefits for validators handling hundreds of miner connections"
-        )
+        logger.debug("uvloop not available - consider installing for significant performance improvements")
     except Exception as e:
         logger.warning(
             f"⚠️ Failed to install uvloop event loop policy: {e}, using default asyncio"
         )
-        print(f"[STARTUP DEBUG] Warning: uvloop installation failed: {e}")
-        print("[STARTUP DEBUG] Falling back to standard asyncio event loop")
+        logger.debug(f"Warning: uvloop installation failed: {e}, falling back to standard asyncio")
 
     parser = ArgumentParser()
 
@@ -6912,19 +6653,13 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # --- Database Setup Note ---
-    # Database installation, configuration, and Alembic migrations are now handled
-    # by the comprehensive database setup system below
-    logger.info("Starting comprehensive database setup and validator application...")
-    # --- End Database Setup Note ---
+    # Database installation, configuration, and Alembic migrations are handled
+    # by the comprehensive database setup system
 
     # --- Comprehensive Database Setup ---
     async def run_comprehensive_database_setup():
         try:
-            logger.info("🚀 Starting comprehensive database setup and validation...")
-            print("\n" + "🔧" * 80)
-            print("🔧 COMPREHENSIVE DATABASE SETUP STARTING 🔧")
-            print("🔧" * 80)
+            logger.info("🚀 Starting database setup...")
 
             # Import the comprehensive database setup
             from gaia.validator.database.comprehensive_db_setup import (
@@ -6947,9 +6682,7 @@ if __name__ == "__main__":
                 ),
             )
 
-            logger.info(
-                f"Database configuration: {db_config.database_name} on port {db_config.port}"
-            )
+            logger.debug(f"Database configuration: {db_config.database_name} on port {db_config.port}")
 
             # Run comprehensive database setup
             setup_success = await setup_comprehensive_database(
@@ -6963,9 +6696,7 @@ if __name__ == "__main__":
                 print("❌ DATABASE SETUP FAILED - EXITING ❌")
                 sys.exit(1)
 
-            logger.info("✅ Comprehensive database setup completed successfully")
-            print("✅ DATABASE SETUP COMPLETED - STARTING VALIDATOR ✅")
-            print("🔧" * 80 + "\n")
+            logger.info("✅ Database setup completed - starting validator")
 
         except Exception as e:
             logger.error(
@@ -6983,10 +6714,8 @@ if __name__ == "__main__":
         import subprocess
         import sys
 
-        logger.info("Ensuring Python requirements are up to date...")
-        print(
-            "[STARTUP DEBUG] Installing/updating requirements from requirements.txt..."
-        )
+        logger.info("🔄 Checking and updating Python requirements...")
+        print("[STARTUP DEBUG] Checking requirements...")
 
         # Construct path to requirements.txt relative to this script
         current_script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -7025,10 +6754,11 @@ if __name__ == "__main__":
             )
 
             if result.returncode == 0:
-                logger.info("Successfully updated Python requirements")
+                logger.success("✅ Python requirements are up to date")
                 print("[STARTUP DEBUG] Python requirements updated successfully")
-                if result.stdout:
-                    logger.debug(f"Pip install output: {result.stdout}")
+                # Only log pip output if there were actual changes (not just "already satisfied")
+                if result.stdout and "Installing" in result.stdout:
+                    logger.debug("Some packages were updated")
             else:
                 logger.warning(
                     f"Pip install returned non-zero exit code {result.returncode}"
@@ -7061,9 +6791,13 @@ if __name__ == "__main__":
         print(f"[STARTUP DEBUG] Unhandled exception: {e}")
     finally:
         print("[STARTUP DEBUG] Entering finally block")
-        if hasattr(validator, "_cleanup_done") and not validator._cleanup_done:
+        if getattr(validator, "_main_started", False) and not getattr(validator, "_cleanup_done", False):
             try:
-                loop = asyncio.get_event_loop()
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
                 if loop.is_closed():
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)

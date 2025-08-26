@@ -200,6 +200,9 @@ class WeatherInitiateFetchData(BaseModel):
     validator_hotkey: Optional[str] = Field(
         None, description="Validator hotkey for deterministic job ID generation."
     )
+    expected_miner_hotkey: Optional[str] = Field(
+        None, description="Expected miner hotkey for verification to prevent crossover."
+    )
 
 
 class WeatherInitiateFetchRequest(BaseModel):
@@ -210,13 +213,13 @@ class WeatherInitiateFetchRequest(BaseModel):
 
 
 class WeatherGetInputStatusData(BaseModel):
-    """Data payload for the /weather-get-input-status request"""
+    """Data payload for the /weather-poll-job-status request"""
 
     job_id: str = Field(..., description="The unique job ID returned by the miner.")
 
 
 class WeatherGetInputStatusRequest(BaseModel):
-    """Request model for /weather-get-input-status"""
+    """Request model for /weather-poll-job-status"""
 
     nonce: str | None = None
     data: WeatherGetInputStatusData

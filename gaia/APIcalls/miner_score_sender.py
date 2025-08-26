@@ -1,6 +1,6 @@
 import asyncio
 from sqlalchemy import text
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 import pprint
 import math
 import traceback
@@ -11,17 +11,7 @@ from gaia.validator.database.validator_database_manager import ValidatorDatabase
 from typing import Dict, Optional
 
 
-def prepare_prediction_field(data_list):
-    """
-    Convert a list of values into a comma-separated string.
 
-    Args:
-        data_list (list): List of prediction values.
-
-    Returns:
-        str: Comma-separated string of values.
-    """
-    return ",".join(map(str, data_list)) if data_list else ""
 
 
 logger = get_logger(__name__)
@@ -51,17 +41,71 @@ class MinerScoreSender:
             for row in results
         ]
 
-    # Geomagnetic processing removed (task disabled)
-
-    async def fetch_geomagnetic_history(self, miner_hotkey: str) -> list:
-        """Geomagnetic task disabled - return empty list."""
-        return []
-
-    # Soil moisture processing removed (task disabled)
-
-    async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
-        """Soil moisture task disabled - return empty list."""
-        return []
+    # Geomagnetic and soil moisture processing removed (tasks disabled)
+    
+    async def fetch_weather_stats(self, miner_uid: int, miner_hotkey: str) -> dict:
+        """
+        Fetch weather forecast statistics from the new stats tables.
+        """
+        try:
+            # Get aggregated stats from miner_stats table
+            stats_query = """
+                SELECT 
+                    miner_rank,
+                    avg_forecast_score,
+                    successful_forecasts,
+                    failed_forecasts,
+                    forecast_success_ratio,
+                    host_reliability_ratio,
+                    avg_day1_score,
+                    avg_era5_score,
+                    avg_era5_completeness,
+                    consecutive_successes,
+                    consecutive_failures
+                FROM miner_stats
+                WHERE miner_uid = :uid
+            """
+            stats = await self.db_manager.fetch_one(stats_query, {"uid": miner_uid})
+            
+            # Get recent forecast runs from weather_forecast_stats
+            recent_query = """
+                SELECT 
+                    forecast_run_id,
+                    forecast_init_time,
+                    forecast_status,
+                    forecast_score_initial,
+                    era5_combined_score,
+                    era5_completeness,
+                    hosting_status,
+                    hosting_latency_ms,
+                    updated_at
+                FROM weather_forecast_stats
+                WHERE miner_uid = :uid
+                ORDER BY updated_at DESC
+                LIMIT 5
+            """
+            recent_runs = await self.db_manager.fetch_all(recent_query, {"uid": miner_uid})
+            
+            # Format the data for API
+            return {
+                "stats": stats if stats else {},
+                "recent_runs": [
+                    {
+                        "run_id": r["forecast_run_id"],
+                        "init_time": r["forecast_init_time"].isoformat() if r["forecast_init_time"] else None,
+                        "status": r["forecast_status"],
+                        "day1_score": r["forecast_score_initial"],
+                        "era5_score": r["era5_combined_score"],
+                        "completeness": r["era5_completeness"],
+                        "hosting": r["hosting_status"],
+                        "latency_ms": r["hosting_latency_ms"]
+                    }
+                    for r in recent_runs
+                ] if recent_runs else []
+            }
+        except Exception as e:
+            logger.error(f"Error fetching weather stats for miner {miner_uid}: {e}")
+            return {"stats": {}, "recent_runs": []}
 
     async def send_to_gaia(self):
         try:
@@ -95,16 +139,23 @@ class MinerScoreSender:
                             logger.debug(
                                 f"Processing miner {miner['hotkey']} under semaphore"
                             )
-                            # Only fetch weather data (other tasks disabled)
-                            geo_history = []  # Geomagnetic disabled
-                            soil_history = []  # Soil moisture disabled
-                            logger.debug(f"Fetched history for miner {miner['hotkey']}")
-                            return {
+                            # Fetch weather stats from new tables
+                            weather_data = await self.fetch_weather_stats(
+                                miner["uid"], miner["hotkey"]
+                            )
+                            logger.debug(f"Fetched weather stats for miner {miner['hotkey']}")
+                            
+                            # Format payload for API
+                            payload = {
                                 "minerHotKey": miner["hotkey"],
                                 "minerColdKey": miner["coldkey"],
+                                "minerUID": miner["uid"],
                                 "geomagneticPredictions": [],  # Geomagnetic task disabled
                                 "soilMoisturePredictions": [],  # Soil moisture task disabled
+                                "weatherStats": weather_data["stats"],
+                                "weatherRecentRuns": weather_data["recent_runs"]
                             }
+                            return payload
                         except Exception as e:
                             logger.error(
                                 f"Error processing miner {miner['hotkey']} under semaphore: {str(e)}\n{traceback.format_exc()}"

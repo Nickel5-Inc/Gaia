@@ -7,12 +7,11 @@ from pydantic import (
     Field,
     validator,
     ConfigDict,
-    root_validator,
     model_validator,
 )
 from gaia.tasks.base.components.outputs import Outputs
 from gaia.tasks.base.decorators import handle_validation_error
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from enum import Enum
 
 logger = get_logger(__name__)
@@ -37,18 +36,17 @@ class WeatherTaskStatus(str, Enum):
     # Initiate Fetch Response Statuses
     FETCH_ACCEPTED = "fetch_accepted"
     FETCH_REJECTED = "fetch_rejected"
+    FETCH_COMPLETED = "completed"  # GFS fetch completed, inference can start
+    FETCH_PROCESSING = "processing"  # Currently fetching GFS or running inference
 
-    # Input Status Response Statuses
-    FETCH_QUEUED = "fetch_queued"
-    FETCHING_GFS = "fetching_gfs"
-    HASHING_INPUT = "hashing_input"
-    INPUT_HASHED_AWAITING_VALIDATION = "input_hashed_awaiting_validation"
-    FETCH_ERROR = "fetch_error"
+    # Legacy statuses (deprecated - use "processing" and "failed" instead)
 
     # Inference Response Statuses
     INFERENCE_STARTED = "inference_started"
     INFERENCE_FAILED = "inference_failed"
-
+    INFERENCE_RUNNING = "running"  # Inference is currently running
+    # Deprecated inference statuses - use "processing" instead
+    
     # Kerchunk/Data Response Statuses
     COMPLETED = "completed"
     PROCESSING = "processing"
@@ -667,18 +665,33 @@ class WeatherKerchunkResponseData(BaseModel):
 class WeatherInitiateFetchResponse(BaseModel):
     """Response model for /weather-initiate-fetch"""
 
-    status: str = Field(..., description="Status indicator, e.g., 'fetch_accepted'")
-    job_id: str = Field(..., description="The unique job ID assigned by the miner.")
+    status: str = Field(..., description="Status indicator, e.g., 'fetch_accepted', 'fetch_rejected'")
+    job_id: Optional[str] = Field(None, description="The unique job ID assigned by the miner (only for accepted requests).")
     message: Optional[str] = Field(None, description="Optional message.")
+    expected_hotkey: Optional[str] = Field(None, description="Expected hotkey (only for verification failures).")
+    actual_hotkey: Optional[str] = Field(None, description="Actual hotkey (only for verification failures).")
+    # Fast-path fields when forecast already exists and is ready
+    zarr_store_url: Optional[str] = Field(
+        None,
+        description="URL to the miner's /forecasts/ endpoint for the Zarr store when status is 'completed' or 'forecast_ready'.",
+    )
+    verification_hash: Optional[str] = Field(
+        None,
+        description="Manifest verification hash for the forecast when status is 'completed' or 'forecast_ready'.",
+    )
+    access_token: Optional[str] = Field(
+        None,
+        description="JWT token granting access to the Zarr store when status is 'completed' or 'forecast_ready'.",
+    )
 
 
 class WeatherGetInputStatusResponse(BaseModel):
-    """Response model for /weather-get-input-status"""
+    """Response model for /weather-poll-job-status"""
 
     job_id: str = Field(..., description="The job ID.")
     status: str = Field(
         ...,
-        description="Current status of the input fetching/hashing process (e.g., 'fetch_queued', 'fetching_gfs', 'hashing_input', 'input_hashed_awaiting_validation', 'fetch_error').",
+        description="Current status of the job (e.g., 'received', 'processing', 'completed', 'failed').",
     )
     input_data_hash: Optional[str] = Field(
         None, description="The computed SHA-256 hash of the input data, if available."

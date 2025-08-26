@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 import asyncio
 from typing import List, Optional
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 DEFAULT_TRIGGER_PATH = "/root/Gaia/db_wipe_trigger"

@@ -3,14 +3,14 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 import asyncio
 import traceback
-from fiber.chain import interface, chain_utils, weights as w
+from fiber.chain import chain_utils, weights as w
 from fiber.chain.fetch_nodes import get_nodes_for_netuid
 from fiber import SubstrateInterface
 from fiber.chain.interface import get_substrate
 import sys
 import os
 from dotenv import load_dotenv
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 import numpy as np
 from gaia import __spec_version__
 from gaia.validator.utils.substrate_manager import get_process_isolated_substrate

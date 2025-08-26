@@ -19,7 +19,7 @@ try:
 except ImportError:
     NETCDF4_AVAILABLE = False
 
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -92,7 +92,7 @@ async def fetch_era5_data(
     for potential_cache_file in cache_files_to_check:
         if potential_cache_file.exists():
             try:
-                logger.info(f"Loading cached ERA5 data from: {potential_cache_file}")
+                logger.success(f"✅ Loading cached ERA5 data from: {potential_cache_file}")
 
                 if potential_cache_file.suffix == ".pkl":
                     # Load pickle format
@@ -862,6 +862,8 @@ async def _fetch_single_day_era5(
     times_str = "_".join([t.strftime("%H%M") for t in times_for_date])
     cache_key = f"era5_{date_str}_{hashlib.md5(times_str.encode()).hexdigest()[:8]}"
     cache_file = cache_dir / f"{cache_key}.nc"
+    
+    logger.debug(f"ERA5 cache check for {date_str}: times={[t.strftime('%H%M') for t in times_for_date]}, key={cache_key}, file={cache_file.name}")
 
     # Check for existing cache
     if cache_file.exists():
@@ -982,10 +984,12 @@ async def _fetch_single_day_era5(
             # Rename variables to match expected names
             var_mapping = {**ERA5_SINGLE_LEVEL_VARS, **ERA5_PRESSURE_LEVEL_VARS}
 
-            for ds in [ds_sl, ds_pl]:
-                for old_name, new_name in var_mapping.items():
-                    if old_name in ds.data_vars:
-                        ds = ds.rename({old_name: new_name})
+            # Apply renaming in-place by reassigning back to the variables
+            for old_name, new_name in var_mapping.items():
+                if old_name in ds_sl.data_vars:
+                    ds_sl = ds_sl.rename({old_name: new_name})
+                if old_name in ds_pl.data_vars:
+                    ds_pl = ds_pl.rename({old_name: new_name})
 
             # Combine datasets with coordinate validation
             logger.debug(f"Before merge - ds_sl coords: {list(ds_sl.coords.keys())}")

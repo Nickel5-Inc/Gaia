@@ -64,3 +64,4 @@ weather_sender/*
 tr.py 
 trigger.py
 weight_trace_runtime.log
+clim_cache/*

@@ -9,7 +9,7 @@ import warnings
 import os
 import functools
 from typing import Dict, Any, Optional
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 

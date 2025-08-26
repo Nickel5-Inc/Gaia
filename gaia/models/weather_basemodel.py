@@ -1,6 +1,6 @@
 import torch
 from aurora import Aurora
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 import traceback
 
 logger = get_logger(__name__)

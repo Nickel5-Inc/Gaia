@@ -6,12 +6,12 @@ to prevent sneaky cache growth in areas not covered by the main validator cleanu
 """
 
 import threading
-import weakref
+
 import gc
 import time
 from typing import Callable, Dict, List, Optional, Set
 from concurrent.futures import ThreadPoolExecutor
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 

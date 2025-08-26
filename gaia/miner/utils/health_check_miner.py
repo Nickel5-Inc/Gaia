@@ -4,7 +4,7 @@ import logging
 from unittest.mock import patch
 from gaia.miner.miner import Miner
 import requests
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 ######Temp Health Check to run on local
 
