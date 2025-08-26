@@ -63,7 +63,6 @@ flexparser==0.4
 fonttools==4.58.0
 frozenlist==1.6.0
 fsspec==2025.3.2
--e file:///root/Gaia
 gcsfs==2025.3.2
 google-api-core==2.25.0rc1
 google-auth==2.40.2
