@@ -58,6 +58,16 @@ rm -rf /root/Gaia/clim_cache/* 2>/dev/null || true
 rm -rf /root/Gaia/verification_logs/* 2>/dev/null || true
 rm -rf /tmp/weather_* 2>/dev/null || true
 
+# Step 6: Clear Python bytecode caches
+echo "6️⃣ Clearing Python bytecode caches (__pycache__, .pyc, .pyo)..."
+find /root/Gaia -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+find /root/Gaia -type f \( -name "*.pyc" -o -name "*.pyo" -o -name "*.pyd" \) -delete 2>/dev/null || true
+# Also clear caches in local Python environment if present
+if [ -d "/root/.gaia" ]; then
+  find /root/.gaia -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+  find /root/.gaia -type f \( -name "*.pyc" -o -name "*.pyo" -o -name "*.pyd" \) -delete 2>/dev/null || true
+fi
+
 echo ""
 echo "✅ Test environment cleanup completed!"
 echo "=================================================="

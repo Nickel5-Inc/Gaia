@@ -261,9 +261,11 @@ async def evaluate_miner_forecast_day1(
                 f"  URL: {zarr_store_url}\n  ClaimedHash: {claimed_manifest_content_hash}"
             )
             try:
-                # If minimal verification was attempted, log its details
+                # If minimal verification was attempted, log its details and traceback
                 if 'min_details' in locals() and min_details is not None:
                     logger.error(f"[Day1Score] Minimal verification details: {json.dumps(min_details, default=str)[:2000]}")
+                    if isinstance(min_details, dict) and min_details.get('open_exception'):
+                        logger.error("[Day1Score] Minimal verification subset open traceback follows:\n" + str(min_details.get('open_exception')))
                 # Also log the last manifest verification log for more context
                 last_log = get_last_manifest_log(f"{job_id}_day1_minrehash") or get_last_manifest_log(f"{job_id}_day1_score")
                 if last_log:

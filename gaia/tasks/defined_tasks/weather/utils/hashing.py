@@ -260,6 +260,13 @@ async def verify_minimal_chunks_and_reconstruct_manifest_hash(
     the final content hash equals the claimed hash.
     """
     start_time = time.time()
+    try:
+        # CODE_MARKER: identify source file and version at runtime to ensure correct code is loaded
+        logger.error(
+            f"CODE_MARKER hashing v1.1 file={__file__} job={job_id}"
+        )
+    except Exception:
+        pass
     details: Dict[str, Any] = {
         "job_id": job_id,
         "store": zarr_store_url,
@@ -299,7 +306,13 @@ async def verify_minimal_chunks_and_reconstruct_manifest_hash(
             job_id=f"{job_id}_subset_open",
         )
     except Exception as open_exc:
-        details["open_exception"] = str(open_exc)
+        import traceback as _tb
+        tb_str = _tb.format_exc()
+        logger.error(
+            f"Job {job_id}: Exception during subset verified open for {zarr_store_url}: {open_exc}",
+            exc_info=True,
+        )
+        details["open_exception"] = tb_str
     if ds_full is None:
         details["error"] = "subset_open_failed"
         details["duration_seconds"] = time.time() - start_time

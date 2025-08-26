@@ -246,15 +246,15 @@ async def run_query_miner_job(
                 # Record forecast-ready status and metadata
                 await db.execute(
                     """
-                    INSERT INTO weather_miner_responses (run_id, miner_uid, miner_hotkey, job_id, status, kerchunk_json_url, verification_hash_claimed, job_accepted_at)
-                    VALUES (:run_id, :miner_uid, :miner_hotkey, :job_id, 'forecast_ready', :url, :hash, NOW())
+                    INSERT INTO weather_miner_responses (run_id, miner_uid, miner_hotkey, response_time, job_id, status, kerchunk_json_url, verification_hash_claimed, job_accepted_at)
+                    VALUES (:run_id, :miner_uid, :miner_hotkey, NOW(), :job_id, 'forecast_ready', :url, :hash, NOW())
                     ON CONFLICT (run_id, miner_uid) DO UPDATE SET
                         status = EXCLUDED.status,
                         job_id = EXCLUDED.job_id,
                         kerchunk_json_url = COALESCE(EXCLUDED.kerchunk_json_url, weather_miner_responses.kerchunk_json_url),
                         verification_hash_claimed = COALESCE(EXCLUDED.verification_hash_claimed, weather_miner_responses.verification_hash_claimed),
                         job_accepted_at = COALESCE(weather_miner_responses.job_accepted_at, NOW()),
-                        updated_at = NOW()
+                        response_time = COALESCE(weather_miner_responses.response_time, NOW())
                     """,
                     {
                         "run_id": run_id,

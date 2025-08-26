@@ -506,6 +506,13 @@ async def open_verified_remote_zarr_dataset(
         f"🔍 ZARR OPEN FULL [{process_name}:{thread_name}] Job {job_id}: "
         f"Attempting VERIFIED open for Zarr: {zarr_store_url}"
     )
+    try:
+        # CODE_MARKER: identify source file and version at runtime to ensure correct code is loaded
+        logger.error(
+            f"CODE_MARKER remote_access v1.3 file={__file__} job={job_id}"
+        )
+    except Exception:
+        pass
 
     if get_trusted_manifest is None or VerifyingChunkMapper is None:
         logger.critical(
@@ -578,12 +585,33 @@ async def open_verified_remote_zarr_dataset(
             logger.info(
                 f"Job {job_id}: Retrying xr.open_zarr with consolidated={not is_consolidated}"
             )
-            dataset = await loop.run_in_executor(
-                None,
-                _synchronous_open_with_verifying_mapper,
-                verifying_mapper,
-                (not is_consolidated),
-            )
+            try:
+                import traceback as _tb
+                logger.error(
+                    f"Job {job_id}: First xr.open_zarr returned None (consolidated={is_consolidated}).\nStack:\n" + ''.join(_tb.format_stack(limit=16))
+                )
+            except Exception:
+                pass
+            try:
+                dataset = await loop.run_in_executor(
+                    None,
+                    _synchronous_open_with_verifying_mapper,
+                    verifying_mapper,
+                    (not is_consolidated),
+                )
+            except Exception as retry_exc:
+                logger.error(
+                    f"Job {job_id}: Retry open_zarr failed: {retry_exc}",
+                    exc_info=True,
+                )
+        if dataset is None:
+            try:
+                import traceback as _tb
+                logger.error(
+                    f"Job {job_id}: Second xr.open_zarr returned None (consolidated={not is_consolidated}).\nStack:\n" + ''.join(_tb.format_stack(limit=16))
+                )
+            except Exception:
+                pass
 
         if dataset is not None:
             logger.info(
@@ -595,7 +623,7 @@ async def open_verified_remote_zarr_dataset(
                 f"Job {job_id}: Opening Zarr with VerifyingChunkMapper returned None for {zarr_store_url}"
             )
             set_last_verified_open_error(job_id, "open_with_verifying_mapper returned None")
-            # Raise to propagate the reason to callers for better diagnostics
+            # Strict: fail immediately (no fallback)
             raise RuntimeError("open_with_verifying_mapper returned None")
 
     except Exception as e:
@@ -607,4 +635,5 @@ async def open_verified_remote_zarr_dataset(
             set_last_verified_open_error(job_id, f"exception: {e}")
         except Exception:
             pass
-        return None
+        # Strict: re-raise so upstream treats as failure (no fallback)
+        raise
