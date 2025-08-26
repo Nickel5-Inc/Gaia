@@ -559,9 +559,11 @@ async def open_verified_remote_zarr_dataset(
             f"Job {job_id}: VerifyingChunkMapper created for {zarr_store_url_cleaned}."
         )
 
+        # Detect consolidated heuristically: prefer presence of .zmetadata on server if available in listing,
+        # but don't rely solely on manifest contents since many manifests exclude metadata files.
         is_consolidated = ".zmetadata" in trusted_manifest.get("files", {})
         logger.info(
-            f"Job {job_id}: Store determined to be consolidated from manifest: {is_consolidated}"
+            f"Job {job_id}: Initial consolidated guess from manifest: {is_consolidated}"
         )
 
         loop = asyncio.get_running_loop()
@@ -571,6 +573,17 @@ async def open_verified_remote_zarr_dataset(
             verifying_mapper,
             is_consolidated,
         )
+        if dataset is None:
+            # Retry with opposite consolidated flag to handle incorrect guess without extra network I/O
+            logger.info(
+                f"Job {job_id}: Retrying xr.open_zarr with consolidated={not is_consolidated}"
+            )
+            dataset = await loop.run_in_executor(
+                None,
+                _synchronous_open_with_verifying_mapper,
+                verifying_mapper,
+                (not is_consolidated),
+            )
 
         if dataset is not None:
             logger.info(
@@ -582,7 +595,8 @@ async def open_verified_remote_zarr_dataset(
                 f"Job {job_id}: Opening Zarr with VerifyingChunkMapper returned None for {zarr_store_url}"
             )
             set_last_verified_open_error(job_id, "open_with_verifying_mapper returned None")
-            return None
+            # Raise to propagate the reason to callers for better diagnostics
+            raise RuntimeError("open_with_verifying_mapper returned None")
 
     except Exception as e:
         logger.error(
