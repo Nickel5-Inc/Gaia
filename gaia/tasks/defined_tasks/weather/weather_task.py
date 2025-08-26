@@ -3166,6 +3166,123 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     f"[Miner] Hotkey verification PASSED - request correctly intended for {actual_miner_hotkey[:8]}...{actual_miner_hotkey[-8:]}"
                 )
 
+            # FAST-PATH: If there is already a completed forecast for this GFS time, reuse it and return ready-to-score info
+            try:
+                # Determine miner and validator hotkeys to generate deterministic job_id
+                miner_hotkey = actual_miner_hotkey
+                if not validator_hotkey:
+                    validator_hotkey = "unknown_validator"
+
+                fastpath_job_id = DeterministicJobID.generate_weather_job_id(
+                    gfs_init_time=t0_run_time,
+                    miner_hotkey=miner_hotkey,
+                    validator_hotkey=validator_hotkey,
+                    job_type="forecast",
+                )
+
+                completed_inference_query = """
+                    SELECT id, target_netcdf_path, verification_hash
+                    FROM weather_miner_jobs 
+                    WHERE gfs_init_time_utc = :gfs_time 
+                    AND status = 'completed'
+                    AND target_netcdf_path IS NOT NULL
+                    AND verification_hash IS NOT NULL
+                    ORDER BY processing_end_time DESC 
+                    LIMIT 1
+                """
+                completed_inference = await self.db_manager.fetch_one(
+                    completed_inference_query, {"gfs_time": t0_run_time}
+                )
+
+                if completed_inference:
+                    target_path = completed_inference["target_netcdf_path"]
+                    verification_hash = completed_inference["verification_hash"]
+
+                    # Ensure a job record exists for this validator/miner pair with our deterministic ID
+                    job_exists_check = """
+                        SELECT id, status, target_netcdf_path, verification_hash
+                        FROM weather_miner_jobs WHERE id = :job_id
+                    """
+                    existing_fast_job = await self.db_manager.fetch_one(
+                        job_exists_check, {"job_id": fastpath_job_id}
+                    )
+
+                    if not existing_fast_job:
+                        insert_query = """
+                            INSERT INTO weather_miner_jobs (id, validator_request_time, validator_hotkey, gfs_init_time_utc, gfs_t_minus_6_time_utc, status, processing_start_time, processing_end_time, target_netcdf_path, verification_hash)
+                            VALUES (:id, :req_time, :val_hk, :gfs_init, :gfs_t_minus_6, 'completed', NOW(), NOW(), :target_path, :hash)
+                        """
+                        await self.db_manager.execute(
+                            insert_query,
+                            {
+                                "id": fastpath_job_id,
+                                "req_time": datetime.now(timezone.utc),
+                                "val_hk": validator_hotkey,
+                                "gfs_init": t0_run_time,
+                                "gfs_t_minus_6": t_minus_6_run_time,
+                                "target_path": target_path,
+                                "hash": verification_hash,
+                            },
+                        )
+                    elif existing_fast_job["status"] != "completed" or not existing_fast_job.get("target_netcdf_path") or not existing_fast_job.get("verification_hash"):
+                        # Update to completed and set artifacts
+                        await self.db_manager.execute(
+                            """
+                            UPDATE weather_miner_jobs 
+                            SET status = 'completed', processing_end_time = NOW(), target_netcdf_path = :target_path, verification_hash = :hash
+                            WHERE id = :job_id
+                            """,
+                            {
+                                "job_id": fastpath_job_id,
+                                "target_path": target_path,
+                                "hash": verification_hash,
+                            },
+                        )
+
+                    # Build JWT access token and response
+                    zarr_dir_name = Path(str(target_path)).name
+                    if not zarr_dir_name.endswith(".zarr"):
+                        logger.warning(f"[Miner Job {fastpath_job_id}] Completed target path is not a .zarr directory: {zarr_dir_name}")
+
+                    miner_jwt_secret_key = self.config.get(
+                        "miner_jwt_secret_key", os.getenv("MINER_JWT_SECRET_KEY")
+                    )
+                    if not miner_jwt_secret_key:
+                        logger.warning(
+                            "MINER_JWT_SECRET_KEY not set in config or environment. Using default insecure key."
+                        )
+                        miner_jwt_secret_key = "insecure_default_key_for_development_only"
+                    jwt_algorithm = self.config.get("jwt_algorithm", "HS256")
+                    token_expire_minutes = int(
+                        self.config.get("access_token_expire_minutes", 60)
+                    )
+
+                    token_data = {
+                        "job_id": fastpath_job_id,
+                        "file_path": zarr_dir_name,
+                        "exp": datetime.now(timezone.utc)
+                        + timedelta(minutes=token_expire_minutes),
+                    }
+                    access_token = jwt.encode(
+                        token_data, miner_jwt_secret_key, algorithm=jwt_algorithm
+                    )
+
+                    zarr_url_for_response = f"/forecasts/{zarr_dir_name}"
+
+                    return self._validate_and_format_response(
+                        {
+                            "status": WeatherTaskStatus.COMPLETED.value,
+                            "job_id": fastpath_job_id,
+                            "message": "Forecast already completed and ready for access",
+                            "zarr_store_url": zarr_url_for_response,
+                            "verification_hash": verification_hash,
+                            "access_token": access_token,
+                        },
+                        ["status", "job_id"],
+                    )
+            except Exception as fast_err:
+                logger.debug(f"[Miner] Fast-path check failed or not applicable: {fast_err}")
+
             # Find existing job for this exact time and validator
             if validator_hotkey:
                 existing_job_query = """

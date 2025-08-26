@@ -226,6 +226,70 @@ async def run_query_miner_job(
             # Parse successful response
             miner_response = result.get("data", {})
             
+            # Fast-path: Miner already completed inference, skip directly to scoring
+            if (
+                isinstance(miner_response, dict)
+                and miner_response.get("status") in [
+                    WeatherTaskStatus.FETCH_COMPLETED,
+                    "completed",
+                    "forecast_ready",
+                ]
+                and miner_response.get("job_id")
+            ):
+                job_id = miner_response.get("job_id")
+                zarr_url = miner_response.get("zarr_store_url") or miner_response.get("kerchunk_json_url")
+                claimed_hash = miner_response.get("verification_hash") or miner_response.get("manifest_hash")
+                logger.info(
+                    f"[Run {run_id}] Miner {miner_hotkey[:8]} completed on initial query. Scheduling Day1 scoring immediately.\n"
+                    f"  Job ID: {job_id}\n  Zarr: {zarr_url}\n  Hash: {claimed_hash}"
+                )
+                # Record forecast-ready status and metadata
+                await db.execute(
+                    """
+                    INSERT INTO weather_miner_responses (run_id, miner_uid, miner_hotkey, job_id, status, kerchunk_json_url, verification_hash_claimed, job_accepted_at)
+                    VALUES (:run_id, :miner_uid, :miner_hotkey, :job_id, 'forecast_ready', :url, :hash, NOW())
+                    ON CONFLICT (run_id, miner_uid) DO UPDATE SET
+                        status = EXCLUDED.status,
+                        job_id = EXCLUDED.job_id,
+                        kerchunk_json_url = COALESCE(EXCLUDED.kerchunk_json_url, weather_miner_responses.kerchunk_json_url),
+                        verification_hash_claimed = COALESCE(EXCLUDED.verification_hash_claimed, weather_miner_responses.verification_hash_claimed),
+                        job_accepted_at = COALESCE(weather_miner_responses.job_accepted_at, NOW()),
+                        updated_at = NOW()
+                    """,
+                    {
+                        "run_id": run_id,
+                        "miner_uid": miner_uid,
+                        "miner_hotkey": miner_hotkey,
+                        "job_id": job_id,
+                        "url": zarr_url,
+                        "hash": claimed_hash,
+                    },
+                )
+                # Enqueue Day1 scoring singleton immediately
+                singleton_key = f"day1_score_run_{run_id}_miner_{miner_uid}"
+                job_id_created = await db.enqueue_singleton_job(
+                    singleton_key=singleton_key,
+                    job_type="weather.day1",
+                    payload={
+                        "run_id": run_id,
+                        "miner_uid": miner_uid,
+                        "miner_hotkey": miner_hotkey,
+                        # We need current response_id; fetch latest
+                        # It will be looked up in day1 step run_item
+                        "response_id": (await db.fetch_one(
+                            "SELECT id FROM weather_miner_responses WHERE run_id = :rid AND miner_uid = :uid ORDER BY id DESC LIMIT 1",
+                            {"rid": run_id, "uid": miner_uid},
+                        ))["id"],
+                        "job_id": job_id,
+                    },
+                    priority=60,
+                    run_id=run_id,
+                    miner_uid=miner_uid,
+                )
+                if job_id_created:
+                    logger.info(f"[Run {run_id}] ✓ Created Day1 singleton job {job_id_created} for miner {miner_uid} (fast-path)")
+                return True
+
             # Check if miner accepted
             if (
                 isinstance(miner_response, dict)

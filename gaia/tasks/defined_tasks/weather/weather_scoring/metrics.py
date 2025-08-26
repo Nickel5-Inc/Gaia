@@ -133,6 +133,22 @@ async def calculate_mse_skill_score_by_pressure_level(
             logger.error("No spatial dimensions (lat/lon) found for MSE skill score.")
             return {}
 
+        # Strict weights validation: must match spatial dims exactly
+        validated_weights = lat_weights
+        if lat_weights is not None:
+            weights_dims_set = set(lat_weights.dims)
+            spatial_dims_set = set(spatial_dims)
+            if weights_dims_set != spatial_dims_set:
+                raise ValueError(
+                    f"Weights dims must match spatial dims exactly. "
+                    f"Spatial dims: {spatial_dims}, Weights dims: {list(lat_weights.dims)}"
+                )
+            # Basic broadcast compatibility
+            _ = truth_da.isel({d: 0 for d in truth_da.dims if d not in spatial_dims}) * lat_weights
+            logger.debug(
+                f"MSE Skill Score by Pressure Level: Weights validation passed - dims: {lat_weights.dims}"
+            )
+
         # Single vectorized MSE calculations (preserve pressure_level dimension)
         mse_forecast_result = await asyncio.to_thread(
             _compute_metric_to_array,  # Use array-preserving helper
@@ -140,7 +156,7 @@ async def calculate_mse_skill_score_by_pressure_level(
             forecast_bc_da,
             truth_da,
             dim=spatial_dims,  # Only reduce lat/lon
-            weights=lat_weights,
+            weights=validated_weights,
             skipna=True,
         )
         
@@ -150,7 +166,7 @@ async def calculate_mse_skill_score_by_pressure_level(
             reference_da,
             truth_da,
             dim=spatial_dims,  # Only reduce lat/lon
-            weights=lat_weights,
+            weights=validated_weights,
             skipna=True,
         )
 
@@ -209,86 +225,113 @@ async def calculate_mse_skill_score(
             logger.error("No spatial dimensions (lat/lon) found for MSE skill score.")
             return -np.inf
 
-        # Check if we should use async processing for large datasets
-        use_async_processing = forecast_bc_da.size > 50000  # Use async for large arrays
-
-        if use_async_processing:
-            logger.debug("Using async processing for MSE skill score calculation")
-
-            try:
-                from ..utils.async_processing import compute_statistical_metrics_async
-
-                # Convert to numpy arrays for async processing
-                forecast_data = forecast_bc_da.values
-                truth_data = truth_da.values
-                reference_data = reference_da.values
-                weights_data = lat_weights.values if lat_weights is not None else None
-
-                # Use async processing for metrics calculation
-                metrics_result = await compute_statistical_metrics_async(
-                    forecast_data,
-                    truth_data,
-                    reference_data,
-                    None,  # No climatology needed for skill score
-                    weights_data,
-                    ["skill"],  # Only compute skill score
+        # Strictly use xskillscore with validated dimensions (no fallbacks)
+        # Validate dims equality and expected structure
+        if truth_da.dims != forecast_bc_da.dims or reference_da.dims != truth_da.dims:
+            raise ValueError(
+                f"Forecast, truth, and reference dims must match exactly. "
+                f"Forecast: {forecast_bc_da.dims}, Truth: {truth_da.dims}, Reference: {reference_da.dims}"
+            )
+        # CRITICAL FIX: Validate weights dimensions before passing to xskillscore
+        validated_weights = lat_weights
+        if lat_weights is not None:
+            weights_dims_set = set(lat_weights.dims)
+            spatial_dims_set = set(spatial_dims)
+            if weights_dims_set != spatial_dims_set:
+                raise ValueError(
+                    f"Weights dims must match spatial dims exactly. "
+                    f"Spatial dims: {spatial_dims}, Weights dims: {list(lat_weights.dims)}"
                 )
-
-                if metrics_result and "skill" in metrics_result:
-                    skill_score = metrics_result["skill"]
-                    logger.info(f"MSE Skill Score (Async): {skill_score}")
-                    
-                    # DIAGNOSTIC: Check if async skill score is non-finite
-                    if not np.isfinite(skill_score):
-                        logger.warning(f"MSE Skill Score (Async): Non-finite result: {skill_score}")
-                        logger.info(f"MSE Skill Score (Async): Metrics result: {metrics_result}")
-                        # Fall through to xskillscore for better diagnostics
-                    else:
-                        return skill_score
-                else:
-                    logger.warning(
-                        "Async skill score calculation failed, falling back to xskillscore"
-                    )
-                    # Fall through to xskillscore calculation
-
-            except Exception as async_error:
-                logger.warning(
-                    f"Async MSE calculation failed: {async_error}, falling back to xskillscore"
-                )
-                # Fall through to xskillscore calculation
-
-        # Use existing xskillscore calculation (fallback or small datasets)
-        mse_forecast_scalar = await asyncio.to_thread(
-            _compute_metric_to_scalar_array,
+            _ = truth_da.isel({d: 0 for d in truth_da.dims if d not in spatial_dims}) * lat_weights
+            logger.debug(f"MSE Skill Score: Weights validation passed - dims: {lat_weights.dims}")
+        
+        # Add diagnostics before MSE calculation
+        variable_name = getattr(forecast_bc_da, 'name', 'unknown')
+        logger.debug(f"MSE Skill Score: About to calculate MSE for variable '{variable_name}'")
+        logger.debug(f"  Forecast dims: {forecast_bc_da.dims}, shape: {forecast_bc_da.shape}")
+        logger.debug(f"  Truth dims: {truth_da.dims}, shape: {truth_da.shape}")
+        logger.debug(f"  Reference dims: {reference_da.dims}, shape: {reference_da.shape}")
+        logger.debug(f"  Spatial dims for reduction: {spatial_dims}")
+        logger.debug(f"  Using weights: {validated_weights is not None}")
+        
+        # Coordinate consistency already enforced; additional debug only
+        
+        # Compute MSE results
+        mse_forecast_result = await asyncio.to_thread(
+            _compute_metric_to_array,
             xs.mse,
             forecast_bc_da,
             truth_da,
             dim=spatial_dims,
-            weights=lat_weights,
+            weights=validated_weights,
             skipna=True,
         )
-        mse_reference_scalar = await asyncio.to_thread(
-            _compute_metric_to_scalar_array,
+        mse_reference_result = await asyncio.to_thread(
+            _compute_metric_to_array,
             xs.mse,
             reference_da,
             truth_da,
             dim=spatial_dims,
-            weights=lat_weights,
+            weights=validated_weights,
             skipna=True,
         )
 
-        # Ensure results are computed if they're dask arrays
-        if hasattr(mse_forecast_scalar, "compute"):
-            mse_forecast_scalar = await asyncio.to_thread(mse_forecast_scalar.compute)
-        if hasattr(mse_reference_scalar, "compute"):
-            mse_reference_scalar = await asyncio.to_thread(mse_reference_scalar.compute)
+        # Aggregate across pressure levels using mass-weighted thickness if needed
+        if "pressure_level" in mse_forecast_result.dims:
+            levels = mse_forecast_result["pressure_level"].values.astype(float)
+            levels_sorted = np.sort(levels)
+            # compute half-level thickness weights in hPa
+            thickness = np.zeros_like(levels_sorted)
+            for i in range(len(levels_sorted)):
+                if i == 0:
+                    thickness[i] = (levels_sorted[i + 1] - levels_sorted[i]) / 2.0
+                elif i == len(levels_sorted) - 1:
+                    thickness[i] = (levels_sorted[i] - levels_sorted[i - 1]) / 2.0
+                else:
+                    thickness[i] = (levels_sorted[i + 1] - levels_sorted[i - 1]) / 2.0
+            # map thickness to the original level order
+            thickness_map = {lvl: th for lvl, th in zip(levels_sorted, thickness)}
+            weights_pl = np.array([thickness_map[lvl] for lvl in levels])
+            weights_pl = weights_pl / np.sum(weights_pl)
 
-        # Extract scalar values with validation
-        mse_forecast_val = mse_forecast_scalar.item()
-        mse_reference_val = mse_reference_scalar.item()
+            # Ensure we weight in the same order as DataArray levels
+            mse_forecast_vals = np.array([float(mse_forecast_result.sel(pressure_level=l).item()) for l in levels])
+            mse_reference_vals = np.array([float(mse_reference_result.sel(pressure_level=l).item()) for l in levels])
+
+            mse_forecast_val = float(np.sum(weights_pl * mse_forecast_vals))
+            mse_reference_val = float(np.sum(weights_pl * mse_reference_vals))
+        else:
+            mse_forecast_val = float(mse_forecast_result.item())
+            mse_reference_val = float(mse_reference_result.item())
         
-        # DIAGNOSTIC: Check for NaN/inf values in MSE calculations
-        logger.info(f"MSE Skill Score Diagnostics - Forecast MSE: {mse_forecast_val}, Reference MSE: {mse_reference_val}")
+        # ENHANCED DIAGNOSTIC: Check for NaN/inf values in MSE calculations
+        logger.info(f"MSE Skill Score Diagnostics for '{variable_name}' - Forecast MSE: {mse_forecast_val}, Reference MSE: {mse_reference_val}")
+        
+        # Additional diagnostics for NaN investigation
+        if not np.isfinite(mse_forecast_val) or not np.isfinite(mse_reference_val):
+            logger.warning(f"MSE Skill Score: Non-finite MSE detected for variable '{variable_name}'!")
+            logger.warning(f"  Forecast MSE: {mse_forecast_val} (finite: {np.isfinite(mse_forecast_val)})")
+            logger.warning(f"  Reference MSE: {mse_reference_val} (finite: {np.isfinite(mse_reference_val)})")
+            
+            # Check input data for NaN/inf values
+            forecast_has_nan = np.isnan(forecast_bc_da.values).any()
+            truth_has_nan = np.isnan(truth_da.values).any()
+            reference_has_nan = np.isnan(reference_da.values).any()
+            
+            logger.warning(f"  Input data NaN check:")
+            logger.warning(f"    Forecast has NaN: {forecast_has_nan}")
+            logger.warning(f"    Truth has NaN: {truth_has_nan}")
+            logger.warning(f"    Reference has NaN: {reference_has_nan}")
+            
+            # Check data ranges
+            if not forecast_has_nan:
+                logger.warning(f"    Forecast range: [{np.nanmin(forecast_bc_da.values):.6f}, {np.nanmax(forecast_bc_da.values):.6f}]")
+            if not truth_has_nan:
+                logger.warning(f"    Truth range: [{np.nanmin(truth_da.values):.6f}, {np.nanmax(truth_da.values):.6f}]")
+            if not reference_has_nan:
+                logger.warning(f"    Reference range: [{np.nanmin(reference_da.values):.6f}, {np.nanmax(reference_da.values):.6f}]")
+            
+            return np.nan
         
         if not np.isfinite(mse_forecast_val):
             logger.warning(f"MSE Skill Score: Forecast MSE is non-finite: {mse_forecast_val}")
@@ -334,6 +377,26 @@ async def calculate_acc_by_pressure_level(
         forecast_anom = forecast_da - climatology_da
         truth_anom = truth_da - climatology_da
 
+        # Debug logging
+        logger.debug(f"ACC calculation - Data dims: {forecast_da.dims}, spatial_dims: {spatial_dims}")
+        logger.debug(f"ACC calculation - Weights dims: {lat_weights.dims if lat_weights is not None else None}")
+        
+        # Strict weights validation
+        validated_weights = lat_weights
+        if lat_weights is not None:
+            weights_dims_set = set(lat_weights.dims)
+            spatial_dims_set = set(spatial_dims)
+            if weights_dims_set != spatial_dims_set:
+                raise ValueError(
+                    f"Weights dims must match spatial dims exactly. Spatial dims: {spatial_dims}, Weights dims: {list(lat_weights.dims)}"
+                )
+
+        # Debug the input data dimensions before calling xskillscore
+        logger.debug(f"ACC Input Debug:")
+        logger.debug(f"  forecast_anom dims: {forecast_anom.dims}, shape: {forecast_anom.shape}")
+        logger.debug(f"  truth_anom dims: {truth_anom.dims}, shape: {truth_anom.shape}")
+        logger.debug(f"  spatial_dims for reduction: {spatial_dims}")
+        
         # Single vectorized ACC calculation across all pressure levels
         acc_result = await asyncio.to_thread(
             _compute_metric_to_array,  # Use array-preserving helper
@@ -341,9 +404,18 @@ async def calculate_acc_by_pressure_level(
             forecast_anom,
             truth_anom,
             dim=spatial_dims,  # Only reduce lat/lon, preserve pressure_level
-            weights=lat_weights,
+            weights=validated_weights,
             skipna=True,
         )
+        
+        logger.debug(f"ACC result dims: {acc_result.dims}, shape: {acc_result.shape}")
+        
+        # Rigor: result must have single 'pressure_level' dimension
+        if hasattr(acc_result, 'dims') and (len(acc_result.dims) != 1 or 'pressure_level' not in acc_result.dims):
+            raise ValueError(
+                f"ACC result must have a single 'pressure_level' dimension after reducing spatial dims. "
+                f"Got dims: {acc_result.dims} with sizes {getattr(acc_result, 'sizes', {})}"
+            )
 
         # Extract per-pressure-level scores
         per_level_scores = {}
@@ -351,10 +423,23 @@ async def calculate_acc_by_pressure_level(
             # Atmospheric variable - extract each pressure level
             for level in acc_result.coords["pressure_level"]:
                 level_val = int(level.item())
-                score_val = float(acc_result.sel(pressure_level=level).item())
+                level_result = acc_result.sel(pressure_level=level)
+                
+                # Handle case where result might still have extra dimensions
+                if level_result.size == 1:
+                    score_val = float(level_result.item())
+                else:
+                    # If still multi-dimensional, take mean (shouldn't happen with proper spatial reduction)
+                    logger.warning(f"ACC result for level {level_val} has {level_result.size} elements, taking mean")
+                    score_val = float(level_result.mean().item())
+                
                 per_level_scores[level_val] = score_val
         else:
-            # Surface variable - single score
+            # Surface variable - single score must be scalar
+            if acc_result.size != 1:
+                raise ValueError(
+                    f"Surface ACC result must be scalar. Got size={acc_result.size}"
+                )
             per_level_scores[None] = float(acc_result.item())
         
         return per_level_scores
@@ -384,48 +469,7 @@ async def calculate_acc(
             logger.error("No spatial dimensions (lat/lon) found for ACC.")
             return -np.inf
 
-        # Check if we should use async processing for large datasets
-        use_async_processing = forecast_da.size > 50000  # Use async for large arrays
-
-        if use_async_processing:
-            logger.debug("Using async processing for ACC calculation")
-
-            try:
-                from ..utils.async_processing import compute_statistical_metrics_async
-
-                # Convert to numpy arrays for async processing
-                forecast_data = forecast_da.values
-                truth_data = truth_da.values
-                climatology_data = climatology_da.values
-                weights_data = lat_weights.values if lat_weights is not None else None
-
-                # Use async processing for ACC calculation
-                metrics_result = await compute_statistical_metrics_async(
-                    forecast_data,
-                    truth_data,
-                    None,  # No reference needed for ACC
-                    climatology_data,
-                    weights_data,
-                    ["acc"],  # Only compute ACC
-                )
-
-                if metrics_result and "acc" in metrics_result:
-                    acc_float = metrics_result["acc"]
-                    logger.info(f"ACC calculated (Async): {acc_float:.4f}")
-                    return acc_float
-                else:
-                    logger.warning(
-                        "Async ACC calculation failed, falling back to xskillscore"
-                    )
-                    # Fall through to xskillscore calculation
-
-            except Exception as async_error:
-                logger.warning(
-                    f"Async ACC calculation failed: {async_error}, falling back to xskillscore"
-                )
-                # Fall through to xskillscore calculation
-
-        # Use existing xskillscore calculation (fallback or small datasets)
+        # Strictly use xskillscore (no fallbacks)
         forecast_anom = forecast_da - climatology_da
         truth_anom = truth_da - climatology_da
 
@@ -445,10 +489,6 @@ async def calculate_acc(
             weights=lat_weights,
             skipna=True,
         )
-
-        # Ensure result is computed if it's a dask array
-        if hasattr(acc_scalar, "compute"):
-            acc_scalar = await asyncio.to_thread(acc_scalar.compute)
 
         acc_float = acc_scalar.item()
         logger.info(f"ACC calculated (xskillscore): {acc_float:.4f}")
@@ -606,10 +646,23 @@ async def calculate_rmse_by_pressure_level(
             # Atmospheric variable - extract each pressure level
             for level in rmse_result.coords["pressure_level"]:
                 level_val = int(level.item())
-                score_val = float(rmse_result.sel(pressure_level=level).item())
+                level_result = rmse_result.sel(pressure_level=level)
+                
+                # Handle case where result might still have extra dimensions
+                if level_result.size == 1:
+                    score_val = float(level_result.item())
+                else:
+                    raise ValueError(
+                        f"RMSE result for level {level_val} has {level_result.size} elements; expected scalar after spatial reduction"
+                    )
+                
                 per_level_scores[level_val] = score_val
         else:
-            # Surface variable - single score
+            # Surface variable - single score must be scalar
+            if rmse_result.size != 1:
+                raise ValueError(
+                    f"Surface RMSE result must be scalar. Got size={rmse_result.size}"
+                )
             per_level_scores[None] = float(rmse_result.item())
         
         return per_level_scores
@@ -635,36 +688,7 @@ async def calculate_rmse(
             logger.error("No spatial dimensions (lat/lon) found for RMSE.")
             return np.inf
 
-        # Use async processing for large datasets
-        if forecast_da.size > 50000:
-            logger.debug("Using async processing for RMSE calculation")
-            try:
-                from ..utils.async_processing import compute_statistical_metrics_async
-
-                forecast_data = forecast_da.values
-                truth_data = truth_da.values
-                weights_data = lat_weights.values if lat_weights is not None else None
-
-                metrics_result = await compute_statistical_metrics_async(
-                    forecast_data,
-                    truth_data,
-                    None,
-                    None,  # No reference or climatology needed
-                    weights_data,
-                    ["rmse"],
-                )
-
-                if metrics_result and "rmse" in metrics_result:
-                    rmse_value = metrics_result["rmse"]
-                    logger.info(f"RMSE calculated (Async): {rmse_value:.4f}")
-                    return rmse_value
-
-            except Exception as async_error:
-                logger.warning(
-                    f"Async RMSE calculation failed: {async_error}, falling back to xskillscore"
-                )
-
-        # Fallback to xskillscore
+        # Strictly use xskillscore (no async alt)
         rmse_scalar = await asyncio.to_thread(
             _compute_metric_to_scalar_array,
             xs.rmse,
@@ -674,11 +698,6 @@ async def calculate_rmse(
             weights=lat_weights,
             skipna=True,
         )
-
-        # Ensure result is computed if it's a dask array
-        if hasattr(rmse_scalar, "compute"):
-            rmse_scalar = await asyncio.to_thread(rmse_scalar.compute)
-
         rmse_value = rmse_scalar.item()
         logger.info(f"RMSE calculated (xskillscore): {rmse_value:.4f}")
         return rmse_value
@@ -704,36 +723,7 @@ async def calculate_bias(
             logger.error("No spatial dimensions (lat/lon) found for bias.")
             return np.nan
 
-        # Use async processing for large datasets
-        if forecast_da.size > 50000:
-            logger.debug("Using async processing for bias calculation")
-            try:
-                from ..utils.async_processing import compute_statistical_metrics_async
-
-                forecast_data = forecast_da.values
-                truth_data = truth_da.values
-                weights_data = lat_weights.values if lat_weights is not None else None
-
-                metrics_result = await compute_statistical_metrics_async(
-                    forecast_data,
-                    truth_data,
-                    None,
-                    None,  # No reference or climatology needed
-                    weights_data,
-                    ["bias"],
-                )
-
-                if metrics_result and "bias" in metrics_result:
-                    bias_value = metrics_result["bias"]
-                    logger.info(f"Bias calculated (Async): {bias_value:.4f}")
-                    return bias_value
-
-            except Exception as async_error:
-                logger.warning(
-                    f"Async bias calculation failed: {async_error}, falling back to manual calculation"
-                )
-
-        # Fallback to manual calculation
+        # Strict manual calculation (no async alt)
         diff = forecast_da - truth_da
         if lat_weights is not None:
             weighted_diff = diff * lat_weights

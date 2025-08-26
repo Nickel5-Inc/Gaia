@@ -670,6 +670,19 @@ class WeatherInitiateFetchResponse(BaseModel):
     message: Optional[str] = Field(None, description="Optional message.")
     expected_hotkey: Optional[str] = Field(None, description="Expected hotkey (only for verification failures).")
     actual_hotkey: Optional[str] = Field(None, description="Actual hotkey (only for verification failures).")
+    # Fast-path fields when forecast already exists and is ready
+    zarr_store_url: Optional[str] = Field(
+        None,
+        description="URL to the miner's /forecasts/ endpoint for the Zarr store when status is 'completed' or 'forecast_ready'.",
+    )
+    verification_hash: Optional[str] = Field(
+        None,
+        description="Manifest verification hash for the forecast when status is 'completed' or 'forecast_ready'.",
+    )
+    access_token: Optional[str] = Field(
+        None,
+        description="JWT token granting access to the Zarr store when status is 'completed' or 'forecast_ready'.",
+    )
 
 
 class WeatherGetInputStatusResponse(BaseModel):

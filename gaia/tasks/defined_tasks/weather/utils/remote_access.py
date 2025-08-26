@@ -11,6 +11,21 @@ from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 
+# Process-local: capture last verified open error details by job_id
+_last_verified_open_error = {}
+
+def set_last_verified_open_error(job_id: str, message: str):
+    try:
+        _last_verified_open_error[job_id] = message
+    except Exception:
+        pass
+
+def get_last_verified_open_error(job_id: str) -> Optional[str]:
+    try:
+        return _last_verified_open_error.get(job_id)
+    except Exception:
+        return None
+
 # Ensure blosc codec is available for zarr operations
 try:
     import blosc
@@ -49,6 +64,23 @@ except ImportError:
         )
 
 logger = get_logger(__name__)
+
+# Lightweight request throttle/cache to prevent request storms during verification
+_CAT_CACHE_MAX = 2048
+_cat_cache = {}
+_cat_order = []
+
+def _cat_cached(fs, path: str) -> bytes:
+    key = path
+    if key in _cat_cache:
+        return _cat_cache[key]
+    data = fs.cat(path)
+    _cat_cache[key] = data
+    _cat_order.append(key)
+    if len(_cat_order) > _CAT_CACHE_MAX:
+        oldest = _cat_order.pop(0)
+        _cat_cache.pop(oldest, None)
+    return data
 
 
 def get_current_memory_usage_mb():
@@ -98,7 +130,10 @@ def _synchronous_zarr_open_unverified(
                 f"SYNC_ZARR_OPEN_UNVERIFIED: Blosc codec test successful in executor thread"
             )
         except Exception as codec_err:
-            logger.warning(f"SYNC_ZARR_OPEN_UNVERIFIED: Codec test failed: {codec_err}")
+            logger.warning(
+                f"SYNC_ZARR_OPEN_UNVERIFIED: Codec test failed: {codec_err}",
+                exc_info=True,
+            )
 
         # Additional fallback: set zarr codec for this thread explicitly
         try:
@@ -114,10 +149,11 @@ def _synchronous_zarr_open_unverified(
             ):
                 zarr.codec_registry.register_codec(blosc_codec)
         except Exception as e:
-            logger.debug(f"Failed to register blosc codec: {e}")
+            logger.debug(f"Failed to register blosc codec: {e}", exc_info=True)
     except Exception as e:
         logger.warning(
-            f"SYNC_ZARR_OPEN_UNVERIFIED: Failed to ensure blosc codec in executor thread: {e}"
+            f"SYNC_ZARR_OPEN_UNVERIFIED: Failed to ensure blosc codec in executor thread: {e}",
+            exc_info=True,
         )
 
     if zarr_store_url.endswith(".zarr") and not zarr_store_url.endswith("/"):
@@ -239,7 +275,7 @@ async def open_remote_zarr_dataset_unverified(
 
 
 def _synchronous_open_with_verifying_mapper(
-    verifying_mapper: VerifyingChunkMapper, consolidated: bool
+    verifying_mapper, consolidated: bool
 ) -> Optional[xr.Dataset]:
     """Synchronous helper to open dataset with the VerifyingChunkMapper."""
     # CRITICAL: Ensure blosc codec is available in this executor thread
@@ -278,12 +314,14 @@ def _synchronous_open_with_verifying_mapper(
 
         except Exception as codec_err:
             logger.warning(
-                f"Job {verifying_mapper.job_id_for_logging}: Codec registration failed: {codec_err}"
+                f"Job {verifying_mapper.job_id_for_logging}: Codec registration failed: {codec_err}",
+                exc_info=True,
             )
 
     except Exception as e:
         logger.warning(
-            f"Job {verifying_mapper.job_id_for_logging}: Failed to ensure blosc codec in executor thread: {e}"
+            f"Job {verifying_mapper.job_id_for_logging}: Failed to ensure blosc codec in executor thread: {e}",
+            exc_info=True,
         )
 
     try:
@@ -543,6 +581,7 @@ async def open_verified_remote_zarr_dataset(
             logger.error(
                 f"Job {job_id}: Opening Zarr with VerifyingChunkMapper returned None for {zarr_store_url}"
             )
+            set_last_verified_open_error(job_id, "open_with_verifying_mapper returned None")
             return None
 
     except Exception as e:
@@ -550,4 +589,8 @@ async def open_verified_remote_zarr_dataset(
             f"Job {job_id}: Error in open_verified_remote_zarr_dataset (post-manifest check) for {zarr_store_url}: {e}",
             exc_info=True,
         )
+        try:
+            set_last_verified_open_error(job_id, f"exception: {e}")
+        except Exception:
+            pass
         return None

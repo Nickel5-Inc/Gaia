@@ -984,10 +984,12 @@ async def _fetch_single_day_era5(
             # Rename variables to match expected names
             var_mapping = {**ERA5_SINGLE_LEVEL_VARS, **ERA5_PRESSURE_LEVEL_VARS}
 
-            for ds in [ds_sl, ds_pl]:
-                for old_name, new_name in var_mapping.items():
-                    if old_name in ds.data_vars:
-                        ds = ds.rename({old_name: new_name})
+            # Apply renaming in-place by reassigning back to the variables
+            for old_name, new_name in var_mapping.items():
+                if old_name in ds_sl.data_vars:
+                    ds_sl = ds_sl.rename({old_name: new_name})
+                if old_name in ds_pl.data_vars:
+                    ds_pl = ds_pl.rename({old_name: new_name})
 
             # Combine datasets with coordinate validation
             logger.debug(f"Before merge - ds_sl coords: {list(ds_sl.coords.keys())}")
