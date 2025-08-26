@@ -1460,8 +1460,55 @@ async def _process_single_variable_parallel(
             rmse_scores_by_level = await calculate_rmse_by_pressure_level(
                 miner_var_da_aligned, truth_var_da_final, broadcasted_weights_final
             )
+            # Compute MAE per pressure level
+            try:
+                spatial_dims = [d for d in truth_var_da_final.dims if d.lower() in ("latitude", "longitude", "lat", "lon")]
+                abs_err = abs(miner_var_da_aligned - truth_var_da_final)
+                if broadcasted_weights_final is not None:
+                    weighted_sum = await asyncio.to_thread(
+                        lambda: (abs_err * broadcasted_weights_final).sum(dim=spatial_dims)
+                    )
+                    weights_sum = await asyncio.to_thread(
+                        lambda: broadcasted_weights_final.sum(dim=spatial_dims)
+                    )
+                    mae_da = weighted_sum / weights_sum
+                else:
+                    mae_da = await asyncio.to_thread(abs_err.mean, spatial_dims)
+                per_level_mae = {}
+                if "pressure_level" in mae_da.dims:
+                    for level in mae_da.coords["pressure_level"]:
+                        per_level_mae[int(level.item())] = float(mae_da.sel(pressure_level=level).item())
+                else:
+                    per_level_mae[None] = float(mae_da.item())
+            except Exception:
+                per_level_mae = {}
+            # Calculate per-level bias (weighted mean error over spatial dims)
+            try:
+                spatial_dims = [d for d in truth_var_da_final.dims if d.lower() in ("latitude", "longitude", "lat", "lon")]
+                diff_da = miner_var_da_aligned - truth_var_da_final
+                if broadcasted_weights_final is not None:
+                    # Weighted mean over spatial dims
+                    weighted_sum = await asyncio.to_thread(
+                        lambda: (diff_da * broadcasted_weights_final).sum(dim=spatial_dims)
+                    )
+                    weights_sum = await asyncio.to_thread(
+                        lambda: broadcasted_weights_final.sum(dim=spatial_dims)
+                    )
+                    bias_da = weighted_sum / weights_sum
+                else:
+                    bias_da = await asyncio.to_thread(diff_da.mean, spatial_dims)
+                per_level_bias = {}
+                if "pressure_level" in bias_da.dims:
+                    for level in bias_da.coords["pressure_level"]:
+                        per_level_bias[int(level.item())] = float(bias_da.sel(pressure_level=level).item())
+                else:
+                    # Fallback single bias
+                    per_level_bias[None] = float(bias_da.item())
+            except Exception as e_bias:
+                logger.warning(f"[Day1Score] Failed to compute per-level bias for {var_name}: {e_bias}")
+                per_level_bias = {}
             
-            # Apply clone penalty to skill scores and calculate averages for backward compatibility
+            # Apply clone penalty tracking only (do not subtract from skill metric), calculate averages for backward compatibility
             avg_skill_score = 0.0
             avg_acc_score = 0.0
             avg_rmse_score = 0.0
@@ -1469,8 +1516,6 @@ async def _process_single_variable_parallel(
             
             for level in skill_scores_by_level.keys():
                 if level in acc_scores_by_level and level in rmse_scores_by_level:
-                    # Apply clone penalty per level
-                    skill_scores_by_level[level] -= clone_penalty
                     avg_skill_score += skill_scores_by_level[level]
                     avg_acc_score += acc_scores_by_level[level]
                     avg_rmse_score += rmse_scores_by_level[level]
@@ -1485,7 +1530,9 @@ async def _process_single_variable_parallel(
             result["pressure_level_scores"] = {
                 "skill": skill_scores_by_level,
                 "acc": acc_scores_by_level,
-                "rmse": rmse_scores_by_level
+                "rmse": rmse_scores_by_level,
+                "mae": per_level_mae,
+                "bias": per_level_bias
             }
             
             logger.info(f"Extracted detailed metrics for {valid_levels} pressure levels")
@@ -1499,9 +1546,20 @@ async def _process_single_variable_parallel(
                 broadcasted_weights_final,
             )
             
-            # clone penalty
-            skill_score_after_penalty = skill_score - clone_penalty
-            result["skill_score"] = skill_score_after_penalty
+            # Do NOT subtract clone penalty from skill metric; record penalty separately
+            result["skill_score"] = skill_score
+
+            # Also compute climatology-referenced skill to match ERA5 method
+            try:
+                skill_score_clim = await calculate_mse_skill_score(
+                    forecast_bc_da,
+                    truth_var_da_final,
+                    clim_var_da_aligned,
+                    broadcasted_weights_final,
+                )
+                result["skill_score_climatology"] = skill_score_clim
+            except Exception:
+                pass
 
             # ACC
             acc_score = await calculate_acc(
@@ -1511,6 +1569,22 @@ async def _process_single_variable_parallel(
                 broadcasted_weights_final,
             )
             result["acc_score"] = acc_score
+            # RMSE, MAE and Bias for surface variables
+            try:
+                from .weather_scoring.metrics import calculate_rmse, calculate_bias
+                rmse_val = await calculate_rmse(miner_var_da_aligned, truth_var_da_final, broadcasted_weights_final)
+                result["rmse"] = rmse_val
+                # MAE calculation
+                abs_err = abs(miner_var_da_aligned - truth_var_da_final)
+                if broadcasted_weights_final is not None:
+                    mae_val = float(((abs_err * broadcasted_weights_final).sum() / broadcasted_weights_final.sum()).item())
+                else:
+                    mae_val = float(abs_err.mean().item())
+                result["mae"] = mae_val
+                bias_val = await calculate_bias(miner_var_da_aligned, truth_var_da_final, broadcasted_weights_final)
+                result["bias"] = bias_val
+            except Exception as e_rmse_bias:
+                logger.warning(f"[Day1Score] Failed to compute RMSE/Bias for {var_name}: {e_rmse_bias}")
 
         # ACC Lower Bound Check
         current_acc_score = result.get("acc_score", -np.inf)

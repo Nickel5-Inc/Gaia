@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone, timedelta
+import random
 from typing import Optional, Dict, Any
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
@@ -258,6 +259,12 @@ async def handle_initiate_fetch_job(
             ORDER BY uid
             """
         )
+        # Randomize miner order to avoid all validators hitting miners in the same sequence
+        try:
+            rng = random.Random()
+            rng.shuffle(miners)
+        except Exception:
+            pass
         
         # CRITICAL: Check for duplicate IP/port assignments (same physical miner, different UIDs)
         if len(miners) > 1:

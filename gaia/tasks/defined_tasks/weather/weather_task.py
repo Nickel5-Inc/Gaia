@@ -7,6 +7,7 @@ import os
 import sys
 import importlib.util
 from pydantic import Field, ConfigDict
+import random
 
 # High-performance JSON operations for weather task
 try:
@@ -1937,7 +1938,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         )
 
         if self.test_mode:
-            logger.warning("Running in TEST MODE: Execution will run once immediately.")
+            logger.warning("Running in TEST MODE: Execution will loop approximately every 30 minutes.")
 
         # Track recovery state to avoid too frequent recovery attempts
         last_recovery_time = 0
@@ -1953,6 +1954,9 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         )
 
         last_run_date = None
+        # In test mode, trigger a new run every ~30 minutes
+        test_run_interval_minutes = self.config.get("test_run_interval_minutes", 30)
+        last_test_run_started_at = None
         
         while True:
             try:
@@ -1974,9 +1978,13 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     else:
                         next_run_trigger_time = target_run_time_today
 
+                    # Add random jitter (0-30 minutes) to spread validator start times
+                    jitter_minutes = random.randint(0, 30)
+                    next_run_trigger_time = next_run_trigger_time + timedelta(minutes=jitter_minutes)
+
                     wait_seconds = (next_run_trigger_time - now_utc).total_seconds()
                     logger.info(
-                        f"Current time: {now_utc}. Next weather run scheduled at {next_run_trigger_time}. Waiting for {wait_seconds:.2f} seconds."
+                        f"Current time: {now_utc}. Next weather run scheduled at {next_run_trigger_time} (jitter={jitter_minutes}m). Waiting for {wait_seconds:.2f} seconds."
                     )
                     if wait_seconds > 0:
                         await asyncio.sleep(wait_seconds)
@@ -1985,11 +1993,17 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 # Determine if we should create a new run
                 should_create_run = False
                 
-                if self.test_mode and last_run_date is None:
-                    # Test mode: run once immediately
-                    should_create_run = True
-                    logger.info("TEST MODE: Creating run immediately")
-                elif not self.test_mode and (
+                if self.test_mode:
+                    # Test mode: create a new run every configured interval
+                    if (
+                        last_test_run_started_at is None
+                        or (now_utc - last_test_run_started_at).total_seconds() >= test_run_interval_minutes * 60
+                    ):
+                        should_create_run = True
+                        logger.info(
+                            f"TEST MODE: Creating run (interval {test_run_interval_minutes} minutes)"
+                        )
+                elif (
                     last_run_date is None or 
                     last_run_date < now_utc.date()
                 ):
@@ -2161,27 +2175,13 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     
                     await validator.update_task_status("weather", "active", "orchestration_enqueued")
                     
-                    # In test mode, wait for the run to complete before creating another
+                    # In test mode, record start time and continue looping without exiting
                     if self.test_mode:
-                        logger.info("TEST MODE: Run created and orchestration enqueued. Waiting for completion...")
-                        # Store the run ID for tracking
                         self.last_test_mode_run_id = run_id
-                        
-                        # Wait for the run to reach a terminal state
-                        max_wait = 600  # 10 minutes max
-                        start_time = time.time()
-                        while time.time() - start_time < max_wait:
-                            run_status = await self.db_manager.fetch_one(
-                                "SELECT status FROM weather_forecast_runs WHERE id = :id",
-                                {"id": run_id}
-                            )
-                            if run_status and run_status["status"] in ["completed", "error", "day1_scored", "era5_scored"]:
-                                logger.info(f"TEST MODE: Run {run_id} reached terminal state: {run_status['status']}")
-                                break
-                            await asyncio.sleep(10)
-                        
-                        logger.info("TEST MODE: Completed one test run cycle. Exiting validator_execute loop.")
-                        break
+                        last_test_run_started_at = now_utc
+                        logger.info(
+                            f"TEST MODE: Run {run_id} started. Next run will be scheduled in ~{test_run_interval_minutes} minutes."
+                        )
                     
                 # Continue to next iteration
                 await asyncio.sleep(60)  # Check every minute

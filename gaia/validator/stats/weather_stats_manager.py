@@ -116,7 +116,8 @@ class WeatherStatsManager:
         hosting_latency_ms: Optional[int] = None,
         avg_rmse: Optional[float] = None,
         avg_acc: Optional[float] = None,
-        avg_skill_score: Optional[float] = None
+        avg_skill_score: Optional[float] = None,
+        overall_forecast_score: Optional[float] = None
     ) -> bool:
         """
         Update or insert weather forecast statistics for a miner.
@@ -162,6 +163,7 @@ class WeatherStatsManager:
                 "run_id": run_id,
                 "forecast_init_time": run_data["gfs_init_time_utc"],
                 "forecast_status": status,
+                "current_forecast_stage": status,
                 "validator_hotkey": self.validator_hotkey,
                 "updated_at": datetime.now(timezone.utc)
             }
@@ -204,6 +206,8 @@ class WeatherStatsManager:
                 stats_data["avg_acc"] = avg_acc
             if avg_skill_score is not None:
                 stats_data["avg_skill_score"] = avg_skill_score
+            if overall_forecast_score is not None:
+                stats_data["overall_forecast_score"] = overall_forecast_score
             
             # Upsert the record
             stmt = insert(weather_forecast_stats_table).values(**stats_data)

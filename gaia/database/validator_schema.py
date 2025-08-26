@@ -944,6 +944,13 @@ weather_forecast_stats_table = sa.Table(
         nullable=True,
         comment="Fraction of ERA5 timesteps completed (0-1)",
     ),
+    # Unified normalized overall forecast score (0-1) for weighting
+    sa.Column(
+        "overall_forecast_score",
+        sa.Float,
+        nullable=True,
+        comment="Unified normalized overall forecast score used for validator weighting (0-1)",
+    ),
     # Average component metrics across all variables/timesteps
     sa.Column(
         "avg_rmse",

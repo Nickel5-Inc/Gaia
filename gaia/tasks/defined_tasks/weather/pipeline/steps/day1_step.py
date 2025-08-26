@@ -10,6 +10,7 @@ from gaia.utils.custom_logger import get_logger
 logger = get_logger(__name__)
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+import sqlalchemy as sa
 # REMOVED: MinerWorkScheduler import - no longer needed since run() method was removed
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import (
@@ -304,6 +305,8 @@ async def run_item(
                                     skill_scores = pressure_level_scores.get("skill", {})
                                     acc_scores = pressure_level_scores.get("acc", {})
                                     rmse_scores = pressure_level_scores.get("rmse", {})
+                                    mae_scores = pressure_level_scores.get("mae", {})
+                                    bias_scores = pressure_level_scores.get("bias", {})
                                     
                                     # Get all pressure levels that have scores
                                     all_levels = set(skill_scores.keys()) | set(acc_scores.keys()) | set(rmse_scores.keys())
@@ -322,8 +325,9 @@ async def run_item(
                                             "skill_score": skill_scores.get(pressure_level),
                                             "acc": acc_scores.get(pressure_level),
                                             "rmse": rmse_scores.get(pressure_level),
-                                            "bias": var_data.get("bias"),
-                                            "mae": var_data.get("mae"),
+                                            "mse": (rmse_scores.get(pressure_level) ** 2) if rmse_scores.get(pressure_level) is not None else None,
+                                            "bias": bias_scores.get(pressure_level),
+                                            "mae": mae_scores.get(pressure_level),
                                             "pattern_correlation": var_data.get("pattern_correlation"),
                                             "pattern_correlation_passed": var_data.get("pattern_correlation_passed"),
                                             "climatology_check_passed": var_data.get("climatology_check_passed"),
@@ -343,6 +347,8 @@ async def run_item(
                                         pressure_level = int(var_key[-3:])
                                         var_name = var_key[:-3]
                                     
+                                    # Prefer climatology-referenced skill if present for comparability with ERA5
+                                    climatology_skill = var_data.get("skill_score_climatology")
                                     component_score = {
                                         "run_id": run_id,
                                         "response_id": response_id,
@@ -353,9 +359,10 @@ async def run_item(
                                         "valid_time_utc": valid_time,
                                         "variable_name": var_name,
                                         "pressure_level": pressure_level,
-                                        "skill_score": var_data.get("skill_score"),
+                                        "skill_score": climatology_skill if climatology_skill is not None else var_data.get("skill_score"),
                                         "acc": var_data.get("acc_score"),
                                         "rmse": var_data.get("rmse"),
+                                        "mse": (var_data.get("rmse") ** 2) if var_data.get("rmse") is not None else None,
                                         "bias": var_data.get("bias"),
                                         "mae": var_data.get("mae"),
                                         "pattern_correlation": var_data.get("pattern_correlation"),
@@ -400,12 +407,35 @@ async def run_item(
                 )
                 logger.info(f"[Day1Step] Recorded overall Day1 score {overall:.4f} to weather_miner_scores for miner {miner_uid}")
             
+            # Compute averages across all Day1 component scores for this run/miner
+            try:
+                avg_row = await db.fetch_one(
+                    sa.text(
+                        """
+                        SELECT AVG(rmse) AS avg_rmse, AVG(acc) AS avg_acc, AVG(skill_score) AS avg_skill
+                        FROM weather_forecast_component_scores
+                        WHERE run_id = :rid AND miner_uid = :uid AND score_type = 'day1'
+                        """
+                    ),
+                    {"rid": run_id, "uid": miner_uid},
+                )
+                avg_rmse = float(avg_row["avg_rmse"]) if avg_row and avg_row["avg_rmse"] is not None else None
+                avg_acc = float(avg_row["avg_acc"]) if avg_row and avg_row["avg_acc"] is not None else None
+                avg_skill = float(avg_row["avg_skill"]) if avg_row and avg_row["avg_skill"] is not None else None
+            except Exception:
+                avg_rmse = None
+                avg_acc = None
+                avg_skill = None
+
             await stats.update_forecast_stats(
                 run_id=run_id,
                 miner_uid=miner_uid,
                 miner_hotkey=miner_hotkey,
                 status="day1_scored",
                 initial_score=float(overall),
+                avg_rmse=avg_rmse,
+                avg_acc=avg_acc,
+                avg_skill_score=avg_skill,
             )
             
             # PIPELINE TIMING: Record Day1 completion time

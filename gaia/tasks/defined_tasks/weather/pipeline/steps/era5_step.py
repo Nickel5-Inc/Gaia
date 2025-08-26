@@ -250,29 +250,30 @@ async def run_item(
         )
         return False
     latency_ms = int((time.perf_counter() - t0) * 1000)
+
+    # After scoring, compute normalized per-lead scores and overall (writes to weather_forecast_stats)
+    try:
+        from gaia.tasks.defined_tasks.weather.processing.weather_logic import _calculate_and_store_aggregated_era5_score
+        # Use task.config variables list; fallback to day1 list if unset
+        vars_levels = task.config.get(
+            "final_scoring_variables_levels",
+            task.config.get("day1_variables_levels_to_score", []),
+        )
+        # Call aggregator to compute per-lead normalized scores and blended overall score
+        await _calculate_and_store_aggregated_era5_score(
+            task_instance=task,
+            run_id=run_id,
+            miner_uid=miner_uid,
+            miner_hotkey=miner_hotkey,
+            response_id=resp["id"],
+            lead_hours_scored=ready_leads,
+            vars_levels_scored=vars_levels,
+        )
+    except Exception as agg_err:
+        logger.debug(f"[ERA5Step] Skipped normalized aggregate write due to error: {agg_err}")
     # Aggregate/update stats
     try:
-        # Get ERA5 RMSE scores (they are stored as era5_rmse_varname_leadh format)
-        rows = await db.fetch_all(
-            sa.text(
-                """
-                SELECT lead_hours, AVG(score) as avg_score
-                FROM weather_miner_scores
-                WHERE run_id = :rid AND miner_uid = :uid AND score_type LIKE 'era5_rmse_%'
-                AND score IS NOT NULL
-                GROUP BY lead_hours
-                ORDER BY lead_hours
-                """
-            ),
-            {"rid": run_id, "uid": miner_uid},
-        )
-        era5_scores = {}
-        for r in rows:
-            lh = r.get("lead_hours")
-            sc = r.get("avg_score")
-            if lh is not None and sc is not None:
-                era5_scores[int(lh)] = float(sc)
-        completed_now = len([h for h in leads if h in era5_scores]) >= len(leads)
+        completed_now = len(ready_leads) >= len(leads)
         status = "completed" if completed_now else "era5_scoring"
         stats = WeatherStatsManager(
             db,
@@ -287,7 +288,12 @@ async def run_item(
             miner_uid=miner_uid,
             miner_hotkey=miner_hotkey,
             status=status,
-            era5_scores=era5_scores,
+            # Per-lead normalized scores are written by processing.weather_logic during final scoring; avoid overwriting here
+            hosting_status=None,
+            hosting_latency_ms=None,
+            avg_rmse=None,
+            avg_acc=None,
+            avg_skill_score=None,
         )
         
         # PIPELINE TIMING: Record ERA5 completion time and calculate total duration

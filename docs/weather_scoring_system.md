@@ -161,6 +161,11 @@ where `anomaly = value - climatology`
 - **Improvement measure**: Positive values indicate skill over reference
 - **Benchmark standard**: Essential for demonstrating forecast value
 
+Day1 vs ERA5 reference consistency:
+- Day1: We compute skill vs GFS reference (operational forecast) and also vs climatology for comparability.
+- ERA5: We compute skill vs climatology.
+- Clone penalty is tracked separately and is not subtracted from the stored skill metric.
+
 ### 5. Bias
 
 **Formula**: `Bias = mean(forecast - truth)`
@@ -182,6 +187,25 @@ where `anomaly = value - climatology`
 - **Robust metric**: Less influenced by extreme errors
 - **Linear penalty**: Equal weight to all errors
 - **Complementary**: Provides different perspective than MSE
+
+### 7. Score Normalization and Aggregation (used for per-lead and overall scores)
+
+To produce comparable, dimensionless scores on [0, 1] across metrics:
+- Skill normalization: `skill_norm = clamp(skill, 0, 1)`
+- ACC normalization: `acc_norm = (acc + 1) / 2`
+- RMSE normalization: when a suitable reference RMSE is available, use relative RMSE: `rrmse = RMSE_forecast / RMSE_reference`; then `rmse_norm = 1 / (1 + rrmse)`.
+  - If a reference is not available, we fallback to a robust per-lead median RMSE as `RMSE_reference`.
+
+Per-lead normalized score (24h, 48h, …, 240h):
+- If skill and ACC are available: `lead_score = 0.6*skill_norm + 0.3*acc_norm + 0.1*rmse_norm` (omit `rmse_norm` term if unavailable).
+- If only one metric available: use that metric’s normalized value.
+
+Overall per-miner ERA5 normalized score:
+- Average the per-lead normalized scores with zeros for missing leads using the configured lead set (default `[24, 48, 72, 96, 120, 144, 168, 192, 216, 240]`).
+
+Blended overall_forecast_score (used for weighting/ranking):
+- `overall_forecast_score = 0.8 * ERA5_norm_avg + 0.2 * Day1_overall`
+  - `Day1_overall` is the Day1 aggregate score (and we compute a climatology-based Day1 skill for direct comparability).
 
 ---
 
@@ -231,8 +255,8 @@ weight_100hPa = (150 - 50) / 2 = 50 hPa thickness
 Fast initial assessment to identify obviously poor forecasts before expensive ERA5 evaluation.
 
 ### Configuration
-- **Variables**: 5 essential surface/near-surface variables
-- **Lead Time**: Single 12-hour forecast
+- **Variables**: 5 essential surface/near-surface variables (plus optional atmospheric variables in test modes)
+- **Lead Time**: Configurable (defaults include 12h; can also include 6h)
 - **Threshold**: Configurable skill score minimum
 - **Processing**: Optimized for speed (~2-3 minutes)
 
@@ -248,6 +272,11 @@ Fast initial assessment to identify obviously poor forecasts before expensive ER
 - **msl**: Synoptic-scale features, good short-range skill
 - **10u/10v**: Surface winds, important for many applications
 - **z**: Atmospheric structure, fundamental for dynamics
+
+### Day1 Metrics and Skill Baselines
+- RMSE, MAE, ACC are computed vs GFS analysis truth.
+- Skill is computed vs GFS reference and, for surface variables, also vs climatology.
+- Clone penalty is recorded (for quality control) but is not subtracted from the stored skill metric.
 
 ---
 
@@ -322,6 +351,11 @@ Identify miners submitting identical or near-identical forecasts to reference da
 - **Operational relevance**: Real forecasts can't copy future observations
 - **Quality assurance**: Maintains scientific integrity
 
+### ERA5 Metrics and Normalized Scores
+- Metrics per variable/level/lead: RMSE, MAE, ACC (against anomalies), Skill (vs climatology).
+- Per-lead normalized score is computed using the normalization and aggregation rules above and stored per lead.
+- Aggregated ERA5 score averages per-lead normalized scores across the configured lead set with zeros for missing.
+
 ---
 
 ## Database Schema
@@ -377,6 +411,13 @@ weather_miner_scores (
     quality_issues BOOLEAN
 )
 ```
+
+### Weather Forecast Stats Table (selected fields and semantics)
+- `era5_score_[24h..240h]`: stores per-lead normalized scores on [0, 1] (not raw RMSE). Written during final scoring as soon as each lead is available.
+- `era5_combined_score`: average of all 10 per-lead normalized scores (zeros for missing).
+- `overall_forecast_score`: blended overall score used for ranking/weights (`0.8 * ERA5_norm_avg + 0.2 * Day1_overall`).
+- `avg_rmse`, `avg_acc`, `avg_skill_score`: averages computed from component scores for the run/miner (written at scoring time).
+- `forecast_status` / `current_forecast_stage`: updated throughout the pipeline (e.g., `day1_scored`, `era5_scoring`, `completed`).
 
 ---
 

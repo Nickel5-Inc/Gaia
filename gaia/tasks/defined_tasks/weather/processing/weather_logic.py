@@ -47,6 +47,8 @@ from ..weather_scoring.metrics import (
 )
 from gaia.utils.custom_logger import get_logger
 from ..weather_scoring.scoring import VARIABLE_WEIGHTS
+import sqlalchemy as sa
+from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
 
 logger = get_logger(__name__)
 
@@ -2572,6 +2574,40 @@ async def calculate_era5_miner_score(
                     )
                     current_metrics["bias"] = mean_bias_val
 
+                    # Compute per-level (or surface) MAE and Bias collapsed over spatial dims
+                    try:
+                        spatial_dims_bias_mae = [d for d in truth_var_da_final.dims if d.lower() in ("latitude", "longitude", "lat", "lon")]
+                        abs_err_da = abs(actual_bias_op)
+                        if mse_weights is not None:
+                            weighted_abs = await asyncio.to_thread(
+                                lambda: (abs_err_da * mse_weights).sum(dim=spatial_dims_bias_mae)
+                            )
+                            sum_w = await asyncio.to_thread(
+                                lambda: mse_weights.sum(dim=spatial_dims_bias_mae)
+                            )
+                            mae_da = weighted_abs / sum_w
+
+                            weighted_bias = await asyncio.to_thread(
+                                lambda: (actual_bias_op * mse_weights).sum(dim=spatial_dims_bias_mae)
+                            )
+                            bias_da = weighted_bias / sum_w
+                        else:
+                            mae_da = await asyncio.to_thread(abs_err_da.mean, spatial_dims_bias_mae)
+                            bias_da = await asyncio.to_thread(actual_bias_op.mean, spatial_dims_bias_mae)
+
+                        per_level_mae_map = {}
+                        per_level_bias_map = {}
+                        if hasattr(mae_da, 'dims') and 'pressure_level' in mae_da.dims:
+                            for level in mae_da.coords['pressure_level']:
+                                per_level_mae_map[int(level.item())] = float(mae_da.sel(pressure_level=level).item())
+                                per_level_bias_map[int(level.item())] = float(bias_da.sel(pressure_level=level).item())
+                        else:
+                            per_level_mae_map[None] = float(mae_da.item())
+                            per_level_bias_map[None] = float(bias_da.item())
+                    except Exception:
+                        per_level_mae_map = {}
+                        per_level_bias_map = {}
+
                     def calculate_raw_mse_preserve_dims(*args, **kwargs):
                         """Calculate MSE preserving pressure level dimensions for per-level processing."""
                         try:
@@ -2763,6 +2799,8 @@ async def calculate_era5_miner_score(
                                 'pressure_level': pressure_level,  # Individual pressure level
                                 'rmse': level_rmse,
                                 'mse': level_mse,
+                                'bias': per_level_bias_map.get(pressure_level),
+                                'mae': per_level_mae_map.get(pressure_level),
                                 'calculation_duration_ms': calculation_duration_ms,
                             }
                             # Will add ACC and skill scores later for each level
@@ -2783,6 +2821,8 @@ async def calculate_era5_miner_score(
                             'pressure_level': pressure_level_db,
                             'rmse': current_metrics["rmse"],
                             'mse': raw_mse_val,
+                            'bias': mean_bias_val,
+                            'mae': per_level_mae_map.get(None),
                             'calculation_duration_ms': calculation_duration_ms,
                         }
                         component_scores_for_this_var = [component_score]
@@ -2956,12 +2996,47 @@ async def calculate_era5_miner_score(
                                 )
 
                                 # skill score
-                                skill_score_val = await calculate_mse_skill_score(
-                                    forecast_bc_da,
-                                    truth_var_da_final,
-                                    gfs_var_da_aligned,
-                                    mse_weights,
-                                )
+                                # For atmospheric variables with multiple pressure levels, compute per-level skill
+                                per_level_skill_gfs = None
+                                if "per_level_mse" in current_metrics:
+                                    from ..weather_scoring.metrics import calculate_mse_skill_score_by_pressure_level
+                                    per_level_skill_map = await calculate_mse_skill_score_by_pressure_level(
+                                        forecast_bc_da,
+                                        truth_var_da_final,
+                                        gfs_var_da_aligned,
+                                        mse_weights,
+                                    )
+                                    per_level_skill_gfs = per_level_skill_map
+                                    # Aggregate to a single value for the summary metric using thickness weights
+                                    try:
+                                        levels = truth_var_da_final.coords['pressure_level'].values.astype(float)
+                                        levels_sorted = np.sort(levels)
+                                        thickness = np.zeros_like(levels_sorted)
+                                        for i in range(len(levels_sorted)):
+                                            if i == 0:
+                                                thickness[i] = (levels_sorted[i + 1] - levels_sorted[i]) / 2.0
+                                            elif i == len(levels_sorted) - 1:
+                                                thickness[i] = (levels_sorted[i] - levels_sorted[i - 1]) / 2.0
+                                            else:
+                                                thickness[i] = (levels_sorted[i + 1] - levels_sorted[i - 1]) / 2.0
+                                        thickness_map = {lvl: th for lvl, th in zip(levels_sorted, thickness)}
+                                        weights_pl = np.array([thickness_map[lvl] for lvl in levels])
+                                        weights_pl = weights_pl / np.sum(weights_pl)
+                                        skill_vals = np.array([per_level_skill_map.get(int(l), np.nan) for l in levels])
+                                        # Replace NaNs with zeros for aggregation safety
+                                        skill_vals = np.nan_to_num(skill_vals, nan=0.0)
+                                        skill_score_val = float(np.sum(weights_pl * skill_vals))
+                                    except Exception:
+                                        # Fallback to simple mean if any issue with thickness weights
+                                        skill_vals_list = [v for v in per_level_skill_map.values() if np.isfinite(v)]
+                                        skill_score_val = float(np.mean(skill_vals_list)) if skill_vals_list else None
+                                else:
+                                    skill_score_val = await calculate_mse_skill_score(
+                                        forecast_bc_da,
+                                        truth_var_da_final,
+                                        gfs_var_da_aligned,
+                                        mse_weights,
+                                    )
 
                                 if np.isfinite(skill_score_val):
                                     logger.info(
@@ -2976,8 +3051,14 @@ async def calculate_era5_miner_score(
                                     all_metrics_for_db.append(skill_metric_row)
                                     
                                     # Add GFS skill score to component scores
-                                    for component_score in component_scores_for_this_var:
-                                        component_score['skill_score_gfs'] = skill_score_val
+                                    if per_level_skill_gfs is not None:
+                                        for component_score in component_scores_for_this_var:
+                                            pl = component_score['pressure_level']
+                                            if pl is not None:
+                                                component_score['skill_score_gfs'] = per_level_skill_gfs.get(pl)
+                                    else:
+                                        for component_score in component_scores_for_this_var:
+                                            component_score['skill_score_gfs'] = skill_score_val
                                 else:
                                     logger.warning(
                                         f"[FinalScore] UID {miner_uid} - Calculated skill score is non-finite for {var_key} L{lead_hours}h"
@@ -3005,7 +3086,7 @@ async def calculate_era5_miner_score(
                                 miner_var_da_aligned, truth_var_da_final
                             )
 
-                            # skill score vs climatology - use coordinate-standardized climatology
+                            # skill score vs climatology - possibly per pressure level
                             # Enforce strict dimension order to match truth for rigorous scorer
                             if hasattr(climatology_skill_input, 'dims') and hasattr(truth_var_da_final, 'dims'):
                                 if set(climatology_skill_input.dims) == set(truth_var_da_final.dims) and tuple(climatology_skill_input.dims) != tuple(truth_var_da_final.dims):
@@ -3013,12 +3094,45 @@ async def calculate_era5_miner_score(
                                         f"[FinalScore] Aligning climatology dims for skill: {climatology_skill_input.dims} -> {truth_var_da_final.dims}"
                                     )
                                     climatology_skill_input = climatology_skill_input.transpose(*truth_var_da_final.dims)
-                            skill_score_val = await calculate_mse_skill_score(
-                                forecast_bc_da,
-                                truth_var_da_final,
-                                climatology_skill_input,  # Use standardized climatology when available
-                                mse_weights,
-                            )
+                            per_level_skill_clim = None
+                            if "per_level_mse" in current_metrics:
+                                from ..weather_scoring.metrics import calculate_mse_skill_score_by_pressure_level
+                                per_level_skill_map = await calculate_mse_skill_score_by_pressure_level(
+                                    forecast_bc_da,
+                                    truth_var_da_final,
+                                    climatology_skill_input,
+                                    mse_weights,
+                                )
+                                per_level_skill_clim = per_level_skill_map
+                                # Aggregate with thickness weights
+                                try:
+                                    levels = truth_var_da_final.coords['pressure_level'].values.astype(float)
+                                    levels_sorted = np.sort(levels)
+                                    thickness = np.zeros_like(levels_sorted)
+                                    for i in range(len(levels_sorted)):
+                                        if i == 0:
+                                            thickness[i] = (levels_sorted[i + 1] - levels_sorted[i]) / 2.0
+                                        elif i == len(levels_sorted) - 1:
+                                            thickness[i] = (levels_sorted[i] - levels_sorted[i - 1]) / 2.0
+                                        else:
+                                            thickness[i] = (levels_sorted[i + 1] - levels_sorted[i - 1]) / 2.0
+                                    thickness_map = {lvl: th for lvl, th in zip(levels_sorted, thickness)}
+                                    weights_pl = np.array([thickness_map[lvl] for lvl in levels])
+                                    weights_pl = weights_pl / np.sum(weights_pl)
+                                    skill_vals = np.array([per_level_skill_map.get(int(l), np.nan) for l in levels])
+                                    skill_vals = np.nan_to_num(skill_vals, nan=0.0)
+                                    skill_score_val = float(np.sum(weights_pl * skill_vals))
+                                except Exception:
+                                    # Fallback to simple mean
+                                    skill_vals_list = [v for v in per_level_skill_map.values() if np.isfinite(v)]
+                                    skill_score_val = float(np.mean(skill_vals_list)) if skill_vals_list else None
+                            else:
+                                skill_score_val = await calculate_mse_skill_score(
+                                    forecast_bc_da,
+                                    truth_var_da_final,
+                                    climatology_skill_input,  # Use standardized climatology when available
+                                    mse_weights,
+                                )
 
                             if np.isfinite(skill_score_val):
                                 logger.info(
@@ -3033,8 +3147,14 @@ async def calculate_era5_miner_score(
                                 all_metrics_for_db.append(skill_metric_row)
                                 
                                 # Add climatology skill score to component scores
-                                for component_score in component_scores_for_this_var:
-                                    component_score['skill_score_climatology'] = skill_score_val
+                                if per_level_skill_clim is not None:
+                                    for component_score in component_scores_for_this_var:
+                                        pl = component_score['pressure_level']
+                                        if pl is not None:
+                                            component_score['skill_score_climatology'] = per_level_skill_clim.get(pl)
+                                else:
+                                    for component_score in component_scores_for_this_var:
+                                        component_score['skill_score_climatology'] = skill_score_val
                             else:
                                 logger.warning(
                                     f"[FinalScore] UID {miner_uid} - Calculated climatology skill score is non-finite for {var_key} L{lead_hours}h"
@@ -3066,8 +3186,12 @@ async def calculate_era5_miner_score(
                     base_variable_weight = VARIABLE_WEIGHTS.get(var_name, 0.0)
                     
                     for component_score in component_scores_for_this_var:
-                        # Add skill score if available
-                        if skill_score_val is not None:
+                        # Add skill score if available; prefer per-level if present
+                        if 'skill_score_gfs' in component_score and component_score.get('skill_score_gfs') is not None:
+                            component_score['skill_score'] = component_score['skill_score_gfs']
+                        elif 'skill_score_climatology' in component_score and component_score.get('skill_score_climatology') is not None:
+                            component_score['skill_score'] = component_score['skill_score_climatology']
+                        elif skill_score_val is not None:
                             component_score['skill_score'] = skill_score_val
                         
                         # Add variable weight - for pressure level variables, distribute weight across levels
@@ -3269,7 +3393,8 @@ async def _calculate_and_store_aggregated_era5_score(
         for var_config in vars_levels_scored:
             var_name = var_config["name"]
             var_level = var_config.get("level")
-            var_key = f"{var_name}{var_level if var_level else ''}"
+            # Match score_type var_key formatting used during scoring: omit 'all'
+            var_key = f"{var_name}{var_level if var_level and var_level != 'all' else ''}"
 
             rmse_score_val = None
             skill_score_val = None
@@ -3377,6 +3502,138 @@ async def _calculate_and_store_aggregated_era5_score(
     )
 
     final_score_val = (0.5 * avg_skill_error_score) + (0.5 * avg_acc_score)
+
+    # Compute normalized per-lead ERA5 scores combining skill/acc/rmse if available
+    # Then write per-lead normalized scores, averages, and overall_forecast_score (80% ERA5 + 20% Day1)
+    try:
+        # Fetch Day1 overall score for 20% blend
+        day1_row = await task_instance.db_manager.fetch_one(
+            """
+            SELECT forecast_score_initial
+            FROM weather_forecast_stats
+            WHERE run_id = :rid AND miner_uid = :uid
+            """,
+            {"rid": run_id, "uid": miner_uid},
+        )
+        day1_overall = float(day1_row["forecast_score_initial"]) if day1_row and day1_row["forecast_score_initial"] is not None else None
+
+        # Compute normalized per-lead scores from weather_miner_scores table
+        # We aggregate by lead and variable
+        rows = await task_instance.db_manager.fetch_all(
+            """
+            SELECT lead_hours, score_type, score
+            FROM weather_miner_scores
+            WHERE run_id = :rid AND miner_uid = :uid AND score IS NOT NULL
+              AND (score_type LIKE 'era5_rmse_%' OR score_type LIKE 'era5_acc_%' OR score_type LIKE 'era5_skill_%')
+            """,
+            {"rid": run_id, "uid": miner_uid},
+        )
+        per_lead_metrics: Dict[int, Dict[str, List[float]]] = {}
+        for r in rows:
+            lh = r.get("lead_hours")
+            st = r.get("score_type")
+            sc = r.get("score")
+            if lh is None or st is None or sc is None:
+                continue
+            bucket = per_lead_metrics.setdefault(int(lh), {"acc": [], "skill": [], "rmse": []})
+            if st.startswith("era5_acc_"):
+                bucket["acc"].append(float(sc))
+            elif st.startswith("era5_skill_"):
+                bucket["skill"].append(float(sc))
+            elif st.startswith("era5_rmse_"):
+                bucket["rmse"].append(float(sc))
+
+        def clamp(x: float, lo: float, hi: float) -> float:
+            return max(lo, min(hi, x))
+
+        normalized_by_lead: Dict[int, float] = {}
+        rmse_ref_by_lead: Dict[int, float] = {}
+        # Establish a reference RMSE per lead as median of miner RMSEs for stability when GFS ref not present in table
+        # Here we fallback to miner's own median across vars; could be enhanced with network-wide stats
+        for lh, met in per_lead_metrics.items():
+            rmse_vals = [v for v in met["rmse"] if v is not None]
+            if rmse_vals:
+                rmse_vals_sorted = sorted(rmse_vals)
+                rmse_ref_by_lead[lh] = rmse_vals_sorted[len(rmse_vals_sorted)//2]
+            else:
+                rmse_ref_by_lead[lh] = 1.0
+
+        for lh, met in per_lead_metrics.items():
+            # Normalize components
+            acc_vals = [a for a in met["acc"] if a is not None]
+            skill_vals = [s for s in met["skill"] if s is not None]
+            rmse_vals = [e for e in met["rmse"] if e is not None]
+
+            acc_norm = None
+            if acc_vals:
+                acc_norm = sum((a + 1.0) / 2.0 for a in acc_vals) / len(acc_vals)
+
+            skill_norm = None
+            if skill_vals:
+                skill_norm = sum(clamp(s, 0.0, 1.0) for s in skill_vals) / len(skill_vals)
+
+            rmse_norm = None
+            if rmse_vals:
+                ref = rmse_ref_by_lead.get(lh, 1.0)
+                rrmse_list = [(e / ref) if ref > 0 else 1.0 for e in rmse_vals]
+                rmse_norm = sum(1.0 / (1.0 + r) for r in rrmse_list) / len(rrmse_list)
+
+            # Combine with weights, prefer skill and acc; use rmse as fallback
+            if skill_norm is not None and acc_norm is not None:
+                normalized = 0.6 * skill_norm + 0.4 * acc_norm if rmse_norm is None else 0.6 * skill_norm + 0.3 * acc_norm + 0.1 * rmse_norm
+            elif skill_norm is not None:
+                normalized = skill_norm
+            elif acc_norm is not None:
+                normalized = acc_norm
+            elif rmse_norm is not None:
+                normalized = rmse_norm
+            else:
+                normalized = 0.0
+            normalized_by_lead[lh] = float(normalized)
+
+        # Push per-lead normalized writes early, as part of final scoring loop
+        stats_mgr = WeatherStatsManager(task_instance.db_manager, validator_hotkey=getattr(task_instance, "validator", None) and getattr(getattr(getattr(task_instance, "validator", None), "validator_wallet", None), "hotkey", None) and getattr(getattr(getattr(task_instance, "validator", None), "validator_wallet", None).hotkey, "ss58_address", None) or "unknown_validator")
+
+        # Compute averages from component table for avg_rmse/avg_acc/avg_skill
+        avg_comp = await task_instance.db_manager.fetch_one(
+            sa.text(
+                """
+                SELECT AVG(rmse) AS avg_rmse, AVG(acc) AS avg_acc, AVG(skill_score) AS avg_skill
+                FROM weather_forecast_component_scores
+                WHERE run_id = :rid AND miner_uid = :uid AND score_type = 'era5'
+                """
+            ),
+            {"rid": run_id, "uid": miner_uid},
+        )
+        era5_avg_rmse = float(avg_comp["avg_rmse"]) if avg_comp and avg_comp["avg_rmse"] is not None else None
+        era5_avg_acc = float(avg_comp["avg_acc"]) if avg_comp and avg_comp["avg_acc"] is not None else None
+        era5_avg_skill = float(avg_comp["avg_skill"]) if avg_comp and avg_comp["avg_skill"] is not None else None
+
+        # Aggregate normalized ERA5 only across ready/observed leads to avoid writing zeros prematurely
+        expected_leads = task_instance.config.get("final_scoring_lead_hours", [24,48,72,96,120,144,168,192,216,240])
+        available_leads = [h for h in expected_leads if h in normalized_by_lead]
+        era5_norm_total = sum(normalized_by_lead[h] for h in available_leads)
+        era5_norm_avg = (era5_norm_total / float(len(available_leads))) if available_leads else 0.0
+
+        # Blend 80/20 with Day1 if available
+        if day1_overall is not None:
+            overall_forecast_score = 0.8 * era5_norm_avg + 0.2 * float(day1_overall)
+        else:
+            overall_forecast_score = era5_norm_avg
+
+        await stats_mgr.update_forecast_stats(
+            run_id=run_id,
+            miner_uid=miner_uid,
+            miner_hotkey=miner_hotkey,
+            status="completed" if len(available_leads) == len(expected_leads) else "era5_scoring",
+            era5_scores={h: normalized_by_lead.get(h) for h in available_leads},
+            avg_rmse=era5_avg_rmse,
+            avg_acc=era5_avg_acc,
+            avg_skill_score=era5_avg_skill,
+            overall_forecast_score=overall_forecast_score,
+        )
+    except Exception as _agg_err:
+        logger.debug(f"[AggFinalScore] Skipped normalized aggregation write due to error: {_agg_err}")
 
     # Log progressive scoring details
     logger.info(
