@@ -3973,7 +3973,53 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         self.initial_scoring_workers = []
         logger.info("Stopped all initial scoring workers")
 
-
+    async def stop_final_scoring_workers(self):
+        """Stop all final scoring workers (multiprocess workers managed by validator)."""
+        if self.node_type != "validator":
+            return
+            
+        if hasattr(self, "validator") and self.validator:
+            # Access the validator's multiprocess workers
+            if hasattr(self.validator, "_weather_worker_processes"):
+                worker_processes = self.validator._weather_worker_processes
+                if worker_processes:
+                    logger.info(f"Stopping {len(worker_processes)} final scoring worker processes...")
+                    
+                    # First try to terminate gracefully
+                    for p in worker_processes:
+                        try:
+                            if p.is_alive():
+                                p.terminate()
+                        except Exception as e:
+                            logger.debug(f"Could not terminate process {p.name}: {e}")
+                    
+                    # Wait for processes to exit gracefully
+                    import time
+                    for p in worker_processes:
+                        try:
+                            p.join(timeout=2)
+                            if not p.is_alive():
+                                logger.debug(f"Process {p.name} terminated gracefully")
+                        except Exception:
+                            pass
+                    
+                    # Force kill any remaining processes
+                    for p in worker_processes:
+                        try:
+                            if p.is_alive():
+                                logger.warning(f"Force killing worker process {p.name} (pid={p.pid})")
+                                p.kill()
+                        except Exception as e:
+                            logger.debug(f"Could not kill process {p.name}: {e}")
+                    
+                    worker_processes.clear()
+                    logger.info("Final scoring worker processes stopped")
+                else:
+                    logger.info("No final scoring worker processes to stop")
+            else:
+                logger.debug("Validator has no _weather_worker_processes attribute")
+        else:
+            logger.debug("No validator reference available for stopping final scoring workers")
 
     async def start_cleanup_workers(self, num_workers=1):
         """Start background workers for cleaning up old data."""

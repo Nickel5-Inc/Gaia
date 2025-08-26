@@ -573,23 +573,19 @@ async def query_miner_for_weather(
                     }
                 )
                 # Update error tracking separately to avoid complex JSONB parameter issues
-                # Use text() with bound parameters to handle JSONB operations
+                # Use text() with parameters passed separately to execute()
                 from sqlalchemy import text
-                query_with_params = text("""
-                    UPDATE miner_stats 
-                    SET common_errors = 
-                        CASE 
-                            WHEN common_errors IS NULL THEN 
-                                jsonb_build_object(:error_type, 1)
-                            WHEN common_errors ? :error_type THEN 
-                                jsonb_set(common_errors, ARRAY[:error_type], 
-                                    to_jsonb(COALESCE((common_errors->>:error_type)::int, 0) + 1))
-                            ELSE 
-                                common_errors || jsonb_build_object(:error_type, 1)
-                        END
+                # Explicitly cast the key parameter to text to avoid ambiguous type errors in Postgres
+                error_query = text("""
+                    UPDATE miner_stats
+                    SET common_errors = COALESCE(common_errors, '{}'::jsonb)
+                        || jsonb_build_object(
+                            CAST(:error_type AS text),
+                            COALESCE((COALESCE(common_errors, '{}'::jsonb)->>CAST(:error_type AS text))::int, 0) + 1
+                        )
                     WHERE miner_uid = (SELECT uid FROM node_table WHERE hotkey = :hotkey LIMIT 1)
-                    """).bindparam(error_type=error_type, hotkey=miner_hotkey)
-                await db_manager.execute(query_with_params)
+                """)
+                await db_manager.execute(error_query, {"error_type": error_type, "hotkey": miner_hotkey})
             except Exception as stats_error:
                 logger.debug(f"Failed to update hosting failure metrics: {stats_error}")
     

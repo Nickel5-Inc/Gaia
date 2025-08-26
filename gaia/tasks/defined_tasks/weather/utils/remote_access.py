@@ -506,13 +506,7 @@ async def open_verified_remote_zarr_dataset(
         f"🔍 ZARR OPEN FULL [{process_name}:{thread_name}] Job {job_id}: "
         f"Attempting VERIFIED open for Zarr: {zarr_store_url}"
     )
-    try:
-        # CODE_MARKER: identify source file and version at runtime to ensure correct code is loaded
-        logger.error(
-            f"CODE_MARKER remote_access v1.3 file={__file__} job={job_id}"
-        )
-    except Exception:
-        pass
+    # removed code marker
 
     if get_trusted_manifest is None or VerifyingChunkMapper is None:
         logger.critical(

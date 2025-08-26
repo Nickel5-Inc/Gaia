@@ -2,6 +2,7 @@ import asyncio
 import traceback
 import gc
 import os
+import sys
 import json
 import time
 from datetime import datetime, timezone, timedelta
@@ -232,10 +233,24 @@ async def evaluate_miner_forecast_day1(
                 headers=storage_options.get("headers"),
                 job_id=f"{job_id}_day1_minrehash",
             )
-            if not ok_min:
-                miner_forecast_ds = None
-            else:
+            if ok_min and preopened_ds is not None:
                 miner_forecast_ds = preopened_ds
+            else:
+                # Strict single-pass fallback: skip minimal verify and attempt strict verified open directly
+                logger.warning(
+                    f"[Day1Score] Minimal verify failed or preopen None (error={min_details.get('error') if isinstance(min_details, dict) else 'unknown'}). "
+                    f"Attempting strict verified open without minimal subset." 
+                )
+                miner_forecast_ds = await asyncio.wait_for(
+                    open_verified_remote_zarr_dataset(
+                        zarr_store_url=zarr_store_url,
+                        claimed_manifest_content_hash=claimed_manifest_content_hash,
+                        miner_hotkey_ss58=miner_hotkey,
+                        storage_options=storage_options,
+                        job_id=f"{job_id}_day1_strict_open",
+                    ),
+                    timeout=verification_timeout_seconds,
+                )
         if miner_forecast_ds is None:
             try:
                 miner_forecast_ds = await asyncio.wait_for(

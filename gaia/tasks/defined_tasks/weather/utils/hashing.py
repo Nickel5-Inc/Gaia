@@ -2,6 +2,7 @@ import hashlib
 import json
 import struct
 from typing import Dict, List, Tuple, Any, Optional, Set, Union
+from collections import OrderedDict
 import numpy as np
 import xarray as xr
 import fsspec
@@ -13,7 +14,7 @@ import asyncio
 from functools import partial
 import traceback
 from .gfs_api import fetch_gfs_analysis_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
-from .remote_access import open_verified_remote_zarr_variable, open_verified_remote_zarr_dataset
+# Removed circular import - moved to inside function where needed
 import xarray as xr
 import pandas as pd
 from gaia.utils.custom_logger import get_logger
@@ -85,6 +86,7 @@ def get_current_memory_usage_mb():
 # Process-local cache to avoid repeated full rehash for the same store+hash
 _rehash_verified_cache: Set[Tuple[str, str]] = set()
 _last_manifest_logs: Dict[str, Dict[str, Any]] = {}
+_trusted_manifest_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
 
 def is_rehash_verified(zarr_store_url: str, claimed_manifest_content_hash: str) -> bool:
@@ -260,13 +262,7 @@ async def verify_minimal_chunks_and_reconstruct_manifest_hash(
     the final content hash equals the claimed hash.
     """
     start_time = time.time()
-    try:
-        # CODE_MARKER: identify source file and version at runtime to ensure correct code is loaded
-        logger.error(
-            f"CODE_MARKER hashing v1.1 file={__file__} job={job_id}"
-        )
-    except Exception:
-        pass
+    # removed code marker
     details: Dict[str, Any] = {
         "job_id": job_id,
         "store": zarr_store_url,
@@ -295,9 +291,40 @@ async def verify_minimal_chunks_and_reconstruct_manifest_hash(
     signer_hotkey = trusted.get("signer_hotkey_ss58")
     files_dict = trusted.get("files", {}) or {}
 
+    # Diagnostics: manifest contents and server metadata presence
+    try:
+        manifest_num_files = len(files_dict)
+        manifest_sample_keys = list(files_dict.keys())[:20]
+        has_zmetadata_in_manifest = ".zmetadata" in files_dict
+        # Check server-side metadata presence
+        import fsspec as _fss
+        protocol = zarr_store_url.rstrip("/").split("://")[0]
+        http_fs_kwargs_diag = {}
+        if headers:
+            http_fs_kwargs_diag["headers"] = headers
+        http_fs_kwargs_diag["ssl"] = False
+        _fs_diag = _fss.filesystem(protocol, **http_fs_kwargs_diag)
+        zroot = zarr_store_url.rstrip("/") + "/"
+        exists_zmetadata = _fs_diag.exists(zroot + ".zmetadata")
+        exists_zgroup = _fs_diag.exists(zroot + ".zgroup")
+        logger.info(
+            f"Job {job_id}: MANIFEST_DIAG files={manifest_num_files} sample_keys={manifest_sample_keys} "
+            f"manifest_has_.zmetadata={has_zmetadata_in_manifest} fs_exists_.zmetadata={exists_zmetadata} fs_exists_.zgroup={exists_zgroup}"
+        )
+        # Add to details for higher-level logging
+        details["manifest_num_files"] = manifest_num_files
+        details["manifest_sample_keys"] = manifest_sample_keys
+        details["manifest_has_zmetadata"] = has_zmetadata_in_manifest
+        details["fs_exists_zmetadata"] = exists_zmetadata
+        details["fs_exists_zgroup"] = exists_zgroup
+    except Exception as diag_err:
+        logger.debug(f"Job {job_id}: Manifest diagnostics failed: {diag_err}")
+
     # Open only requested variables (this sets up an FSMap with verifying mapper; ok since manifest is trusted)
     ds_full = None
     try:
+        # Import here to avoid circular dependency
+        from .remote_access import open_verified_remote_zarr_dataset
         ds_full = await open_verified_remote_zarr_dataset(
             zarr_store_url=zarr_store_url,
             claimed_manifest_content_hash=claimed_manifest_content_hash,
@@ -323,40 +350,10 @@ async def verify_minimal_chunks_and_reconstruct_manifest_hash(
         # If none of the requested variables exist, proceed with manifest-level check only
         vars_present = list(ds_full.data_vars)[:1]  # minimal var to ensure mapper is wired
 
-    # Determine chunk paths to verify by reading minimal slices (load); FSMap will fetch only needed chunks
-    try:
-        # Build selection dicts for minimal reads
-        for var in vars_present:
-            if var not in ds_full:
-                continue
-            da = ds_full[var]
-            # Build indexer: select requested times/levels and a small lat/lon window
-            indexer = {}
-            if "time" in da.dims and times:
-                # Use nearest on provided timestamps
-                indexer["time"] = times
-            if levels is not None:
-                # Attempt to map to existing level dim
-                for lvl_dim in ("pressure_level", "plev", "level", "isobaricInhPa"):
-                    if lvl_dim in da.dims:
-                        indexer[lvl_dim] = levels
-                        break
-            # For spatial dims, limit to a small window to minimize chunks
-            for d in ("lat", "latitude"):
-                if d in da.dims:
-                    size = da.sizes[d]
-                    indexer[d] = list({0, size // 2, max(0, size - 1)})
-                    break
-            for d in ("lon", "longitude"):
-                if d in da.dims:
-                    size = da.sizes[d]
-                    indexer[d] = list({0, size // 2, max(0, size - 1)})
-                    break
-            # Trigger loads (this will read only needed chunks)
-            _ = da.sel(**{k: v for k, v in indexer.items() if k in da.dims}, method="nearest").load()
-    finally:
-        # Keep dataset open for reuse by caller
-        pass
+    # IMPORTANT: Do not eagerly read any chunks here. We rely on on-read verification via
+    # VerifyingChunkMapper during scoring to validate chunks that are actually accessed.
+    # This avoids prefetching across many variables and drastically reduces remote requests.
+    details["verification_mode"] = "on_read_only"
 
     # At this point, the verifying mapper has checked fetched chunks. Reconstruct manifest content hash
     # using the original trusted manifest files (we rely on the verifying mapper for subset integrity).
@@ -370,7 +367,8 @@ async def verify_minimal_chunks_and_reconstruct_manifest_hash(
     manifest_json_bytes = json.dumps(manifest_to_hash, sort_keys=True, indent=4).encode("utf-8")
     recomputed_content_hash = hashlib.sha256(manifest_json_bytes).hexdigest()
     details["recomputed_content_hash"] = recomputed_content_hash
-    details["verified_subset_files"] = len(files_dict)
+    # No subset reads performed; verification happens on-read during scoring
+    details["verified_subset_files"] = 0
     details["duration_seconds"] = time.time() - start_time
     if recomputed_content_hash != claimed_manifest_content_hash:
         details["error"] = "content_hash_mismatch"
@@ -1706,6 +1704,9 @@ class VerifyingChunkMapper(fsspec.mapping.FSMap):
             logger.warning(
                 f"Job {self.job_id_for_logging}: VerifyingChunkMapper initialized with empty manifest file list."
             )
+        # Small LRU cache to avoid duplicate remote fetches of hot chunks
+        self._chunk_cache: "OrderedDict[str, bytes]" = OrderedDict()
+        self._chunk_cache_max_entries: int = 512
 
     def _hash_chunk(self, key: str, content_bytes: bytes) -> str:
         path_plus_content = key.encode("utf-8") + b"\0" + content_bytes
@@ -1729,7 +1730,27 @@ class VerifyingChunkMapper(fsspec.mapping.FSMap):
         request_msg = f"🌐 ZARR REQUEST [{process_name}:{thread_name}] Job {self.job_id_for_logging}: Requesting chunk '{key}'"
         logger.info(request_msg)
         print(f"DEBUG ZARR: {request_msg}", flush=True)  # Immediate output for testing
-        
+        # LRU cache check
+        if key in self._chunk_cache:
+            content = self._chunk_cache.pop(key)
+            self._chunk_cache[key] = content
+            expected_hash = self.trusted_manifest_files.get(key)
+            if expected_hash is not None:
+                computed_hash = self._hash_chunk(key, content)
+                if computed_hash != expected_hash:
+                    msg = (
+                        f"CHUNK INTEGRITY FAIL Job {self.job_id_for_logging}: For cached chunk '{key}'. "
+                        f"Expected: {expected_hash}, Computed: {computed_hash}"
+                    )
+                    logger.error(msg)
+                    # Drop bad cache and fall through to fetch
+                    self._chunk_cache.pop(key, None)
+                else:
+                    logger.debug(
+                        f"Job {self.job_id_for_logging}: Served '{key}' from cache with verified integrity"
+                    )
+                    return content
+
         chunk_content_bytes = super().__getitem__(key)
         expected_hash = self.trusted_manifest_files.get(key)
         if expected_hash is None:
@@ -1752,6 +1773,13 @@ class VerifyingChunkMapper(fsspec.mapping.FSMap):
         logger.debug(
             f"Job {self.job_id_for_logging}: Chunk integrity PASSED for '{key}'"
         )
+        # Insert into LRU cache
+        try:
+            self._chunk_cache[key] = chunk_content_bytes
+            if len(self._chunk_cache) > self._chunk_cache_max_entries:
+                self._chunk_cache.popitem(last=False)
+        except Exception:
+            pass
         return chunk_content_bytes
 
 
