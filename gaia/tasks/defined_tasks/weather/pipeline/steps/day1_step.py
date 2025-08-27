@@ -61,7 +61,6 @@ async def _load_inputs(db, task: WeatherTask, *, run_id: int, miner_uid: int, mi
         fetch_gfs_data,
     )
     from pathlib import Path
-    from datetime import timedelta
     cache_dir = Path(task.config.get("gfs_analysis_cache_dir", "./gfs_analysis_cache"))
     
     # day1 uses initial scoring leads
@@ -498,7 +497,6 @@ async def run_item(
                     "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :rid",
                     {"rid": run_id},
                 )
-                from datetime import timedelta
                 delay_days = int(getattr(task.config, "era5_delay_days", task.config.get("era5_delay_days", 5))) if hasattr(task, "config") else 5
                 buffer_hours = int(getattr(task.config, "era5_buffer_hours", task.config.get("era5_buffer_hours", 6))) if hasattr(task, "config") else 6
                 next_ready_time = None
@@ -552,7 +550,7 @@ async def run_item(
             await cleanup_clim_cache_if_done(db, task, run_id=run_id)
         except Exception:
             pass
-    except Exception:
+    except Exception as e:
         try:
             from gaia.tasks.defined_tasks.weather.pipeline.retry_policy import next_retry_time as _nrt
             nrt = _nrt("day1", 1)
@@ -563,7 +561,11 @@ async def run_item(
                 miner_hotkey=miner_hotkey,
                 step_name="day1",
                 substep="score",
-                error_json={"type": "day1_unknown", "message": "exception during scoring"},
+                error_json={
+                    "type": "day1_unknown",
+                    "message": str(e),
+                    "exception_type": type(e).__name__,
+                },
                 retry_count=1,
                 next_retry_time=nrt,
             )
