@@ -623,13 +623,16 @@ async def evaluate_miner_forecast_day1(
                 f"[Day1Score] Miner {miner_hotkey}: Time step {effective_lead_h}h contributed {len(timestep_skill_scores)} skill scores and {len(timestep_acc_scores)} ACC scores"
             )
 
-        # CRITICAL ABC MEMORY LEAK FIX: Clean up async task references after result processing
+        # Cleanup: ensure references are dropped and GC runs
         try:
-            for _, task in timestep_tasks:
-                if not task.done():
-                    task.cancel()
-            del timestep_tasks, tasks_only, timestep_results
-            # Force immediate cleanup of completed task objects
+            try:
+                del tasks_only
+            except Exception:
+                pass
+            try:
+                del timestep_results
+            except Exception:
+                pass
             collected = gc.collect()
             logger.debug(
                 f"[Day1Score] Miner {miner_hotkey}: Post-processing cleanup collected {collected} objects"
