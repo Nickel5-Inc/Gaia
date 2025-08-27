@@ -2546,8 +2546,30 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         final_weather_scores_for_table = np.clip(
             proportional_weather_scores + miner_bonuses_applied, 0.0, 1.1
         )
-        logger.info(
-            f"[CombinedWeatherScore] Applied bonuses. Max combined score: {np.max(final_weather_scores_for_table):.4f}"
+        nz_mask_cw = final_weather_scores_for_table > 0
+        if np.any(nz_mask_cw):
+            nz_vals_cw = final_weather_scores_for_table[nz_mask_cw]
+            logger.info(
+                f"[CombinedWeatherScore] Applied bonuses. Combined summary: nonzero={nz_vals_cw.size}, min>0={np.min(nz_vals_cw):.6f}, max>0={np.max(nz_vals_cw):.6f}, mean>0={np.mean(nz_vals_cw):.6f}"
+            )
+            try:
+                top_idx_cw = np.argsort(-final_weather_scores_for_table)[:10]
+                top_pairs_cw = [
+                    (int(i), float(final_weather_scores_for_table[i]))
+                    for i in top_idx_cw
+                    if final_weather_scores_for_table[i] > 0
+                ]
+                logger.info(
+                    f"[CombinedWeatherScore] Top combined scores (uid,score): {top_pairs_cw}"
+                )
+            except Exception:
+                pass
+        else:
+            logger.warning(
+                "[CombinedWeatherScore] All combined scores are zero after bonuses"
+            )
+        logger.debug(
+            f"[CombinedWeatherScore] Combined score array: {np.array2string(final_weather_scores_for_table, precision=6, separator=',')}"
         )
 
         mock_evaluation_results = []
@@ -2563,31 +2585,43 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         # (has_era5_scores and has_day1_scores calculated earlier before array cleanup)
 
         if run_id_trigger:
-            # If triggered by a specific run, use run-specific naming
-            if has_era5_scores:
-                # If we have ERA5 scores, this run has completed final scoring
-                id_for_combined_row = f"final_weather_scores_{run_id_trigger}"
-                logger.info(
-                    f"[CombinedWeatherScore] Creating final weather scores for run {run_id_trigger}"
+            # Single-row per run: keep one task_id per run and update it across stages
+            # Task ID format: weather_scores_{run_id}_{GFSInit}
+            try:
+                run_info_row = await self.db_manager.fetch_one(
+                    "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :rid",
+                    {"rid": run_id_trigger},
                 )
-            else:
-                # Only day1 scores available, this is initial scoring
-                id_for_combined_row = f"initial_weather_scores_{run_id_trigger}"
-                logger.info(
-                    f"[CombinedWeatherScore] Creating initial weather scores for run {run_id_trigger}"
-                )
+                if run_info_row and run_info_row.get("gfs_init_time_utc"):
+                    gfs_dt = run_info_row["gfs_init_time_utc"].astimezone(timezone.utc)
+                    gfs_str = gfs_dt.strftime("%Y%m%dT%H%MZ")
+                else:
+                    gfs_str = "unknown"
+            except Exception:
+                gfs_str = "unknown"
+
+            id_for_combined_row = f"weather_scores_{run_id_trigger}_{gfs_str}"
+            combined_status = (
+                "final_scores_compiled" if has_era5_scores else "initial_scores_compiled"
+            )
+            logger.info(
+                f"[CombinedWeatherScore] Writing {combined_status} for run {run_id_trigger} (single-row per run): {id_for_combined_row}"
+            )
         else:
             # Periodic/manual call - use generic naming for overall system state
             if has_era5_scores:
                 id_for_combined_row = "final_weather_scores"
+                combined_status = "final_scores_compiled"
             else:
                 id_for_combined_row = "initial_weather_scores"
+                combined_status = "initial_scores_compiled"
             logger.info(
                 f"[CombinedWeatherScore] Creating combined weather scores (periodic): {id_for_combined_row}"
             )
 
         timestamp_for_combined_score_row = datetime.now(timezone.utc)
 
+        # Override status to reflect stage
         await self.build_score_row(
             run_id=id_for_combined_row,
             gfs_init_time=timestamp_for_combined_score_row,
@@ -2595,28 +2629,18 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             task_name_prefix="weather",
         )
 
-        # Cleanup: If we just created a final score row for a specific run, remove the corresponding initial row
-        if (
-            run_id_trigger
-            and has_era5_scores
-            and id_for_combined_row.startswith("final_weather_scores_")
-        ):
-            initial_row_id = f"initial_weather_scores_{run_id_trigger}"
-            try:
-                cleanup_query = """
-                DELETE FROM score_table 
-                WHERE task_name = 'weather' AND task_id = :initial_task_id
+        # Update status on the freshly written row to reflect stage
+        try:
+            await self.db_manager.execute(
                 """
-                await self.db_manager.execute(
-                    cleanup_query, {"initial_task_id": initial_row_id}
-                )
-                logger.info(
-                    f"[CombinedWeatherScore] Cleaned up initial score row: {initial_row_id}"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[CombinedWeatherScore] Failed to cleanup initial score row {initial_row_id}: {e}"
-                )
+                UPDATE score_table
+                SET status = :combined_status, created_at = :ts
+                WHERE task_name = 'weather' AND task_id = :tid
+                """,
+                {"combined_status": combined_status, "ts": timestamp_for_combined_score_row, "tid": id_for_combined_row},
+            )
+        except Exception:
+            pass
 
         logger.info(
             f"[CombinedWeatherScore] Update completed for 'weather' (task_id: {id_for_combined_row})."

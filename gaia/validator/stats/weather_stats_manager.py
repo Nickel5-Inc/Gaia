@@ -313,7 +313,13 @@ class WeatherStatsManager:
                 )
                 SELECT
                     wfs.miner_uid,
-                    wfs.miner_hotkey,
+                    (
+                      SELECT w2.miner_hotkey
+                      FROM weather_forecast_stats w2
+                      WHERE w2.miner_uid = wfs.miner_uid
+                      ORDER BY w2.updated_at DESC NULLS LAST
+                      LIMIT 1
+                    ) AS miner_hotkey,
                     MAX(wfs.miner_rank) AS miner_rank,
                     AVG(wfs.era5_combined_score) AS avg_forecast_score,
                     SUM(CASE WHEN wfs.forecast_status = 'completed' THEN 1 ELSE 0 END) AS successful_forecasts,
@@ -351,7 +357,7 @@ class WeatherStatsManager:
                     NOW() AT TIME ZONE 'UTC' AS updated_at
                 FROM weather_forecast_stats wfs
                 {where_clause}
-                GROUP BY wfs.miner_uid, wfs.miner_hotkey
+                GROUP BY wfs.miner_uid
                 ON CONFLICT (miner_uid) DO UPDATE SET
                     miner_hotkey = EXCLUDED.miner_hotkey,
                     miner_rank = EXCLUDED.miner_rank,

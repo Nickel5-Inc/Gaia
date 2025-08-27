@@ -146,7 +146,21 @@ class FiberWeightSetter:
                     logger.warning("UID 252 not found in node_ids, using zero weights")
             return fallback_weights, node_ids
 
-        logger.info(f"Raw computed weights before normalization: {weights}")
+        # Summarize input weights prior to normalization
+        try:
+            arr_in = np.array(weights, dtype=float)
+            nz_in = arr_in[arr_in > 0]
+            if nz_in.size > 0:
+                logger.info(
+                    f"Input weights summary: nonzero={nz_in.size}, min>0={nz_in.min():.6f}, max>0={nz_in.max():.6f}, mean>0={nz_in.mean():.6f}"
+                )
+                top_idx_in = np.argsort(-arr_in)[:10]
+                top_pairs_in = [(int(i), float(arr_in[i])) for i in top_idx_in if arr_in[i] > 0]
+                logger.debug(f"Top input weights (uid,weight): {top_pairs_in}")
+            else:
+                logger.warning("All input weights are zero before chain alignment; fallback likely")
+        except Exception:
+            pass
 
         weights_tensor /= weights_tensor.sum()
         warning_threshold = 0.5  # Warn if any node exceeds 50% of total weight

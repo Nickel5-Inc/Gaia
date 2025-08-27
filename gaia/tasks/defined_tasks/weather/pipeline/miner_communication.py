@@ -22,8 +22,8 @@ from cryptography.fernet import Fernet
 from gaia.utils.custom_logger import get_logger
 logger = get_logger(__name__)
 
-# Cache duration for symmetric keys (24 hours by default)
-SYMMETRIC_KEY_CACHE_HOURS = 24
+# Cache duration for symmetric keys (2 hours)
+SYMMETRIC_KEY_CACHE_HOURS = 2
 
 async def _get_cached_symmetric_key(db, miner_uid: int) -> Optional[Dict[str, Any]]:
     """
@@ -46,10 +46,14 @@ async def _get_cached_symmetric_key(db, miner_uid: int) -> Optional[Dict[str, An
         
         if result and result["fiber_symmetric_key"]:
             age = datetime.now(timezone.utc) - result["fiber_key_cached_at"]
+            age_minutes = age.total_seconds() / 60
+            # Enforce proactive refresh: if older than ~120 minutes, pretend cache miss
+            if age_minutes >= 120:
+                return None
             return {
                 "key": result["fiber_symmetric_key"],
                 "uuid": result["fiber_symmetric_key_uuid"],
-                "age_minutes": age.total_seconds() / 60
+                "age_minutes": age_minutes
             }
     except Exception as e:
         logger.warning(f"Error checking cached symmetric key: {e}")
@@ -313,7 +317,21 @@ async def query_single_miner(
                         logger.error(f"❌ Step 3 failed: Encrypted request to {miner_hotkey[:8]} failed after {request_time:.2f}s: {e}")
                         raise
                     
-                    # Parse response
+                    status_code = getattr(response, 'status_code', None)
+                    # Treat non-2xx as failure
+                    if not (isinstance(status_code, int) and 200 <= status_code < 300):
+                        text_msg = None
+                        try:
+                            text_msg = getattr(response, 'text', None)
+                        except Exception:
+                            text_msg = None
+                        return {
+                            "success": False,
+                            "error": f"HTTP {status_code}: {text_msg or 'non-2xx response'}",
+                            "miner_uid": miner_uid,
+                        }
+
+                    # Parse response (2xx)
                     if response and hasattr(response, 'content'):
                         try:
                             data = json.loads(response.content)
@@ -321,13 +339,13 @@ async def query_single_miner(
                             data = {"raw": response.content.decode('utf-8', errors='ignore')}
                     else:
                         data = {}
-                    
+
                     logger.info(
                         f"✅ Success from {miner_hotkey[:8]} (UID {miner_uid})"
                         f"\n  Time: {request_time:.2f}s"
                         f"\n  Response keys: {list(data.keys()) if isinstance(data, dict) else 'non-dict'}"
                     )
-                    
+
                     return {
                         "success": True,
                         "data": data,
@@ -384,7 +402,112 @@ async def query_single_miner(
                         logger.warning(f"🗑️ Invalidated cached key for {miner_hotkey[:8]} due to request failure")
                         raise
                     
-                    # Parse response
+                    status_code = getattr(response, 'status_code', None)
+                    # If non-2xx with cached key, optionally retry with fresh handshake on known key-missing errors
+                    if not (isinstance(status_code, int) and 200 <= status_code < 300):
+                        response_text = None
+                        try:
+                            response_text = getattr(response, 'text', None)
+                        except Exception:
+                            response_text = None
+
+                        # Detect key mismatch/expired on miner side
+                        needs_rehandshake = bool(
+                            status_code in (400, 401, 403) and response_text and "No symmetric key found" in response_text
+                        )
+
+                        if needs_rehandshake:
+                            logger.info(f"🔄 Cached key rejected by {miner_hotkey[:8]} (HTTP {status_code}). Re-handshaking and retrying once.")
+                            await _invalidate_cached_key(db, miner_uid)
+
+                            # Perform handshake
+                            try:
+                                pubkey = await handshake.get_public_encryption_key(
+                                    client,
+                                    server_address,
+                                    timeout=int(timeout),
+                                )
+                                new_key: bytes = os.urandom(32)
+                                new_uuid = os.urandom(32).hex()
+                                hs_ok = await handshake.send_symmetric_key_to_server(
+                                    client,
+                                    server_address,
+                                    validator_keypair,
+                                    pubkey,
+                                    new_key,
+                                    new_uuid,
+                                    miner_hotkey,
+                                    timeout=int(timeout),
+                                )
+                                if not hs_ok:
+                                    return {
+                                        "success": False,
+                                        "error": "Handshake retry failed",
+                                        "miner_uid": miner_uid,
+                                    }
+                                await _cache_symmetric_key(db, miner_uid, new_key, new_uuid)
+                                fernet_retry = Fernet(base64.b64encode(new_key).decode())
+                                # Retry the request once
+                                retry_start = time.time()
+                                response = await vali_client.make_non_streamed_post(
+                                    httpx_client=client,
+                                    server_address=server_address,
+                                    fernet=fernet_retry,
+                                    keypair=validator_keypair,
+                                    symmetric_key_uuid=new_uuid,
+                                    validator_ss58_address=validator_keypair.ss58_address,
+                                    miner_ss58_address=miner_hotkey,
+                                    payload=payload,
+                                    endpoint=endpoint,
+                                )
+                                request_time = time.time() - retry_start
+                                retry_code = getattr(response, 'status_code', None)
+                                if not (isinstance(retry_code, int) and 200 <= retry_code < 300):
+                                    txt = None
+                                    try:
+                                        txt = getattr(response, 'text', None)
+                                    except Exception:
+                                        txt = None
+                                    return {
+                                        "success": False,
+                                        "error": f"Retry HTTP {retry_code}: {txt or 'non-2xx'}",
+                                        "miner_uid": miner_uid,
+                                    }
+                                # Success on retry
+                                if response and hasattr(response, 'content'):
+                                    try:
+                                        data = json.loads(response.content)
+                                    except json.JSONDecodeError:
+                                        data = {"raw": response.content.decode('utf-8', errors='ignore')}
+                                else:
+                                    data = {}
+                                logger.info(
+                                    f"✅ Success from {miner_hotkey[:8]} (UID {miner_uid}) after re-handshake"
+                                    f"\n  Time: {request_time:.2f}s"
+                                    f"\n  Response keys: {list(data.keys()) if isinstance(data, dict) else 'non-dict'}"
+                                )
+                                return {
+                                    "success": True,
+                                    "data": data,
+                                    "miner_uid": miner_uid,
+                                    "response_time": request_time,
+                                    "response_time_ms": int(request_time * 1000),
+                                }
+                            except Exception as e:
+                                return {
+                                    "success": False,
+                                    "error": f"Handshake retry exception: {e}",
+                                    "miner_uid": miner_uid,
+                                }
+
+                        # Non-2xx without key-mismatch: return failure
+                        return {
+                            "success": False,
+                            "error": f"HTTP {status_code}: {response_text or 'non-2xx response'}",
+                            "miner_uid": miner_uid,
+                        }
+
+                    # Parse response (2xx)
                     if response and hasattr(response, 'content'):
                         try:
                             data = json.loads(response.content)

@@ -28,7 +28,9 @@ from .util_time import get_effective_gfs_init
 
 class DataNotReadyError(Exception):
     """Exception raised when ERA5 data is not yet available for scoring."""
-    pass
+    def __init__(self, message: str, next_ready_at: Optional[datetime] = None):
+        super().__init__(message)
+        self.next_ready_at = next_ready_at
 
 
 # Lightweight in-process cache for ERA5 truth per (run_id, leads)
@@ -92,7 +94,17 @@ async def run_item(
     validator: Optional[Any] = None,
 ) -> bool:
     """Process ERA5 for a specific miner/run item (used by generic queue dispatcher)."""
-    task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+    # Reuse a single WeatherTask per worker via validator-carried singleton
+    task = None
+    if validator is not None:
+        task = getattr(validator, "weather_task_singleton", None)
+    if task is None:
+        task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+        if validator is not None:
+            try:
+                setattr(validator, "weather_task_singleton", task)
+            except Exception:
+                pass
     if validator is not None:
         setattr(task, "validator", validator)
     # Pull response details
@@ -202,7 +214,10 @@ async def run_item(
             f"Next lead ready in {hours_until_ready:.1f} hours at {next_ready_time}"
         )
         # Return a special exception to indicate data not ready (not a failure)
-        raise DataNotReadyError(f"ERA5 data not ready for {hours_until_ready:.1f} hours")
+        raise DataNotReadyError(
+            f"ERA5 data not ready for {hours_until_ready:.1f} hours",
+            next_ready_at=next_ready_time,
+        )
     logger.info(f"[ERA5] Run {run_id} Miner {miner_uid}: Progressive scoring {len(ready_days)} days with {len(ready_leads)} lead times: {ready_leads}")
     
     # Load truth/climatology for only the ready leads (one day at a time)
@@ -317,6 +332,25 @@ async def run_item(
             substep="score",
             latency_ms=latency_ms,
         )
+        # NEW: Update combined final score row in score_table when ERA5 is computed
+        try:
+            combined_task = getattr(validator, "weather_task_singleton", None)
+            if combined_task is None:
+                combined_task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+                try:
+                    setattr(validator, "weather_task_singleton", combined_task)
+                except Exception:
+                    pass
+            await combined_task.update_combined_weather_scores(
+                run_id_trigger=run_id, force_phase="final"
+            )
+            logger.info(
+                f"[ERA5Step] Updated score_table final row for run {run_id}"
+            )
+        except Exception as e_comb:
+            logger.warning(
+                f"[ERA5Step] Failed to update combined final score row for run {run_id}: {e_comb}"
+            )
     except Exception:
         pass
     return True

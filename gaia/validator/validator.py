@@ -4867,8 +4867,27 @@ class GaiaValidator:
                     else:
                         weather_scores[uid] = scores[uid]
                         weather_counts[uid] += scores[uid] != 0.0
-                logger.info(
-                    f"Weather scores: {sum(1 for s in weather_scores if s == 0.0)} UIDs have zero score"
+                zeros_count = int(np.sum(weather_scores == 0.0))
+                nonzero_mask_ws = weather_scores > 0
+                nonzero_count_ws = int(np.sum(nonzero_mask_ws))
+                if nonzero_count_ws > 0:
+                    nz_vals_ws = weather_scores[nonzero_mask_ws]
+                    logger.info(
+                        f"Weather score summary: nonzero={nonzero_count_ws}, min>0={np.min(nz_vals_ws):.6f}, max>0={np.max(nz_vals_ws):.6f}, mean>0={np.mean(nz_vals_ws):.6f}, zeros={zeros_count}"
+                    )
+                    # Top-10 UIDs by weather score
+                    try:
+                        top_indices_ws = np.argsort(-weather_scores)[:10]
+                        top_pairs_ws = [(int(i), float(weather_scores[i])) for i in top_indices_ws if weather_scores[i] > 0]
+                        logger.info(f"Top weather scores (uid,score): {top_pairs_ws}")
+                    except Exception:
+                        pass
+                else:
+                    logger.warning(
+                        f"All weather scores are zero for latest row (zeros={zeros_count})."
+                    )
+                logger.debug(
+                    f"Weather scores array: {np.array2string(weather_scores, precision=6, separator=',')}"
                 )
 
             # Geomagnetic task disabled
@@ -4941,6 +4960,7 @@ class GaiaValidator:
             # === NEW: Capture pathway tracking data for miner performance stats ===
             pathway_tracking = {}  # UID -> pathway details
 
+            ip_zeroed_count = 0
             for idx in range(256):
                 # Get weather score for this miner
                 w_s = weather_scores[idx]
@@ -4963,6 +4983,7 @@ class GaiaValidator:
                             f"UID {idx} has no valid IP ({ip}) - setting weight to 0"
                         )
                         weights_final[idx] = 0.0
+                        ip_zeroed_count += 1
                         continue
 
                 # With weather-only, we use the weather score directly (no multi-task pathways needed)
@@ -5022,6 +5043,28 @@ class GaiaValidator:
                         f"final={weights_final[idx]:.4f}"
                     )
 
+            # Summarize pre-consensus weights
+            nonzero_mask_wf = weights_final > 0.0
+            nonzero_count_wf = int(np.sum(nonzero_mask_wf))
+            if ip_zeroed_count > 0:
+                logger.info(f"Weights pre-consensus: {ip_zeroed_count} UIDs zeroed due to invalid IPs")
+            if nonzero_count_wf > 0:
+                nz_vals_wf = weights_final[nonzero_mask_wf]
+                logger.info(
+                    f"Weights pre-consensus summary: nonzero={nonzero_count_wf}, min>0={np.min(nz_vals_wf):.6f}, max>0={np.max(nz_vals_wf):.6f}, mean>0={np.mean(nz_vals_wf):.6f}"
+                )
+                try:
+                    top_indices_wf = np.argsort(-weights_final)[:10]
+                    top_pairs_wf = [(int(i), float(weights_final[i])) for i in top_indices_wf if weights_final[i] > 0]
+                    logger.info(f"Top weights pre-consensus (uid,weight): {top_pairs_wf}")
+                except Exception:
+                    pass
+            else:
+                logger.warning("All pre-consensus weights are zero before normalization/consensus adjustments")
+            logger.debug(
+                f"Weights pre-consensus array: {np.array2string(weights_final, precision=6, separator=',')}"
+            )
+
             # Log pathway usage statistics (weather-only)
             total_excellence = sum(excellence_count.values())
             logger.info(
@@ -5039,6 +5082,26 @@ class GaiaValidator:
             _cm = _il.import_module("gaia.utils.consensus_metrics")
             weights_final = getattr(_cm, _b64.b64decode(_fn_enc).decode())(
                 weights_final, validator_nodes_by_uid_list, logger
+            )
+
+            # Post-consensus summary
+            nonzero_mask_post = weights_final > 0.0
+            nonzero_count_post = int(np.sum(nonzero_mask_post))
+            if nonzero_count_post > 0:
+                nz_vals_post = weights_final[nonzero_mask_post]
+                logger.info(
+                    f"Weights post-consensus summary: nonzero={nonzero_count_post}, min>0={np.min(nz_vals_post):.6f}, max>0={np.max(nz_vals_post):.6f}, mean>0={np.mean(nz_vals_post):.6f}"
+                )
+                try:
+                    top_indices_post = np.argsort(-weights_final)[:10]
+                    top_pairs_post = [(int(i), float(weights_final[i])) for i in top_indices_post if weights_final[i] > 0]
+                    logger.info(f"Top weights post-consensus (uid,weight): {top_pairs_post}")
+                except Exception:
+                    pass
+            else:
+                logger.warning("All post-consensus weights are zero.")
+            logger.debug(
+                f"Weights post-consensus array: {np.array2string(weights_final, precision=6, separator=',')}"
             )
 
             non_zero_mask = weights_final != 0.0
@@ -5211,14 +5274,13 @@ class GaiaValidator:
             FROM score_table 
             WHERE task_name = 'weather' AND created_at >= :weather_start_time 
             AND (
+                task_id LIKE 'weather_scores_%' OR
                 task_id LIKE 'final_weather_scores%' OR 
-                task_id LIKE 'initial_weather_scores%' OR
-                task_id = 'final_weather_scores' OR
-                task_id = 'initial_weather_scores'
+                task_id LIKE 'initial_weather_scores%'
             )
             ORDER BY 
                 CASE 
-                    WHEN task_id LIKE 'final_weather_scores%' OR task_id = 'final_weather_scores' THEN 0 
+                    WHEN task_id LIKE 'weather_scores_%' THEN 0 
                     ELSE 1 
                 END,
                 created_at DESC 

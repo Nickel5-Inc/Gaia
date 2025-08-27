@@ -91,6 +91,22 @@ class AutoSyncManager:
                 "backup_buffer_minutes": 5,  # Wait 5 minutes after backup time
                 "sync_minute": None,  # No specific minute in test mode
             }
+        else:
+            # Production defaults (non-test mode) so setup() and fallback schedulers have config early
+            self.backup_schedule = {
+                "full_backup_time": "08:30",  # Daily at 8:30 AM UTC
+                "diff_backup_interval": 1,  # Every 1 hour
+                "diff_backup_minute": 24,  # At 24 minutes past the hour
+                "check_interval": 60,  # Every hour
+                "health_check_interval": 300,  # Every 5 minutes
+            }
+            # Replica schedule for production mode
+            self.replica_schedule = {
+                "sync_interval": 1,  # Every hour (align with primary diff backups)
+                "backup_buffer_minutes": 15,  # Wait 15 minutes after backup completes
+                "sync_minute": 39,  # Download at :39 (24 + 15 minute buffer)
+                "estimated_backup_duration": 5,  # Estimated 5 minutes for diff backup
+            }
 
     async def _acquire_pause_lock(self) -> None:
         """Acquire an exclusive advisory lock to pause app DB operations."""
