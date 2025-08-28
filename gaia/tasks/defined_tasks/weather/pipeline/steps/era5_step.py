@@ -57,18 +57,40 @@ async def _get_era5_truth(task: WeatherTask, run_id: int, gfs_init, leads: list[
     ds = None
     try:
         cache_dir_str = task.config.get("era5_cache_dir", "./era5_cache")
-        
-        # Use progressive fetch for consistency with finalize worker and better caching
-        use_progressive_fetch = task.config.get("progressive_era5_fetch", True)
-        if use_progressive_fetch:
-            from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data_progressive
-            ds = await fetch_era5_data_progressive(
-                target_datetimes, cache_dir=Path(cache_dir_str)
-            )
+        # Only the lock holder performs the heavy fetch; others back off
+        if have_lock:
+            # Use progressive fetch for consistency with finalize worker and better caching
+            use_progressive_fetch = task.config.get("progressive_era5_fetch", True)
+            if use_progressive_fetch:
+                from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data_progressive
+                ds = await fetch_era5_data_progressive(
+                    target_datetimes, cache_dir=Path(cache_dir_str)
+                )
+            else:
+                ds = await fetch_era5_data(
+                    target_datetimes, cache_dir=Path(cache_dir_str)
+                )
         else:
-            ds = await fetch_era5_data(
-                target_datetimes, cache_dir=Path(cache_dir_str)
-            )
+            # Non-lock holders should not hit the ERA5 API. Optionally wait briefly, then return None.
+            guard_wait_seconds = int(task.config.get("era5_guard_wait_seconds", 900))
+            try:
+                await asyncio.sleep(max(1, guard_wait_seconds))
+            except Exception:
+                pass
+            # Opportunistic cache read after wait (will be fast if lock holder saved files)
+            try:
+                use_progressive_fetch = task.config.get("progressive_era5_fetch", True)
+                if use_progressive_fetch:
+                    from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data_progressive
+                    ds = await fetch_era5_data_progressive(
+                        target_datetimes, cache_dir=Path(cache_dir_str)
+                    )
+                else:
+                    ds = await fetch_era5_data(
+                        target_datetimes, cache_dir=Path(cache_dir_str)
+                    )
+            except Exception:
+                ds = None
     finally:
         if have_lock:
             try:
@@ -224,7 +246,10 @@ async def run_item(
     truth = await _get_era5_truth(task, run_id, gfs_init, ready_leads)
     clim = await task._get_or_load_era5_climatology()
     if not truth or not clim:
-        return False
+        # Signal data-not-ready so the worker schedules a long backoff instead of tight retries
+        backoff_hours = int(getattr(task.config, "era5_retry_backoff_hours", task.config.get("era5_retry_backoff_hours", 6))) if hasattr(task, "config") else 6
+        next_ready_time = datetime.now(timezone.utc) + timedelta(hours=max(1, backoff_hours))
+        raise DataNotReadyError("ERA5 truth/climatology not ready", next_ready_at=next_ready_time)
     miner_record = {
         "id": resp["id"],
         "miner_hotkey": miner_hotkey,

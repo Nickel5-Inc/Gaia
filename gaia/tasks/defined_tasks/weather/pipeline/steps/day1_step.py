@@ -530,7 +530,7 @@ async def run_item(
                 truth_key = f"era5_truth_guard_run_{run_id}"
                 _ = await db.enqueue_singleton_job(
                     singleton_key=truth_key,
-                    job_type="weather.era5_truth_guard",
+                    job_type="era5.era5_truth_guard",
                     payload={
                         "run_id": run_id,
                     },

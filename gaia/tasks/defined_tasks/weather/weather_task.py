@@ -210,6 +210,10 @@ def _load_config(self):
     config["era5_retry_backoff_hours"] = int(
         os.getenv("WEATHER_ERA5_RETRY_BACKOFF_HOURS", "6")
     )  # Don't retry failed dates for 6 hours
+    # Wait time for non-lock-holder workers when ERA5 truth fetch is guarded
+    config["era5_guard_wait_seconds"] = int(
+        os.getenv("WEATHER_ERA5_GUARD_WAIT_SECONDS", "900")
+    )
     config["cleanup_check_interval_seconds"] = int(
         os.getenv("WEATHER_CLEANUP_INTERVAL_S", "21600")
     )  # 6 hours
