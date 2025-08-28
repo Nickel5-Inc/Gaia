@@ -338,6 +338,29 @@ class FiberWeightSetter:
             # Set weights using standard fiber function (with timeout)
             try:
                 logger.info(f"Setting weights for {len(self.nodes)} nodes")
+                # Log the exact array and ordering submitted to the chain
+                weights_list = calculated_weights.tolist()
+                try:
+                    arr = np.array(weights_list, dtype=float)
+                    nz = arr[arr > 0]
+                    if nz.size > 0:
+                        logger.info(
+                            f"Submitting weights summary: nonzero={nz.size}, min>0={nz.min():.6f}, max>0={nz.max():.6f}, mean>0={nz.mean():.6f}"
+                        )
+                        top_idx = np.argsort(-arr)[:10]
+                        top_pairs = [(int(self.nodes[i].node_id), float(arr[i])) for i in top_idx if arr[i] > 0]
+                        logger.info(f"Top submitted weights (uid,weight): {top_pairs}")
+                    else:
+                        logger.warning("All submitted weights are zero")
+                except Exception:
+                    pass
+                # Debug: full arrays being sent to fiber
+                try:
+                    debug_node_ids = [node.node_id for node in self.nodes]
+                    logger.debug(f"Submitted node_ids order: {debug_node_ids}")
+                    logger.debug(f"Submitted weights array: {weights_list}")
+                except Exception:
+                    pass
                 await asyncio.wait_for(
                     self._async_set_node_weights(
                         substrate=self.substrate,
@@ -374,6 +397,32 @@ class FiberWeightSetter:
 
     async def _async_set_node_weights(self, **kwargs):
         """Async wrapper for the synchronous set_node_weights function"""
+        # Log exactly what will be sent to the fiber library
+        try:
+            node_ids = list(kwargs.get("node_ids") or [])
+            node_weights = list(kwargs.get("node_weights") or [])
+            netuid = kwargs.get("netuid")
+            validator_node_id = kwargs.get("validator_node_id")
+            logger.info(
+                f"[SetWeights→fiber] netuid={netuid}, validator_node_id={validator_node_id}, nodes={len(node_ids)}, nonzero={int(np.count_nonzero(node_weights))}"
+            )
+            try:
+                arr = np.array(node_weights, dtype=float)
+                if arr.size:
+                    nz = arr[arr > 0]
+                    if nz.size:
+                        logger.info(
+                            f"[SetWeights→fiber] Summary: min>0={nz.min():.6f}, max>0={nz.max():.6f}, mean>0={nz.mean():.6f}"
+                        )
+                        top_idx = np.argsort(-arr)[:10]
+                        top_pairs = [(int(node_ids[i]), float(arr[i])) for i in top_idx if arr[i] > 0]
+                        logger.info(f"[SetWeights→fiber] Top (uid,weight): {top_pairs}")
+                logger.debug(f"[SetWeights→fiber] node_ids order: {node_ids}")
+                logger.debug(f"[SetWeights→fiber] weights array: {node_weights}")
+            except Exception:
+                pass
+        except Exception:
+            pass
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, lambda: w.set_node_weights(**kwargs))
 

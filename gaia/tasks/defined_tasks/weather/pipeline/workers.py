@@ -545,8 +545,9 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 if response_id and miner_hotkey:
                     # Hard cancel if miner no longer exists in node_table (deregistered or hotkey changed)
                     try:
+                        # Require BOTH uid and hotkey to match the same row; OR may pass during hotkey churn
                         exists_row = await db.fetch_one(
-                            "SELECT 1 FROM node_table WHERE uid = :uid OR hotkey = :hk",
+                            "SELECT 1 FROM node_table WHERE uid = :uid AND hotkey = :hk",
                             {"uid": miner_uid, "hk": miner_hotkey},
                         )
                     except Exception:
@@ -568,6 +569,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                             )
                         except Exception:
                             pass
+                        # Hard-cancel: mark job completed without scheduling future retries
                         await db.complete_validator_job(job["id"], result={"cancelled": "miner_not_found"})
                         return True
                     try:

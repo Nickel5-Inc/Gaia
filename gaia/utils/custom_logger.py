@@ -9,6 +9,7 @@ Replaces fiber.logging_utils.get_logger with enhanced functionality:
 
 import sys
 import os
+import re
 import multiprocessing as mp
 from typing import Optional, Dict, Any
 from loguru import logger
@@ -288,7 +289,7 @@ class CustomLogger:
             sys.stdout,
             format=_format_log_record,
             level="TRACE",
-            colorize=True,  # Enable colorization for our manual color tags
+            colorize=False,  # Disable tag parsing; we use raw ANSI codes
             filter=stdout_filter,
         )
         
@@ -302,7 +303,7 @@ class CustomLogger:
             sys.stderr,
             format=_format_log_record,
             level="WARNING",
-            colorize=True,  # Enable colorization for our manual color tags
+            colorize=False,  # Disable tag parsing; we use raw ANSI codes
             backtrace=True,
             diagnose=True,
             catch=True,
@@ -320,7 +321,14 @@ class CustomLogger:
                 # Use time-based rotation to avoid file conflicts
                 import time
                 timestamp = int(time.time())
-                log_file_with_timestamp = f"{log_dir}/gaia_{timestamp}.log"
+                # Use per-process file to avoid cross-process rotation races
+                pid = os.getpid()
+                try:
+                    pname = mp.current_process().name or "proc"
+                except Exception:
+                    pname = "proc"
+                pname_sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", pname)
+                log_file_with_timestamp = f"{log_dir}/gaia_{timestamp}_{pid}_{pname_sanitized}.log"
                 
                 logger.add(
                     log_file_with_timestamp,
