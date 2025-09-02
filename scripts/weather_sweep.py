@@ -71,16 +71,20 @@ async def _create_session() -> async_sessionmaker:
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
-async def _fetch_recent_runs(session_maker, limit_runs: int) -> List[int]:
+async def _fetch_recent_runs(session_maker, limit_runs: int, ignore_status: bool = False) -> List[int]:
     async with session_maker() as s:
-        rows = (await s.execute(sa.text(
-            """
-            SELECT id FROM weather_forecast_runs
-            WHERE status IN ('completed','finalized','era5_scoring','day1_scoring_started','day1_scored')
-            ORDER BY id DESC
-            LIMIT :lim
-            """
-        ), {"lim": int(limit_runs)})).fetchall()
+        if ignore_status:
+            sql = "SELECT id FROM weather_forecast_runs ORDER BY id DESC LIMIT :lim"
+            params = {"lim": int(limit_runs)}
+        else:
+            sql = (
+                "SELECT id FROM weather_forecast_runs "
+                "WHERE status IN (" 
+                "'completed','final_scores_compiled','initial_scores_compiled','era5_scoring','day1_scoring_started','day1_scored'" 
+                ") ORDER BY id DESC LIMIT :lim"
+            )
+            params = {"lim": int(limit_runs)}
+        rows = (await s.execute(sa.text(sql), params)).fetchall()
         return [int(r.id) for r in rows]
 
 
@@ -89,35 +93,33 @@ async def _fetch_data_for_runs(session_maker, run_ids: List[int]) -> Dict[int, D
     if not run_ids:
         return data
     async with session_maker() as s:
-        # Component scores (day1 + era5 leads)
-        rows_cs = (await s.execute(sa.text(
-            """
-            SELECT run_id, miner_uid, variable_name, pressure_level, lead_hours,
-                   rmse, mse, acc, skill_score, skill_score_gfs, skill_score_climatology,
-                   clone_penalty, valid_time_utc
-            FROM weather_forecast_component_scores
-            WHERE run_id = ANY(:run_ids)
-            """
-        ), {"run_ids": run_ids})).fetchall()
+        for r in run_ids:
+            data[r] = {"components": {}, "stats": {}}
+            # Component scores (day1 + era5 leads)
+            rows_cs = (await s.execute(sa.text(
+                """
+                SELECT run_id, miner_uid, variable_name, pressure_level, lead_hours,
+                       rmse, mse, acc, skill_score, skill_score_gfs, skill_score_climatology,
+                       clone_penalty, valid_time_utc
+                FROM weather_forecast_component_scores
+                WHERE run_id = :rid
+                """
+            ), {"rid": r})).fetchall()
+            for row in rows_cs:
+                uid = int(row.miner_uid)
+                data[r]["components"].setdefault(uid, []).append(dict(row._mapping))
 
-        # Overall stats per run/miner including era5 combined
-        rows_stats = (await s.execute(sa.text(
-            """
-            SELECT run_id, miner_uid, forecast_score_initial, era5_combined_score
-            FROM weather_forecast_stats
-            WHERE run_id = ANY(:run_ids)
-            """
-        ), {"run_ids": run_ids})).fetchall()
-
-    # Organize
-    for r in run_ids:
-        data[r] = {"components": {}, "stats": {}}
-    for row in rows_cs:
-        r = int(row.run_id); uid = int(row.miner_uid)
-        data[r]["components"].setdefault(uid, []).append(dict(row._mapping))
-    for row in rows_stats:
-        r = int(row.run_id); uid = int(row.miner_uid)
-        data[r]["stats"].setdefault(uid, dict(row._mapping))
+            # Overall stats per run/miner including era5 combined
+            rows_stats = (await s.execute(sa.text(
+                """
+                SELECT run_id, miner_uid, forecast_score_initial, era5_combined_score
+                FROM weather_forecast_stats
+                WHERE run_id = :rid
+                """
+            ), {"rid": r})).fetchall()
+            for row in rows_stats:
+                uid = int(row.miner_uid)
+                data[r]["stats"].setdefault(uid, dict(row._mapping))
     return data
 
 
@@ -280,13 +282,30 @@ def _summarize(run_bundle: Dict[str, Any], recomputed: Dict[str, Any]) -> Dict[s
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--runs", type=int, default=10, help="Number of recent runs to analyze")
+    parser.add_argument("--runs", type=int, default=25, help="Number of recent runs to analyze")
     parser.add_argument("--out", type=str, default="weather_sweep.json", help="Output JSON path")
+    parser.add_argument("--ignore-status", action="store_true", help="Ignore run status filter when selecting recent runs")
+    parser.add_argument("--run-ids", type=str, default="", help="Comma-separated run IDs to analyze (overrides --runs selection)")
     args = parser.parse_args()
 
     session_maker = await _create_session()
-    run_ids = await _fetch_recent_runs(session_maker, args.runs)
+    if args.run_ids.strip():
+        run_ids = [int(x) for x in args.run_ids.split(",") if x.strip().isdigit()]
+    else:
+        run_ids = await _fetch_recent_runs(session_maker, args.runs, ignore_status=args.ignore_status)
+
+    if not run_ids:
+        print("No runs found. Try --ignore-status or specify --run-ids, and verify DB_* env vars point to main.")
+        with open(args.out, "w") as f:
+            json.dump({"sweep": [], "generated_at": datetime.now(timezone.utc).isoformat()}, f, indent=2)
+        return
+
     bundles = await _fetch_data_for_runs(session_maker, run_ids)
+
+    # Diagnostics for empty data
+    empty_runs = [r for r, b in bundles.items() if not b.get("components") and not b.get("stats")]
+    if empty_runs:
+        print(f"No component/stats rows for runs: {empty_runs[:10]}... (total {len(empty_runs)}).")
 
     gammas = _env_csv("SWEEP_GAMMAS", "1.0,2.0,3.0")
     delta_scales = _env_csv("SWEEP_DELTA_SCALES", "0.5,1.0,1.5")
@@ -344,9 +363,12 @@ async def main():
     with open(out_path, "w") as f:
         json.dump({"sweep": final, "generated_at": datetime.now(timezone.utc).isoformat()}, f, indent=2)
     # Print a small top-k summary
-    final_sorted = sorted(final, key=lambda r: (r["no_era5_weight_share"], -r["tau_correlation"]))
-    for r in final_sorted[:10]:
-        print(json.dumps(r))
+    if not final:
+        print("Sweep produced no results: data may be missing per-run components or stats. Try increasing --runs or use --run-ids.")
+    else:
+        final_sorted = sorted(final, key=lambda r: (r["no_era5_weight_share"], -r["tau_correlation"]))
+        for r in final_sorted[:10]:
+            print(json.dumps(r))
 
 
 if __name__ == "__main__":
