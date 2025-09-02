@@ -437,6 +437,25 @@ def _load_config(self):
     config["weather_score_day1_weight"] = float(
         os.getenv("WEATHER_SCORE_DAY1_WEIGHT", "0.2")
     )
+    # Strict near-GFS clamp and no-ERA5 tiering (configurable)
+    config["day1_strict_clone_clamp_enabled"] = (
+        os.getenv("WEATHER_DAY1_STRICT_CLONE_CLAMP_ENABLED", "true").lower() in ("1", "true", "yes")
+    )
+    config["day1_strict_clone_clamp_fraction"] = float(
+        os.getenv("WEATHER_DAY1_STRICT_CLONE_CLAMP_FRACTION", "0.5")
+    )  # fraction of delta threshold considered "too similar"
+    config["day1_strict_clamp_value"] = float(
+        os.getenv("WEATHER_DAY1_STRICT_CLAMP_VALUE", "0.05")
+    )  # cap on overall day1 when strict similarity triggers
+    config["tier_no_era5_enabled"] = (
+        os.getenv("WEATHER_TIER_NO_ERA5_ENABLED", "true").lower() in ("1", "true", "yes")
+    )
+    config["tier_no_era5_factor"] = float(
+        os.getenv("WEATHER_TIER_NO_ERA5_FACTOR", "0.2")
+    )  # multiplicative factor applied when miner has no ERA5
+    config["tier_no_era5_day1_cap"] = float(
+        os.getenv("WEATHER_TIER_NO_ERA5_DAY1_CAP", "0.05")
+    )  # max day1 weight contribution when no ERA5
     config["weather_score_era5_weight"] = float(
         os.getenv("WEATHER_SCORE_ERA5_WEIGHT", "0.8")
     )
@@ -2462,7 +2481,25 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
         W_day1 = self.config.get("weather_score_day1_weight", 0.2)
         W_era5 = self.config.get("weather_score_era5_weight", 0.8)
-        proportional_weather_scores = (latest_day1_scores_array * W_day1) + (
+
+        # Tiering: scale day1 for miners without ERA5 and cap effective day1 contribution
+        tier_enabled = bool(self.config.get("tier_no_era5_enabled", True))
+        tier_factor = float(self.config.get("tier_no_era5_factor", 0.2) or 0.2)
+        day1_cap = float(self.config.get("tier_no_era5_day1_cap", 0.08) or 0.08)
+
+        # Determine miners with ERA5
+        has_era5_flags = np.zeros(256, dtype=bool)
+        for uid in active_uids:
+            has_era5_flags[uid] = latest_era5_composite_scores_array[uid] > 0
+
+        # Effective day1 weights per UID
+        W_day1_eff = np.full(256, W_day1, dtype=float)
+        if tier_enabled:
+            no_era5_mask = ~has_era5_flags
+            # Apply multiplicative factor and cap the day1 weight
+            W_day1_eff[no_era5_mask] = np.minimum(W_day1 * tier_factor, day1_cap)
+
+        proportional_weather_scores = (latest_day1_scores_array * W_day1_eff) + (
             latest_era5_composite_scores_array * W_era5
         )
         logger.info(f"[CombinedWeatherScore] Calculated proportional scores.")

@@ -162,9 +162,8 @@ where `anomaly = value - climatology`
 - **Benchmark standard**: Essential for demonstrating forecast value
 
 Day1 vs ERA5 reference consistency:
-- Day1: We compute skill vs GFS reference (operational forecast) and also vs climatology for comparability.
+- Day1: Skill is computed vs GFS reference (operational forecast) and also vs climatology for comparability. A clone penalty is computed per variable and subtracted when aggregating the Day1 score. Raw component metrics (including unpenalized skill variants such as skill vs climatology) are still stored for transparency.
 - ERA5: We compute skill vs climatology.
-- Clone penalty is tracked separately and is not subtracted from the stored skill metric.
 
 ### 5. Bias
 
@@ -204,8 +203,11 @@ Overall per-miner ERA5 normalized score:
 - Average the per-lead normalized scores with zeros for missing leads using the configured lead set (default `[24, 48, 72, 96, 120, 144, 168, 192, 216, 240]`).
 
 Blended overall_forecast_score (used for weighting/ranking):
-- `overall_forecast_score = 0.8 * ERA5_norm_avg + 0.2 * Day1_overall`
-  - `Day1_overall` is the Day1 aggregate score (and we compute a climatology-based Day1 skill for direct comparability).
+- `overall_forecast_score = W_era5 * ERA5_norm_avg + W_day1_eff * Day1_overall`
+  - Defaults: `W_era5 = 0.8`, `W_day1 = 0.2`.
+  - Tiering for miners without ERA5: `W_day1_eff = min(W_day1 * tier_no_era5_factor, tier_no_era5_day1_cap)`; otherwise `W_day1_eff = W_day1`.
+    - Defaults: `tier_no_era5_factor = 0.2`, `tier_no_era5_day1_cap = 0.05`.
+  - Purpose: ensure Day1 remains a light-quality signal while preventing no-ERA5 miners from dominating rankings.
 
 ---
 
@@ -273,10 +275,20 @@ Fast initial assessment to identify obviously poor forecasts before expensive ER
 - **10u/10v**: Surface winds, important for many applications
 - **z**: Atmospheric structure, fundamental for dynamics
 
-### Day1 Metrics and Skill Baselines
+### Day1 Metrics and Aggregation
 - RMSE, MAE, ACC are computed vs GFS analysis truth.
 - Skill is computed vs GFS reference and, for surface variables, also vs climatology.
-- Clone penalty is recorded (for quality control) but is not subtracted from the stored skill metric.
+- Clone penalty is computed per variable (see Clone Detection below) and is subtracted when aggregating Day1.
+
+Day1 aggregation:
+- Per-variable contributions are aggregated across selected lead times. Let `skill_norm = clamp(skill, 0, 1)` and `acc_norm = (acc + 1)/2`.
+- Let `penalty_v ≥ 0` be the clone penalty for variable v (defined below). We apply the penalty at the per-variable level, then aggregate:
+  - `Day1_overall = alpha * mean(skill_norm_after_penalty) + beta * mean(acc_norm)`
+  - Defaults: `alpha = 0.6`, `beta = 0.4`.
+
+Strict near-GFS clamp:
+- If any critical variable’s clone-distance MSE is below a strict fraction of its threshold (or a clone penalty was applied), we clamp `Day1_overall ≤ strict_clamp_value`.
+  - Defaults: `strict_clone_clamp_fraction = 0.5`, `strict_clamp_value = 0.05`.
 
 ---
 
@@ -329,19 +341,23 @@ Identify miners submitting identical or near-identical forecasts to reference da
 
 ### Methods
 
-1. **Statistical Thresholds**: Extremely high correlation with reference data
-2. **Pattern Analysis**: Identical spatial patterns across variables
-3. **Temporal Consistency**: Suspicious consistency across forecast times
+1. **MSE distance to GFS reference** (primary): We compute `MSE_v(forecast, GFS_ref)` per variable v and compare to a variable-specific threshold `Δ_v`.
+   - Clone penalty per variable: `penalty_v = gamma * max(0, 1 - MSE_v / Δ_v)` (applies only when `MSE_v < Δ_v`).
+   - Defaults: `gamma = 1.0`; thresholds `Δ_v` (surface-focused) below.
+2. **Strict clamp**: If any critical variable satisfies `MSE_v < strict_clone_clamp_fraction * Δ_v` (or any clone penalty was applied), clamp `Day1_overall ≤ strict_clamp_value`.
+3. **Pattern correlation check** (sanity QC): Pattern correlation is still tracked; it supports QC but is not the primary clone detector.
 
-### Thresholds (Day1)
+### Thresholds (Day1 MSE deltas)
 
-| Variable | Clone Threshold (Correlation) |
-|----------|-------------------------------|
-| `2t` | > 0.9999 |
-| `msl` | > 0.9999 |
-| `10u` | > 0.9995 |
-| `10v` | > 0.9995 |
-| `z` | > 0.9999 |
+| Variable | Δ_v (MSE threshold) | Notes |
+|----------|----------------------|-------|
+| `2t` | 0.0025 (≈ (0.05 K)²) | 2-meter temp |
+| `msl` | 400 (≈ (20 Pa)²) | Mean sea level pressure |
+| `10u` | 0.01 (≈ (0.1 m/s)²) | 10 m U wind |
+| `10v` | 0.01 (≈ (0.1 m/s)²) | 10 m V wind |
+| `z500` | 100 (≈ (10 m)²) | 500 hPa geopotential height |
+
+These defaults are configurable via environment and can be tuned via sweep.
 
 ### Scientific Rationale
 

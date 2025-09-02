@@ -167,7 +167,10 @@ async def run_item(
             """
             SELECT lead_hours, score
             FROM weather_miner_scores
-            WHERE run_id = :rid AND miner_uid = :uid AND score_type = 'era5_rmse'
+            WHERE run_id = :rid
+              AND miner_uid = :uid
+              AND score_type LIKE 'era5_rmse_%'
+              AND lead_hours IS NOT NULL
             """
         ),
         {"rid": run_id, "uid": miner_uid},
@@ -276,7 +279,10 @@ async def run_item(
             miner_uid=miner_uid,
             miner_hotkey=miner_hotkey,
         )
-    except Exception:
+    except Exception as e:
+        logger.exception(
+            f"[ERA5] Exception during scoring for run {run_id} miner {miner_uid} leads={ready_leads}: {e}"
+        )
         ok = False
     if not ok:
         await log_failure(
@@ -286,7 +292,11 @@ async def run_item(
             miner_hotkey=miner_hotkey,
             step_name="era5",
             substep="score",
-            error_json={"type": "scoring_failed", "message": "calculate_era5_miner_score returned False"},
+            error_json={
+                "type": "scoring_failed",
+                "message": "calculate_era5_miner_score returned False",
+                "context": {"run_id": run_id, "miner_uid": miner_uid, "ready_leads": ready_leads},
+            },
         )
         return False
     latency_ms = int((time.perf_counter() - t0) * 1000)
