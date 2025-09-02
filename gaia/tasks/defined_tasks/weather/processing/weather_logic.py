@@ -3506,7 +3506,7 @@ async def _calculate_and_store_aggregated_era5_score(
     # Compute normalized per-lead ERA5 scores combining skill/acc/rmse if available
     # Then write per-lead normalized scores, averages, and overall_forecast_score (80% ERA5 + 20% Day1)
     try:
-        # Fetch Day1 overall score for 20% blend
+        # Fetch Day1 overall score for binary QC blend
         day1_row = await task_instance.db_manager.fetch_one(
             """
             SELECT forecast_score_initial
@@ -3615,11 +3615,24 @@ async def _calculate_and_store_aggregated_era5_score(
         era5_norm_total = sum(normalized_by_lead[h] for h in available_leads)
         era5_norm_avg = (era5_norm_total / float(len(available_leads))) if available_leads else 0.0
 
-        # Blend 80/20 with Day1 if available
-        if day1_overall is not None:
-            overall_forecast_score = 0.8 * era5_norm_avg + 0.2 * float(day1_overall)
-        else:
-            overall_forecast_score = era5_norm_avg
+        # Binary Day1 QC: day1_pass = 1 if day1_overall >= threshold else 0
+        qc_threshold = float(task_instance.config.get("day1_binary_threshold", 0.1))
+        day1_pass = 1.0 if (day1_overall is not None and float(day1_overall) >= qc_threshold) else 0.0
+
+        # Blend with configured weights (defaults: 0.95 ERA5, 0.05 Day1-pass)
+        W_era5 = task_instance.config.get("weather_score_era5_weight", 0.95)
+        W_day1 = task_instance.config.get("weather_score_day1_weight", 0.05)
+        try:
+            W_era5 = float(W_era5)
+            W_day1 = float(W_day1)
+        except Exception:
+            W_era5, W_day1 = 0.95, 0.05
+        if (W_era5 + W_day1) > 0:
+            norm = float(W_era5 + W_day1)
+            W_era5 /= norm
+            W_day1 /= norm
+
+        overall_forecast_score = W_era5 * era5_norm_avg + W_day1 * day1_pass
 
         await stats_mgr.update_forecast_stats(
             run_id=run_id,

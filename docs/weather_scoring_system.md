@@ -203,11 +203,18 @@ Overall per-miner ERA5 normalized score:
 - Average the per-lead normalized scores with zeros for missing leads using the configured lead set (default `[24, 48, 72, 96, 120, 144, 168, 192, 216, 240]`).
 
 Blended overall_forecast_score (used for weighting/ranking):
-- `overall_forecast_score = W_era5 * ERA5_norm_avg + W_day1_eff * Day1_overall`
-  - Defaults: `W_era5 = 0.8`, `W_day1 = 0.2`.
+- Binary Day1 QC pass is used instead of numeric Day1 in the blend:
+  - Let `day1_pass = 1` if `Day1_overall >= day1_binary_threshold` else `0` (default threshold `0.1`).
+  - `overall_forecast_score = W_era5 * ERA5_norm_avg + W_day1_eff * day1_pass`
+  - Defaults: `W_era5 = 0.95`, `W_day1 = 0.05`.
   - Tiering for miners without ERA5: `W_day1_eff = min(W_day1 * tier_no_era5_factor, tier_no_era5_day1_cap)`; otherwise `W_day1_eff = W_day1`.
     - Defaults: `tier_no_era5_factor = 0.2`, `tier_no_era5_day1_cap = 0.05`.
-  - Purpose: ensure Day1 remains a light-quality signal while preventing no-ERA5 miners from dominating rankings.
+  - Purpose: keep Day1 as a light QC gate while preventing manipulation of the Day1 magnitude from affecting rankings.
+
+Configuration (env overrides):
+- `WEATHER_DAY1_BINARY_THRESHOLD` (default `0.1`)
+- `WEATHER_SCORE_DAY1_WEIGHT` (default `0.05`)
+- `WEATHER_SCORE_ERA5_WEIGHT` (default `0.95`)
 
 ---
 
@@ -289,6 +296,12 @@ Day1 aggregation:
 Strict near-GFS clamp:
 - If any critical variable’s clone-distance MSE is below a strict fraction of its threshold (or a clone penalty was applied), we clamp `Day1_overall ≤ strict_clamp_value`.
   - Defaults: `strict_clone_clamp_fraction = 0.5`, `strict_clamp_value = 0.05`.
+
+Binary QC usage in overall blend:
+- The numeric `Day1_overall` is still computed for QC diagnostics and clamping, but for the final overall blend we only use a binary pass/fail:
+  - `day1_pass = 1` if `Day1_overall ≥ day1_binary_threshold`, else `0`.
+  - Default threshold `day1_binary_threshold = 0.1` (configurable via `WEATHER_DAY1_BINARY_THRESHOLD`).
+  - This ensures Day1 acts as a gate (max 5% contribution by default) without incentivizing Day1 score inflation.
 
 ---
 
@@ -431,7 +444,7 @@ weather_miner_scores (
 ### Weather Forecast Stats Table (selected fields and semantics)
 - `era5_score_[24h..240h]`: stores per-lead normalized scores on [0, 1] (not raw RMSE). Written during final scoring as soon as each lead is available.
 - `era5_combined_score`: average of all 10 per-lead normalized scores (zeros for missing).
-- `overall_forecast_score`: blended overall score used for ranking/weights (`0.8 * ERA5_norm_avg + 0.2 * Day1_overall`).
+- `overall_forecast_score`: blended overall score used for ranking/weights (`W_era5 * ERA5_norm_avg + W_day1_eff * day1_pass`, defaults `W_era5=0.95`, `W_day1=0.05`, `day1_pass = 1{Day1_overall≥0.1}`).
 - `avg_rmse`, `avg_acc`, `avg_skill_score`: averages computed from component scores for the run/miner (written at scoring time).
 - `forecast_status` / `current_forecast_stage`: updated throughout the pipeline (e.g., `day1_scored`, `era5_scoring`, `completed`).
 

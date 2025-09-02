@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
+import numpy as np
 from pathlib import Path
 from typing import Optional, Any, Dict, Tuple
 
@@ -253,6 +254,57 @@ async def run_item(
         backoff_hours = int(getattr(task.config, "era5_retry_backoff_hours", task.config.get("era5_retry_backoff_hours", 6))) if hasattr(task, "config") else 6
         next_ready_time = datetime.now(timezone.utc) + timedelta(hours=max(1, backoff_hours))
         raise DataNotReadyError("ERA5 truth/climatology not ready", next_ready_at=next_ready_time)
+
+    # Validate truth actually contains requested times; refine ready_leads accordingly
+    try:
+        ds_times = getattr(truth, "indexes", None) and truth.indexes.get("time")
+        if ds_times is None:
+            ds_times = getattr(truth, "time", None) and truth["time"].values
+        def _has_time(dt: datetime) -> bool:
+            if ds_times is None:
+                return False
+            try:
+                # Convert to numpy datetime64 matching seconds precision; drop tz for compare
+                dt64 = np.datetime64(dt.replace(tzinfo=None))
+            except Exception:
+                return False
+            try:
+                arr = np.array(ds_times)
+            except Exception:
+                arr = ds_times
+            try:
+                # Exact match check
+                return np.any(arr == dt64)
+            except Exception:
+                # Fallback: iterate with tolerance of 60s
+                try:
+                    for t in np.array(arr):
+                        try:
+                            delta = np.abs((dt64 - t).astype('timedelta64[s]').astype(int))
+                            if delta <= 60:
+                                return True
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                return False
+
+        original_ready = list(ready_leads)
+        confirmed_ready_leads = []
+        for h in ready_leads:
+            target_dt = gfs_init + timedelta(hours=h)
+            if _has_time(target_dt):
+                confirmed_ready_leads.append(h)
+        if not confirmed_ready_leads:
+            # No actual matching times in truth; back off
+            raise DataNotReadyError("ERA5 truth missing requested times", next_ready_at=datetime.now(timezone.utc) + timedelta(hours=3))
+        # Use refined list
+        ready_leads = sorted(confirmed_ready_leads)
+    except DataNotReadyError:
+        raise
+    except Exception:
+        # If any error during refinement, proceed with original but expect scoring to guard internally
+        pass
     miner_record = {
         "id": resp["id"],
         "miner_hotkey": miner_hotkey,

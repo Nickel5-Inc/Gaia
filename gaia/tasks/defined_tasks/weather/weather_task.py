@@ -434,8 +434,13 @@ def _load_config(self):
         )
         config["day1_clone_delta_thresholds"] = default_clone_delta_thresholds
 
+    # Day1 binary QC weighting (default 5%)
     config["weather_score_day1_weight"] = float(
-        os.getenv("WEATHER_SCORE_DAY1_WEIGHT", "0.2")
+        os.getenv("WEATHER_SCORE_DAY1_WEIGHT", "0.05")
+    )
+    # Day1 binary threshold (>= threshold counts as pass)
+    config["day1_binary_threshold"] = float(
+        os.getenv("WEATHER_DAY1_BINARY_THRESHOLD", "0.1")
     )
     # Strict near-GFS clamp and no-ERA5 tiering (configurable)
     config["day1_strict_clone_clamp_enabled"] = (
@@ -457,7 +462,7 @@ def _load_config(self):
         os.getenv("WEATHER_TIER_NO_ERA5_DAY1_CAP", "0.05")
     )  # max day1 weight contribution when no ERA5
     config["weather_score_era5_weight"] = float(
-        os.getenv("WEATHER_SCORE_ERA5_WEIGHT", "0.8")
+        os.getenv("WEATHER_SCORE_ERA5_WEIGHT", "0.95")
     )
     config["weather_bonus_value_add"] = float(
         os.getenv("WEATHER_BONUS_VALUE_ADD", "0.05")
@@ -2499,7 +2504,10 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             # Apply multiplicative factor and cap the day1 weight
             W_day1_eff[no_era5_mask] = np.minimum(W_day1 * tier_factor, day1_cap)
 
-        proportional_weather_scores = (latest_day1_scores_array * W_day1_eff) + (
+        # Binary Day1 QC pass vector using configured threshold
+        qc_threshold = float(self.config.get("day1_binary_threshold", 0.1))
+        day1_pass_vec = (latest_day1_scores_array >= qc_threshold).astype(float)
+        proportional_weather_scores = (day1_pass_vec * W_day1_eff) + (
             latest_era5_composite_scores_array * W_era5
         )
         logger.info(f"[CombinedWeatherScore] Calculated proportional scores.")

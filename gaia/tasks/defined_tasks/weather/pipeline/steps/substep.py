@@ -45,15 +45,17 @@ def substep(
             )
             try:
                 result = await func(db, task, **kwargs)
-                await log_success(
-                    db,
-                    run_id=run_id,
-                    miner_uid=miner_uid,
-                    miner_hotkey=miner_hotkey,
-                    step_name=step_name,
-                    substep=substep_name,
-                    lead_hours=lead_hours,
-                )
+                # Only log success if the substep indicates success (truthy result)
+                if result:
+                    await log_success(
+                        db,
+                        run_id=run_id,
+                        miner_uid=miner_uid,
+                        miner_hotkey=miner_hotkey,
+                        step_name=step_name,
+                        substep=substep_name,
+                        lead_hours=lead_hours,
+                    )
                 return result
             except Exception as e:
                 # CRITICAL: Each substep owns its retry count from job payload

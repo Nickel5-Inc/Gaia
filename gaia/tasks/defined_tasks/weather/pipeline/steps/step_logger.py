@@ -144,14 +144,24 @@ async def log_failure(
     next_retry_time: Optional[datetime] = None,
     context: Optional[Dict[str, Any]] = None,
 ) -> None:
-    # Console logging for operational visibility
+    # Console logging for operational visibility (include error context if provided)
     substep_str = f".{substep}" if substep else ""
     lead_str = f" (L{lead_hours}h)" if lead_hours else ""
     latency_str = f" after {latency_ms}ms" if latency_ms else ""
-    error_str = f": {error_json.get('message', 'Unknown error')}" if error_json else ""
     retry_str = f" (retry {retry_count})" if retry_count else ""
-    
-    logger.error(f"❌ [Run {run_id}] Miner {miner_uid}: Failed {step_name}{substep_str}{lead_str}{latency_str}{error_str}{retry_str}")
+    msg = error_json.get("message", "Unknown error") if isinstance(error_json, dict) else "Unknown error"
+    # Compact context rendering to avoid massive logs
+    ctx = None
+    if isinstance(error_json, dict) and isinstance(error_json.get("context"), (dict, list)):
+        try:
+            import json as _json
+            ctx = _json.dumps(error_json["context"])[:300]
+        except Exception:
+            ctx = str(error_json.get("context"))[:300]
+    context_str = f" | context={ctx}" if ctx else ""
+    logger.error(
+        f"❌ [Run {run_id}] Miner {miner_uid}: Failed {step_name}{substep_str}{lead_str}{latency_str}: {msg}{context_str}{retry_str}"
+    )
     
     await _upsert(
         db,
