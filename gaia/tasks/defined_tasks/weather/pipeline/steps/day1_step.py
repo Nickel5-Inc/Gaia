@@ -201,6 +201,10 @@ async def run_item(
         "clone_penalty_gamma": task.config.get("day1_clone_penalty_gamma", 1.0),
         "clone_delta_thresholds": task.config.get("day1_clone_delta_thresholds", {}),
         "lead_times_hours": task.config.get("initial_scoring_lead_hours", [6, 12]),  # Add lead times
+        # Strict clamp configuration
+        "strict_clone_clamp_enabled": task.config.get("day1_strict_clone_clamp_enabled", True),
+        "strict_clone_clamp_fraction": task.config.get("day1_strict_clone_clamp_fraction", 0.5),
+        "strict_clamp_value": task.config.get("day1_strict_clamp_value", 0.05),
     }
     
     # CRITICAL: Debug configuration to understand why scoring fails
@@ -210,6 +214,7 @@ async def run_item(
         f"\n  Lead times: {day1_cfg['lead_times_hours']}"
         f"\n  Pattern threshold: {day1_cfg['pattern_correlation_threshold']}"
         f"\n  ACC lower bound: {day1_cfg['acc_lower_bound']}"
+        f"\n  Strict clamp: {day1_cfg['strict_clone_clamp_enabled']} at {day1_cfg['strict_clone_clamp_fraction']}x, value={day1_cfg['strict_clamp_value']}"
     )
     
     if not day1_cfg["variables_levels_to_score"]:

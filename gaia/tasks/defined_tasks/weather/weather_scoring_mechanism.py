@@ -675,6 +675,48 @@ async def evaluate_miner_forecast_day1(
                 )
 
             normalized_score = alpha * avg_clipped_skill + beta * avg_scaled_acc
+
+            # Strict near-GFS clamp: if any critical variable at any evaluated lead
+            # has clone_distance_mse < strict_fraction * delta, clamp normalized_score to configured cap
+            try:
+                if day1_scoring_config.get("strict_clone_clamp_enabled", True):
+                    strict_fraction = float(day1_scoring_config.get("strict_clone_clamp_fraction", 0.5) or 0.5)
+                    clamp_value = float(day1_scoring_config.get("strict_clamp_value", 0.05) or 0.05)
+                    delta_thresholds_config = day1_scoring_config.get("clone_delta_thresholds", {})
+
+                    def _violates(var_key: str, var_result: dict) -> bool:
+                        try:
+                            delta = delta_thresholds_config.get(var_key)
+                            if delta is None:
+                                return False
+                            cd = var_result.get("clone_penalty_applied")
+                            # If penalty applied > 0, clone_distance_mse < delta already. Treat as violation under strict_fraction.
+                            # Otherwise, if clone_distance_mse present, compare directly.
+                            if cd is not None and float(cd) > 0:
+                                return True
+                            d = var_result.get("clone_distance_mse")
+                            return (d is not None) and (float(d) < strict_fraction * float(delta))
+                        except Exception:
+                            return False
+
+                    any_violation = False
+                    for time_key, vars_map in day1_results.get("lead_time_scores", {}).items():
+                        if not isinstance(vars_map, dict):
+                            continue
+                        for var_key, var_res in vars_map.items():
+                            if isinstance(var_res, dict) and _violates(var_key, var_res):
+                                any_violation = True
+                                break
+                        if any_violation:
+                            break
+                    if any_violation:
+                        logger.warning(
+                            f"[Day1Score] Miner {miner_hotkey}: Strict clone clamp triggered -> clamping Day1 score to {clamp_value}"
+                        )
+                        normalized_score = min(normalized_score, clamp_value)
+            except Exception as _strict_ex:
+                logger.debug(f"[Day1Score] Strict clone clamp evaluation failed: {_strict_ex}")
+
             day1_results["overall_day1_score"] = normalized_score
             logger.info(
                 f"[Day1Score] Miner {miner_hotkey}: AvgClippedSkill={avg_clipped_skill:.3f}, AvgScaledACC={avg_scaled_acc:.3f}, Overall Day1 Score={normalized_score:.3f}"
@@ -1511,7 +1553,7 @@ async def _process_single_variable_parallel(
                 logger.warning(f"[Day1Score] Failed to compute per-level bias for {var_name}: {e_bias}")
                 per_level_bias = {}
             
-            # Apply clone penalty tracking only (do not subtract from skill metric), calculate averages for backward compatibility
+            # Calculate averages across pressure levels
             avg_skill_score = 0.0
             avg_acc_score = 0.0
             avg_rmse_score = 0.0
@@ -1524,8 +1566,10 @@ async def _process_single_variable_parallel(
                     avg_rmse_score += rmse_scores_by_level[level]
                     valid_levels += 1
             
-            # Store averages for backward compatibility
-            result["skill_score"] = avg_skill_score / valid_levels if valid_levels > 0 else -np.inf
+            # Store averages (apply clone penalty consistently)
+            _avg_skill = avg_skill_score / valid_levels if valid_levels > 0 else -np.inf
+            _clone_penalty = float(result.get("clone_penalty_applied", 0.0) or 0.0)
+            result["skill_score"] = _avg_skill - _clone_penalty
             result["acc_score"] = avg_acc_score / valid_levels if valid_levels > 0 else -np.inf
             result["rmse"] = avg_rmse_score / valid_levels if valid_levels > 0 else np.inf
             
@@ -1549,8 +1593,12 @@ async def _process_single_variable_parallel(
                 broadcasted_weights_final,
             )
             
-            # Do NOT subtract clone penalty from skill metric; record penalty separately
-            result["skill_score"] = skill_score
+            # Apply clone penalty consistently to skill metric
+            try:
+                _clone_penalty = float(result.get("clone_penalty_applied", 0.0) or 0.0)
+            except Exception:
+                _clone_penalty = 0.0
+            result["skill_score"] = skill_score - _clone_penalty
 
             # Also compute climatology-referenced skill to match ERA5 method
             try:
