@@ -454,7 +454,7 @@ def _load_config(self):
         os.getenv("WEATHER_TIER_NO_ERA5_FACTOR", "0.2")
     )  # multiplicative factor applied when miner has no ERA5
     config["tier_no_era5_day1_cap"] = float(
-        os.getenv("WEATHER_TIER_NO_ERA5_DAY1_CAP", "0.08")
+        os.getenv("WEATHER_TIER_NO_ERA5_DAY1_CAP", "0.05")
     )  # max day1 weight contribution when no ERA5
     config["weather_score_era5_weight"] = float(
         os.getenv("WEATHER_SCORE_ERA5_WEIGHT", "0.8")

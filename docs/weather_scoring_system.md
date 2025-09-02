@@ -206,7 +206,7 @@ Blended overall_forecast_score (used for weighting/ranking):
 - `overall_forecast_score = W_era5 * ERA5_norm_avg + W_day1_eff * Day1_overall`
   - Defaults: `W_era5 = 0.8`, `W_day1 = 0.2`.
   - Tiering for miners without ERA5: `W_day1_eff = min(W_day1 * tier_no_era5_factor, tier_no_era5_day1_cap)`; otherwise `W_day1_eff = W_day1`.
-    - Defaults: `tier_no_era5_factor = 0.2`, `tier_no_era5_day1_cap = 0.08`.
+    - Defaults: `tier_no_era5_factor = 0.2`, `tier_no_era5_day1_cap = 0.05`.
   - Purpose: ensure Day1 remains a light-quality signal while preventing no-ERA5 miners from dominating rankings.
 
 ---
