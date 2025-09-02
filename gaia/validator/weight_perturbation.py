@@ -27,12 +27,16 @@ logger = get_logger(__name__)
 # Default perturbation parameters
 # These defaults are carefully chosen for optimal anti-weight-copying defense
 P_MOVE = float(
-    os.getenv("PERTURB_P", "0.07")
-)  # 7% mass moved (results in v-trust ~0.58 for copiers)
+    os.getenv("PERTURB_P", "0.35")
+)  # 35% mass moved (strong defense against weight copying)
 TAIL_FR = float(os.getenv("PERTURB_TAIL_FR", "0.50"))  # Bottom 50% of miners get boost
 UNIFORM_PORTION = float(
     os.getenv("PERTURB_UNIFORM", "0.70")
 )  # 70% uniform, 30% random distribution
+
+# Minimum fraction of moved mass that must go to the burn key (UID 252)
+# Default: at least 90% of P_MOVE goes to burn; remainder goes to tail miners
+BURN_MIN_FRACTION = float(os.getenv("PERTURB_BURN_MIN", "0.90"))
 
 # Feature is ENABLED by default - validators must explicitly disable if needed
 # This ensures network-wide adoption without configuration
@@ -375,19 +379,19 @@ class WeightPerturbationManager:
         BURN_UID = 252
 
         if n > BURN_UID:  # Ensure burn UID exists
-            # Determine burn fraction: 30-100% of P_MOVE goes to burn, rest to tail
-            # Use deterministic random based on seed for high variance
-            burn_fraction = 0.3 + (rng.random() * 0.7)  # 30% to 100%
-            tail_fraction = 1.0 - burn_fraction
+            # Determine burn fraction: at least BURN_MIN_FRACTION of P_MOVE goes to burn
+            # Remaining (if any) goes to tail miners with deterministic randomness
+            rand_portion = rng.random() * max(0.0, 1.0 - BURN_MIN_FRACTION)
+            burn_fraction = BURN_MIN_FRACTION + rand_portion
+            burn_fraction = min(1.0, burn_fraction)
+            tail_fraction = max(0.0, 1.0 - burn_fraction)
 
             # Mass to burn key
             burn_mass = P_MOVE * burn_fraction
             delta[BURN_UID] = burn_mass
 
             # Remaining mass distributed to tail miners (excluding burn key)
-            if (
-                tail_size > 0 and tail_fraction > 0
-            ):  # Only distribute if there's mass left
+            if tail_size > 0 and tail_fraction > 0:  # Only distribute if there's mass left
                 # Exclude burn key from tail if it's already there
                 tail_indices_filtered = [idx for idx in tail_indices if idx != BURN_UID]
 
