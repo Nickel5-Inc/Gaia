@@ -3,17 +3,7 @@
 ---
 
 
-## **API's required**
-
-
-### NASA EarthData
-1. Create an account at https://urs.earthdata.nasa.gov/
-2. Accept the necessary EULAs for the following collections:
-    - GESDISC Test Data Archive 
-    - OB.DAAC Data Access 
-    - Sentinel EULA
-
-3. Generate an API token and save it in the .env file (details below)
+## **Required APIs**
 
 ### Climate Data Store
 1. create an account at https://cds.climate.copernicus.eu/ 
@@ -58,13 +48,7 @@ NETUID=237                # Network UID (e.g., 237 for testnet, 57 for mainnet)
 SUBTENSOR_NETWORK=test    # Bittensor network ('test' or 'finney')
 SUBTENSOR_ADDRESS=wss://test.finney.opentensor.ai:443/ # Subtensor chain endpoint
 
-# --- NASA Earthdata Credentials (Sensitive - DO NOT COMMIT ACTUAL VALUES TO PUBLIC REPOS) ---
-# These are required for downloading data from NASA.
-# Create an account at https://urs.earthdata.nasa.gov/
-# Accept EULAs for: GESDISC Test Data Archive, OB.DAAC Data Access, Sentinel EULA
-EARTHDATA_USERNAME=<YOUR_EARTHDATA_USERNAME>
-EARTHDATA_PASSWORD=<YOUR_EARTHDATA_PASSWORD>
-EARTHDATA_API_KEY=<YOUR_EARTHDATA_API_KEY>  # This refers to your Earthdata login credentials used by the application.
+# (NASA Earthdata is no longer required.)
 
 # --- Database Synchronization System (Optional, highly recommended) ---
 # Enable database synchronization (uses pgBackRest + R2)
@@ -205,16 +189,13 @@ DB_CONNECTION_TYPE=socket alembic -c alembic_validator.ini history
 
 ## Custom Models (Advanced)
 
-Validators can benefit from miners using custom models for better performance:
+Validators can benefit from miners using custom weather models for better performance:
 
 ### Encouraging Custom Models
 - Miners with custom models typically provide better predictions
-- Custom models can be task-specific (geomagnetic, soil moisture, weather)
 - Improved accuracy leads to better rewards for miners
 
 ### Model Requirements
-- **Soil Moisture**: Must output 11x11 arrays for surface/rootzone moisture (0-1 range)
-- **Geomagnetic**: Must predict next-hour DST index with UTC timestamp
 - **Weather**: Must generate 40-step forecasts in Zarr format
 
 Custom model files must follow naming conventions and implement specific methods (`run_inference()`).

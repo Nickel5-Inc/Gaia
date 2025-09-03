@@ -261,60 +261,9 @@ grep "PORT=" .env
 
 ---
 
-## Task Descriptions
+## Task Description
 
-### Geomagnetic Task
-
-**Purpose:** Forecast the DST (Disturbance Storm Time) index to predict geomagnetic disturbances affecting GPS, communications, and power grids.
-
-**Data Sources:**
-- Hourly DST index values from validators
-- Optional historical DST data for model improvement
-
-**Output:**
-- Predicted DST value for the next hour
-- UTC timestamp of the last observation
-
-**Process:**
-1. Receive cleaned DataFrame with timestamp and DST values
-2. Process historical data if available
-3. Generate prediction using `GeomagneticPreprocessing`
-4. Return prediction and timestamp
-
-### Soil Moisture Task
-
-**Purpose:** Predict soil moisture levels using satellite imagery and weather data to support agriculture and environmental monitoring.
-
-**Data Sources:**
-- Sentinel-2 satellite imagery
-- IFS weather forecast data
-- SMAP soil moisture data (for scoring)
-- SRTM elevation data
-- NDVI vegetation indices
-
-**Process:**
-1. **Region Selection:** Choose analysis regions avoiding urban/water areas
-2. **Data Retrieval:** Gather multi-source datasets via APIs
-3. **Data Compilation:** Create .tiff files with band order: [Sentinel-2, IFS, SRTM, NDVI]
-4. **Model Inference:** Process through `soil_model.py`
-5. **Validation:** Compare predictions against ground truth SMAP data
-
-**IFS Weather Variables (in order):**
-- t2m: Surface air temperature (2m) [Kelvin]
-- tp: Total precipitation [m/day]
-- ssrd: Surface solar radiation downwards [J/m²]
-- st: Surface soil temperature [Kelvin]
-- stl2/stl3: Soil temperature at 2m/3m depth [Kelvin]
-- sp: Surface pressure [Pascals]
-- d2m: Dewpoint temperature [Kelvin]
-- u10/v10: Wind components at 10m [m/s]
-- ro: Total runoff [m/day]
-- msl: Mean sea level pressure [Pascals]
-- et0: Reference evapotranspiration [mm/day]
-- bare_soil_evap: Bare soil evaporation [mm/day]
-- svp: Saturated vapor pressure [kPa]
-- avp: Actual vapor pressure [kPa]
-- r_n: Net radiation [MJ/m²/day]
+<!-- Removed deprecated Geomagnetic and Soil Moisture tasks -->
 
 ### Weather Task
 
@@ -353,7 +302,7 @@ RunPod → R2 Upload → Miner Proxy → Validator
 
 ## Hardware Requirements
 
-### Basic Miner (Geomagnetic + Soil Moisture)
+### Basic Miner
 - **CPU:** 4+ cores
 - **RAM:** 8GB minimum
 - **Storage:** 50GB+ for databases and caching
@@ -561,8 +510,7 @@ This guide provides everything needed to set up and run a Gaia miner:
 1. **Quick Setup:** Basic configuration for immediate functionality
 2. **Weather Task:** Comprehensive opt-in weather forecasting
 3. **Variable Names:** Critical exact naming requirements
-4. **Task Details:** Complete description of all supported tasks
-5. **Troubleshooting:** Solutions for common issues
+4. **Troubleshooting:** Solutions for common issues
 
 The key to success is using the **exact variable names** expected by the code and following the configuration templates provided. All documentation is now aligned with the current codebase to prevent configuration failures.
 
@@ -577,16 +525,12 @@ Miners can create custom models for improved performance:
 #### File Structure
 ```bash
 gaia/models/custom_models/
-├── custom_soil_model.py           # CustomSoilModel class
-├── custom_geomagnetic_model.py    # CustomGeomagneticModel class
-└── custom_weather_model.py        # CustomWeatherModel class (future)
+└── custom_weather_model.py        # CustomWeatherModel class
 ```
 
 #### Requirements
-- **Exact class names**: `CustomSoilModel`, `CustomGeomagneticModel`
+- **Exact class name**: `CustomWeatherModel`
 - **Required method**: `run_inference()` with specific input/output formats
-- **Soil moisture output**: 11x11 arrays for surface/rootzone (0-1 range)
-- **Geomagnetic output**: Next-hour DST prediction with UTC timestamp
 
 ---
 

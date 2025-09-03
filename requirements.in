@@ -22,7 +22,7 @@ lz4
 
 # PERFORMANCE: Fast character encoding detection
 # cchardet (C-based) is much faster than chardet for text processing
-cchardet
+cchardet; python_version < '3.12'
 
 aiohttp
 asyncpg

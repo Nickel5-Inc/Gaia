@@ -3,6 +3,7 @@ import sys
 import subprocess
 from pathlib import Path
 import getpass
+import shutil
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
@@ -53,6 +54,24 @@ def install_system_dependencies():
     )
 
 
+def ensure_uv_installed() -> str:
+    """Ensure uv (Astral) is installed and return its executable path."""
+    uv_path = shutil.which("uv")
+    if uv_path:
+        return uv_path
+    try:
+        # Install uv (non-interactive)
+        subprocess.run(
+            ["bash", "-lc", "curl -LsSf https://astral.sh/uv/install.sh | sh"],
+            check=True,
+        )
+    except Exception as e:
+        print(f"Error installing uv: {e}")
+        raise
+    # Re-check PATH and default install location
+    return shutil.which("uv") or str(Path.home() / ".local/bin/uv")
+
+
 def setup_postgresql(default_user="postgres", default_password="postgres"):
     """Configure PostgreSQL for the project"""
     try:
@@ -99,23 +118,32 @@ def setup_postgresql(default_user="postgres", default_password="postgres"):
 
 
 def setup_python_environment():
-    """Set up Python virtual environment and install dependencies"""
+    """Set up Python virtual environment and install dependencies using uv."""
     try:
-        subprocess.run([sys.executable, "-m", "venv", "../.gaia"], check=True)
-        python_path = "../.gaia/bin/python"
-        pip_path = "../.gaia/bin/pip"
+        uv = ensure_uv_installed()
 
-        subprocess.run(
-            [python_path, "-m", "pip", "install", "--upgrade", "pip"], check=True
-        )
+        venv_path = Path("../.gaia").resolve()
+        # Create venv using current interpreter
+        subprocess.run([uv, "venv", "--python", sys.executable, str(venv_path)], check=True)
+        python_path = str(venv_path / "bin" / "python")
 
-        # Get GDAL version from system
+        # Install GDAL matching system version
         gdal_version = (
             subprocess.check_output(["gdal-config", "--version"]).decode().strip()
         )
-        subprocess.run([pip_path, "install", f"GDAL=={gdal_version}"], check=True)
+        subprocess.run([uv, "pip", "install", "--python", python_path, f"GDAL=={gdal_version}"], check=True)
 
-        subprocess.run([pip_path, "install", "-r", "requirements.txt"], check=True)
+        # Prefer syncing from lockfile if present
+        repo_root = Path(__file__).resolve().parents[1]
+        req_lock = repo_root / "requirements.lock"
+        req_txt = repo_root / "requirements.txt"
+        if req_lock.exists():
+            subprocess.run([uv, "pip", "sync", "--python", python_path, str(req_lock)], check=True)
+        elif req_txt.exists():
+            subprocess.run([uv, "pip", "install", "--python", python_path, "-r", str(req_txt)], check=True)
+
+        # Editable install of the project itself (ensures entry points/modules are importable)
+        subprocess.run([uv, "pip", "install", "--python", python_path, "-e", str(repo_root)], check=True)
 
         print("Python environment setup completed successfully")
 

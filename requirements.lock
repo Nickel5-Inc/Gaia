@@ -113,7 +113,7 @@ cachetools==5.5.2
     # via
     #   -r requirements.txt
     #   google-auth
-cchardet==2.1.7
+cchardet==2.1.7; python_version < "3.12"
     # via -r requirements.txt
 cdsapi==0.7.6
     # via -r requirements.txt

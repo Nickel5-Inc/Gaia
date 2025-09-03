@@ -3,6 +3,9 @@ FROM python:3.10-slim AS builder
 
 WORKDIR /app
 
+# Use uv (Astral) for fast, reliable installs
+ENV PATH="/root/.local/bin:${PATH}"
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
@@ -14,8 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy requirements and install to a local directory
 COPY requirements.txt requirements.txt
-RUN pip install --no-cache-dir --user -r requirements.txt
-RUN pip install --no-cache-dir --user huggingface-hub boto3 botocore
+# Install uv and dependencies
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    uv pip install --no-cache-dir --user -r requirements.txt && \
+    uv pip install --no-cache-dir --user huggingface-hub boto3 botocore
 
 # Download Aurora model in builder stage for better layer caching
 ARG AURORA_MODEL_REPO="microsoft/aurora"

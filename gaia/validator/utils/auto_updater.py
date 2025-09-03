@@ -22,6 +22,14 @@ async def check_and_install_dependencies():
             "wheel": "--upgrade wheel",
         }
 
+        # Prefer uv for core tool upgrades when available
+        uv_exe = None
+        try:
+            import shutil as _shutil
+            uv_exe = _shutil.which("uv")
+        except Exception:
+            uv_exe = None
+
         for package, install_args in core_deps.items():
             try:
                 await asyncio.to_thread(
@@ -34,13 +42,21 @@ async def check_and_install_dependencies():
             except subprocess.CalledProcessError:
                 logger.info(f"Installing core dependency: {package}")
                 try:
-                    await asyncio.to_thread(
-                        lambda: subprocess.check_call(
-                            [sys.executable, "-m", "pip", "install"]
-                            + install_args.split(),
-                            stdout=subprocess.DEVNULL,
+                    if uv_exe:
+                        await asyncio.to_thread(
+                            lambda: subprocess.check_call(
+                                [uv_exe, "pip", "install"] + install_args.split(),
+                                stdout=subprocess.DEVNULL,
+                            )
                         )
-                    )
+                    else:
+                        await asyncio.to_thread(
+                            lambda: subprocess.check_call(
+                                [sys.executable, "-m", "pip", "install"]
+                                + install_args.split(),
+                                stdout=subprocess.DEVNULL,
+                            )
+                        )
                 except subprocess.CalledProcessError as e:
                     logger.error(f"Failed to install {package}: {e}")
                     return False
@@ -55,21 +71,50 @@ async def install_requirements():
     """Install project requirements"""
     try:
         requirements_path = Path("requirements.txt")
+        requirements_lock = Path("requirements.lock")
         if not requirements_path.exists():
             logger.error("requirements.txt not found")
             return False
 
         logger.info("Installing project requirements...")
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-r",
-            "requirements.txt",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+
+        # Prefer uv sync if available and lock exists
+        try:
+            import shutil as _shutil
+            uv_exe = _shutil.which("uv")
+        except Exception:
+            uv_exe = None
+
+        if uv_exe and requirements_lock.exists():
+            process = await asyncio.create_subprocess_exec(
+                uv_exe,
+                "pip",
+                "sync",
+                str(requirements_lock),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        elif uv_exe:
+            process = await asyncio.create_subprocess_exec(
+                uv_exe,
+                "pip",
+                "install",
+                "-r",
+                "requirements.txt",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        else:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-r",
+                "requirements.txt",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
         stdout, stderr = await process.communicate()
 

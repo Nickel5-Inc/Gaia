@@ -266,7 +266,7 @@ def create_aurora_batch_from_gfs(
         import pandas as pd
     except ImportError:
         logger.error(
-            "pandas is required but not installed. Please install it with 'pip install pandas'"
+            "pandas is required but not installed. Please install it with 'uv pip install pandas'"
         )
         raise
 

@@ -6687,7 +6687,7 @@ if __name__ == "__main__":
             logger.debug(f"uvloop available but skipping on {platform.system()} - using standard asyncio")
     except ImportError:
         logger.info(
-            "⚡ uvloop not available - install with 'pip install uvloop' for 2-4x async performance boost"
+            "⚡ uvloop not available - install with 'uv pip install uvloop' for 2-4x async performance boost"
         )
         logger.debug("uvloop not available - consider installing for significant performance improvements")
     except Exception as e:
@@ -6779,65 +6779,71 @@ if __name__ == "__main__":
         logger.info("🔄 Checking and updating Python requirements...")
         print("[STARTUP DEBUG] Checking requirements...")
 
+        # Prefer uv for dependency management with fallback to pip
+        uv_exe = None
+        try:
+            import shutil as _shutil
+            uv_exe = _shutil.which("uv")
+        except Exception:
+            uv_exe = None
+
         # Construct path to requirements.txt relative to this script
         current_script_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.abspath(os.path.join(current_script_dir, "..", ".."))
         requirements_path = os.path.join(project_root, "requirements.txt")
+        requirements_lock = os.path.join(project_root, "requirements.lock")
 
         if not os.path.exists(requirements_path):
             logger.warning(
-                f"requirements.txt not found at {requirements_path}, skipping pip install"
+                f"requirements.txt not found at {requirements_path}, skipping dependency sync"
             )
             print(
                 f"[STARTUP DEBUG] Warning: requirements.txt not found at {requirements_path}"
             )
         else:
-            # Check if constraints file exists to prevent problematic packages
-            constraints_path = os.path.join(project_root, "constraints.txt")
-            pip_command = [sys.executable, "-m", "pip", "install"]
-
-            # Add constraints file if it exists to prevent problematic packages like asyncio
-            if os.path.exists(constraints_path):
-                pip_command.extend(["-c", constraints_path])
-                logger.info(f"Using constraints file: {constraints_path}")
-                print(
-                    f"[STARTUP DEBUG] Using constraints file to prevent problematic packages: {constraints_path}"
-                )
-
-            pip_command.extend(["-r", requirements_path])
-
-            # Run pip install with timeout to prevent hanging
-            result = subprocess.run(
-                pip_command,
-                capture_output=True,
-                text=True,
-                timeout=300,  # 5 minute timeout
-                cwd=project_root,
-            )
-
-            if result.returncode == 0:
-                logger.success("✅ Python requirements are up to date")
-                print("[STARTUP DEBUG] Python requirements updated successfully")
-                # Only log pip output if there were actual changes (not just "already satisfied")
-                if result.stdout and "Installing" in result.stdout:
-                    logger.debug("Some packages were updated")
+            if uv_exe and os.path.exists(requirements_lock):
+                cmd = [uv_exe, "pip", "sync", "-q", requirements_lock]
+                tool = "uv pip sync"
+            elif uv_exe:
+                cmd = [uv_exe, "pip", "install", "-r", requirements_path]
+                tool = "uv pip install"
             else:
-                logger.warning(
-                    f"Pip install returned non-zero exit code {result.returncode}"
+                # Fallback to pip
+                constraints_path = os.path.join(project_root, "constraints.txt")
+                cmd = [sys.executable, "-m", "pip", "install"]
+                if os.path.exists(constraints_path):
+                    cmd.extend(["-c", constraints_path])
+                cmd.extend(["-r", requirements_path])
+                tool = "pip install"
+
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    cwd=project_root,
                 )
-                print(
-                    f"[STARTUP DEBUG] Warning: pip install failed with exit code {result.returncode}"
-                )
-                if result.stderr:
-                    logger.warning(f"Pip install stderr: {result.stderr}")
-                    print(f"[STARTUP DEBUG] Pip error output: {result.stderr}")
+                if result.returncode == 0:
+                    logger.success("✅ Python requirements are up to date")
+                    print(f"[STARTUP DEBUG] Dependencies updated successfully via {tool}")
+                else:
+                    logger.warning(
+                        f"{tool} returned non-zero exit code {result.returncode}"
+                    )
+                    if result.stderr:
+                        logger.warning(f"{tool} stderr: {result.stderr}")
+            except subprocess.TimeoutExpired:
+                logger.warning(f"{tool} timed out after 5 minutes, continuing with startup")
+            except Exception as e:
+                logger.warning(f"Error during {tool}: {e}, continuing with startup")
 
     except subprocess.TimeoutExpired:
-        logger.warning("Pip install timed out after 5 minutes, continuing with startup")
-        print("[STARTUP DEBUG] Warning: pip install timed out, continuing with startup")
+        logger.warning("Dependency install timed out after 5 minutes, continuing with startup")
+        print("[STARTUP DEBUG] Warning: dependency install timed out, continuing with startup")
     except Exception as e:
-        logger.warning(f"Error during pip install: {e}, continuing with startup")
-        print(f"[STARTUP DEBUG] Warning: Error during pip install: {e}")
+        logger.warning(f"Error during dependency install: {e}, continuing with startup")
+        print(f"[STARTUP DEBUG] Warning: Error during dependency install: {e}")
     # --- End requirements update ---
 
     print("[STARTUP DEBUG] Creating GaiaValidator instance")

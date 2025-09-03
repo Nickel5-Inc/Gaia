@@ -54,7 +54,7 @@ def load_base_weather_model(
 
     except ImportError as e:
         logger.error("The 'microsoft-aurora' library is required but not installed.")
-        logger.error("Please install it, e.g., using 'pip install microsoft-aurora'")
+        logger.error("Please install it, e.g., using 'uv pip install microsoft-aurora'")
         raise e
     except Exception as e:
         logger.error(f"Failed to load base Aurora model: {e}")

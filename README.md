@@ -21,19 +21,13 @@ cd Gaia
 ```
 ## **Build the Repository Modules**
 ```bash
-pip install -e .
+uv pip install -e .
 ```
 
 ## Miners
 [Quicklink - Mining Guide](docs/MINER.md)
 
-Miners develop models to understand future events. These events currently include soil moisture and geomagnetic readings at the equator. Miners will receive data from validators for the models that we have in place. They are also free to gather their own data from other resources. The tasks are consistent in design and in timing; this predictability allows miners the flexibility to retrieve any data that their model requires. 
-
-Miners can choose between these two tasks or perform both. 
-Incentive Distribution:
-40% of emissions are allocated to Geomagnetic Dst Index Prediction.
-60% of emissions are allocated based on a sigmoid-weighted scoring mechanism.
-The incentive split was previously 50:50, but has been adjusted to favor higher-quality predictions.
+Miners develop models to generate high-quality weather forecasts using the Aurora model pipeline. Tasks and schedules are consistent, enabling predictable data retrieval and processing.
 
 
 ## Validators
@@ -48,7 +42,7 @@ Gaia is built on [Fiber](https://github.com/rayonlabs/fiber) - special thanks to
 ### Run the setup script
 
 ```bash
-python./scripts/setup.py
+python scripts/setup.py
 ```
 - This will create a virtual environment and install all dependencies
 - The virtual environment (.gaia) will be located above the gaia directory.
@@ -58,11 +52,13 @@ source ../.gaia/bin/activate
 ```
 
 
-## Install fiber
+## Dependency management with uv
 
 ----
 ```bash
-pip install "git+https://github.com/rayonlabs/fiber.git@production#egg=fiber[full]"
+# Create or reuse the project venv and sync dependencies
+uv venv ../.gaia
+uv pip sync --python ../.gaia/bin/python /root/Gaia/requirements.lock
 ```
 
 ### PostgreSQL Configuration for Local Connections
@@ -383,26 +379,4 @@ Material has been modified by the following: resolution transformations, spatial
 
 [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data)
 
-### HLS Sentinel-2
-
-Masek, J., Ju, J., Roger, J., Skakun, S., Vermote, E., Claverie, M., Dungan, J., Yin, Z., Freitag, B., Justice, C. (2021). HLS Sentinel-2 Multi-spectral Instrument Surface Reflectance Daily Global 30m v2.0 [Data set]. NASA EOSDIS Land Processes Distributed Active Archive Center. Accessed 2024-11-27 from https://doi.org/10.5067/HLS/HLSS30.002
-
-[HLSS30](https://lpdaac.usgs.gov/products/hlss30v002/)
-
-### Soil Moisture Active Passive
-
-Reichle, R., De Lannoy, G., Koster, R. D., Crow, W. T., Kimball, J. S., Liu, Q. & Bechtold, M. (2022). SMAP L4 Global 3-hourly 9 km EASE-Grid Surface and Root Zone Soil Moisture Geophysical Data. (SPL4SMGP, Version 7). [Data Set]. Boulder, Colorado USA. NASA National Snow and Ice Data Center Distributed Active Archive Center. https://doi.org/10.5067/EVKPQZ4AFC4D. Date Accessed 11-27-2024.
-
-[SPL4SMGP](https://nsidc.org/data/spl4smgp/versions/7)
-
-### Nasa Shuttle Radar Topography Mission
-
-NASA JPL (2013). NASA Shuttle Radar Topography Mission Global 1 arc second [Data set]. NASA EOSDIS Land Processes Distributed Active Archive Center. Accessed 2024-11-27 from https://doi.org/10.5067/MEaSUREs/SRTM/SRTMGL1.003
-
-[SRTMl1v003](https://lpdaac.usgs.gov/products/srtmgl1v003/)
-
-### World Data Center for Geomagnetism, Kyoto
-
-World Data Center for Geomagnetism, Kyoto. World Data Center for Geomagnetism, Kyoto. Kyoto University. Accessed December 2, 2024.
-
-[Dst Open Data](https://wdc.kugi.kyoto-u.ac.jp/dst_realtime/index.html)
+<!-- Removed references to deprecated tasks (soil moisture, geomagnetic) -->
