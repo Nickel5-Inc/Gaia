@@ -12,9 +12,14 @@ import sys
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager, DatabaseError
 from gaia.tasks.defined_tasks.weather.pipeline.workers import process_one
 from gaia.utils.custom_logger import get_logger
+from gaia.utils.gcsfs_safe_close import apply_gcsfs_threadsafe_close_patch
 
 # Use custom logger for consistency with other modules
 logger = get_logger(__name__)
+
+
+def _patch_gcsfs_close_session() -> None:
+    apply_gcsfs_threadsafe_close_patch()
 
 
 def _prefix() -> str:
@@ -137,6 +142,7 @@ async def _install_worker_prefix_filters(tag: str) -> None:
 async def main() -> None:
     db = ValidatorDatabaseManager()
     tag = _prefix()
+    _patch_gcsfs_close_session()
     await _install_worker_prefix_filters(tag)
     # Retry DB init while Postgres is restarting or paused for maintenance
     max_tries = int(os.getenv("WEATHER_WORKER_DB_INIT_RETRIES", "30"))
@@ -158,6 +164,11 @@ async def main() -> None:
         logger.info(f"started (idle_sleep={idle}s, rss_limit={mem_limit}MB)")
         await worker_loop(db, idle_sleep=idle, memory_limit_mb=mem_limit)
     finally:
+        # Give any scheduled close tasks a chance to run
+        try:
+            await asyncio.sleep(0)
+        except Exception:
+            pass
         await db.close_all_connections()
 
 

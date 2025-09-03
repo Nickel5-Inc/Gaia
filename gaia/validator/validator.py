@@ -69,6 +69,10 @@ from fiber.chain import weights as w
 # Note: get_nodes_for_netuid replaced with process-isolated _fetch_nodes_process_isolated
 from fiber.chain.chain_utils import query_substrate
 from gaia.utils.custom_logger import get_logger
+from gaia.utils.gcsfs_safe_close import apply_gcsfs_threadsafe_close_patch
+
+# Ensure gcsfs close_session is thread-safe before any potential usage
+apply_gcsfs_threadsafe_close_patch()
 
 # Patch query_substrate to handle ProcessIsolatedSubstrate results
 _original_query_substrate = query_substrate
@@ -310,9 +314,17 @@ async def perform_handshake_with_retry(
 def _weather_worker_entrypoint() -> None:
     # Child process entrypoint for per-miner worker
     import asyncio
+    import sys
     from gaia.tasks.defined_tasks.weather.pipeline.worker_main import main as worker_main
 
-    asyncio.run(worker_main())
+    try:
+        asyncio.run(worker_main())
+    except KeyboardInterrupt:
+        try:
+            logger.info("[Worker] KeyboardInterrupt received - exiting cleanly")
+        except Exception:
+            pass
+        sys.exit(0)
 
 
 class GaiaValidator:
@@ -560,7 +572,13 @@ class GaiaValidator:
         # Weather worker pool management (multi-process)
         self._weather_worker_processes: list[mp.Process] = []
         self._weather_worker_num: int = self._compute_weather_worker_procs()
-
+        # Allow optional override via environment for debugging
+        try:
+            _env_workers = os.getenv("WEATHER_WORKER_COUNT")
+            if _env_workers is not None:
+                self._weather_worker_num = max(1, int(_env_workers))
+        except Exception:
+            pass
         # Initialize HTTP clients first
         # Client for miner communication with SSL verification disabled
         import ssl
@@ -768,15 +786,80 @@ class GaiaValidator:
         logger.debug("GaiaValidator initialization completed")
 
     def _compute_weather_worker_procs(self) -> int:
+        # Core-based cap (80% of cores, reserve 1 for system)
         try:
             cores = os.cpu_count() or 2
         except Exception:
             cores = 2
-        # Use up to 80% of cores, rounded down, with at least 1 core reserved for main/system
         pct_target = max(0, math.floor(0.8 * cores))
         reserve_cap = max(0, cores - 1)
-        procs = min(pct_target, reserve_cap)
-        return max(1, procs)
+        core_cap = max(1, min(pct_target, reserve_cap))
+
+        # Memory-based cap
+        def _read_mem_kb(label: str) -> int:
+            try:
+                with open("/proc/meminfo", "r") as f:
+                    for line in f:
+                        if line.startswith(label):
+                            parts = line.split()
+                            return int(parts[1])  # kB
+            except Exception:
+                pass
+            return 0
+
+        def _read_cgroup_limit_bytes() -> int:
+            # Prefer cgroup v2; fallback to v1 path
+            for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+                try:
+                    with open(path, "r") as f:
+                        txt = f.read().strip()
+                        if txt and txt.lower() != "max":
+                            val = int(txt)
+                            if val > 0:
+                                return val
+                except Exception:
+                    continue
+            return 0
+
+        mem_total_kb = _read_mem_kb("MemTotal:")
+        mem_avail_kb = _read_mem_kb("MemAvailable:") or max(0, mem_total_kb - _read_mem_kb("Buffers:") - _read_mem_kb("Cached:"))
+        cg_limit_bytes = _read_cgroup_limit_bytes()
+
+        # Convert to GB
+        KB_PER_GB = 1024 * 1024
+        BYTES_PER_GB = 1024 * 1024 * 1024
+        total_gb = mem_total_kb / KB_PER_GB if mem_total_kb else 0.0
+        avail_gb = mem_avail_kb / KB_PER_GB if mem_avail_kb else max(0.0, total_gb - 1.0)
+        if cg_limit_bytes:
+            limit_gb = cg_limit_bytes / BYTES_PER_GB
+            # Effective available cannot exceed cgroup limit (very conservative)
+            avail_gb = min(avail_gb, max(0.0, limit_gb - 1.0))
+
+        # Heuristics and env overrides
+        try:
+            per_worker_gb = float(os.getenv("WEATHER_WORKER_PEAK_GB", "5"))
+        except Exception:
+            per_worker_gb = 5.0
+        try:
+            reserve_gb = float(os.getenv("WEATHER_MEMORY_RESERVE_GB", "2"))
+        except Exception:
+            reserve_gb = 2.0
+        try:
+            utilization = float(os.getenv("WEATHER_MEM_UTILIZATION_FRACTION", "0.85"))
+        except Exception:
+            utilization = 0.85
+
+        usable_gb = max(0.0, avail_gb * utilization - reserve_gb)
+        mem_cap = max(1, int(usable_gb // max(0.1, per_worker_gb)))
+
+        procs = max(1, min(core_cap, mem_cap))
+        try:
+            logger.info(
+                f"[WorkerSizing] cores={cores}, core_cap={core_cap}, total_gb={total_gb:.2f}, avail_gb={avail_gb:.2f}, usable_gb={usable_gb:.2f}, per_worker_gb={per_worker_gb:.2f}, reserve_gb={reserve_gb:.2f}, mem_cap={mem_cap}, selected={procs}"
+            )
+        except Exception:
+            pass
+        return procs
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -3886,6 +3969,15 @@ class GaiaValidator:
                                     job_type="era5.refresh_token",
                                     payload={},
                                     priority=170,
+                                    scheduled_at=now,
+                                )
+                            # Global ERA5 truth guard every 3 hours (time-gates leads and enqueues per-lead steps)
+                            if now.minute == 0 and (now.hour % 3 == 0):
+                                await db.enqueue_singleton_job(
+                                    singleton_key="era5_guard_all",
+                                    job_type="era5.era5_truth_guard_all",
+                                    payload={},
+                                    priority=95,
                                     scheduled_at=now,
                                 )
                             # Ops status and DB monitor every 15 minutes

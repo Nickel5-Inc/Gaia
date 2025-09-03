@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from functools import wraps
 from typing import Optional, Callable, Any, Dict
+import traceback
 
 from loguru import logger
 from .step_logger import log_start, log_success, log_failure, schedule_retry
@@ -60,6 +61,10 @@ def substep(
             except Exception as e:
                 # CRITICAL: Each substep owns its retry count from job payload
                 current_retry_count = kwargs.get("retry_count", 1)
+                # Capture traceback for detailed diagnostics
+                tb_text = traceback.format_exc()
+                # Emit full exception with stack trace to logs
+                logger.exception(f"[{step_name}.{substep_name}] Exception during substep for run {run_id}, miner {miner_uid}: {e}")
                 
                 # Log the failure with current attempt number
                 await log_failure(
@@ -70,9 +75,14 @@ def substep(
                     step_name=step_name,
                     substep=substep_name,
                     lead_hours=lead_hours,
-                    error_json={"type": f"{step_name}_{substep_name}_failed", "message": str(e)},
+                    error_json={
+                        "type": f"{step_name}_{substep_name}_failed",
+                        "message": str(e),
+                        "traceback": tb_text,
+                    },
                     retry_count=current_retry_count,
                     next_retry_time=None,  # No automatic retry scheduling
+                    context=kwargs,
                 )
                 
                 # Check if we should schedule a retry
@@ -135,7 +145,11 @@ def substep(
                             step_name=step_name,
                             substep=substep_name,
                             lead_hours=lead_hours,
-                            error_json={"type": f"{step_name}_{substep_name}_failed", "message": str(e)},
+                            error_json={
+                                "type": f"{step_name}_{substep_name}_failed",
+                                "message": str(e),
+                                "traceback": tb_text,
+                            },
                             retry_count=next_retry_count,
                             next_retry_time=nrt,
                         )
@@ -147,8 +161,12 @@ def substep(
                         return None  # Don't raise - retry scheduled
                 else:
                     logger.warning(
-                        f"[{step_name}.{substep_name}] Max retries ({max_retries}) exceeded for "
-                        f"run {run_id}, miner {miner_uid} (attempt {current_retry_count}), giving up"
+                        f"[{step_name}.{substep_name}] "
+                        + (
+                            f"Max retries ({max_retries}) exceeded for run {run_id}, miner {miner_uid} (attempt {current_retry_count}), giving up"
+                            if should_retry else
+                            f"Retries disabled for run {run_id}, miner {miner_uid} (attempt {current_retry_count}); not retrying"
+                        )
                     )
                 
                 # Either no retries configured or max retries exceeded

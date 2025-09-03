@@ -26,6 +26,7 @@ from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
 from gaia.validator.utils.substrate_manager import get_process_isolated_substrate
 from fiber.chain.fetch_nodes import get_nodes_for_netuid
 from gaia.validator.weights.weight_service import commit_weights_if_eligible
+import os
 
 
 # verification removed
@@ -41,6 +42,45 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
     # Each pipeline step now creates its successor job upon completion
     try:
         await db.enqueue_miner_poll_jobs(limit=200)
+    except Exception:
+        pass
+    # Convert pending/retry steps in weather_forecast_steps into validator_jobs (single worker via advisory lock)
+    # Throttle: only one designated worker (index 1) performs this, and at a limited cadence
+    try:
+        import multiprocessing as _mp
+        _pname = _mp.current_process().name if _mp.current_process() else ""
+        should_enqueue_steps = True
+        try:
+            if "worker-" in _pname and "/" in _pname:
+                _idx = int(_pname.split("worker-")[1].split("/")[0])
+                if _idx != 1:
+                    should_enqueue_steps = False
+        except Exception:
+            pass
+        if should_enqueue_steps:
+            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+            interval_s = 60
+            try:
+                interval_s = int(os.getenv("WEATHER_STEPS_ENQUEUE_INTERVAL_SECONDS", "60"))
+            except Exception:
+                interval_s = 60
+            last_at = getattr(validator, "_last_steps_enqueue_at", None) if validator is not None else None
+            now = _dt.now(_tz.utc)
+            if last_at is None or (now - last_at).total_seconds() >= interval_s:
+                lock = await db.fetch_one("SELECT pg_try_advisory_lock(:k) AS ok", {"k": 0x57465354})  # 'WFST'
+                if lock and lock.get("ok"):
+                    try:
+                        await db.enqueue_weather_step_jobs(limit=2000)
+                    finally:
+                        try:
+                            await db.execute("SELECT pg_advisory_unlock(:k)", {"k": 0x57465354})
+                        except Exception:
+                            pass
+                if validator is not None:
+                    try:
+                        setattr(validator, "_last_steps_enqueue_at", now)
+                    except Exception:
+                        pass
     except Exception:
         pass
     # Prefer generic queue if available
@@ -400,26 +440,18 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                             validator=validator,
                         )
                     except era5_step.DataNotReadyError as e:
-                        # ERA5 data not ready yet - schedule retry aligned to the next_ready_at if provided
+                        # Mark job completed; step row is waiting_for_truth and will be re-queued by guard
                         logger.info(f"ERA5 data not ready for run {payload['run_id']} miner {payload['miner_uid']}: {e}")
-                        delay_seconds = 24*3600
-                        try:
-                            next_ready_at = getattr(e, "next_ready_at", None)
-                            if next_ready_at is not None:
-                                from datetime import datetime, timezone
-                                now_utc = datetime.now(timezone.utc)
-                                delay_seconds = max(3600, int((next_ready_at - now_utc).total_seconds()))
-                        except Exception:
-                            pass
-                        await db.fail_validator_job(job["id"], f"ERA5 data not ready: {e}", schedule_retry_in_seconds=delay_seconds)
-                        return True  # Not a failure, just delayed
+                        await db.complete_validator_job(job["id"], result={"waiting_for_truth": True})
+                        return True
                     except Exception as e:
                         logger.error(f"ERA5 job failed with exception: {e}", exc_info=True)
                         ok = False
                 else:
                     # Fallback: No specific job payload, cannot process without run_item parameters
-                    logger.warning("ERA5 job without specific payload cannot be processed via fallback")
-                    ok = False
+                    logger.warning("ERA5 job without required payload (run_id/miner_uid/response_id); marking completed to prevent retry thrash")
+                    await db.complete_validator_job(job["id"], result={"skipped": "invalid_payload"})
+                    return True
                 
                 # Handle the result properly
                 if ok:
@@ -429,8 +461,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     await db.complete_validator_job(job["id"], result={"retry_scheduled_by_substep": True})
                     logger.info(f"[weather.era5] Job {job['id']} completed - substep scheduled own retry")
                 else:
-                    # Schedule retry with 60 second delay to prevent rate limiting
-                    await db.fail_validator_job(job["id"], "ERA5 scoring failed", schedule_retry_in_seconds=60)
+                    # Hard-fail the job to avoid repeated retries for miner-side data errors
+                    await db.fail_validator_job(job["id"], "ERA5 scoring failed - not retrying")
                 return ok
             elif jtype == "weather.scoring.day1_qc":
                 # Kick off per-miner day1 by ensuring jobs are enqueued
@@ -754,17 +786,229 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                         await db.complete_validator_job(job["id"], result={"skipped": "no_run"})
                         return True
                     leads = t.config.get("final_scoring_lead_hours", [24,48,72,96,120,144,168,192,216,240])
-                    ds = await _get_era5_truth(t, int(rid), gfs_init, leads)
-                    if ds is not None:
-                        # Truth is available; miners will progress naturally on next attempts
-                        await db.complete_validator_job(job["id"], result={"truth_available": True})
+                    # Time-gate leads based on delay/buffer
+                    now_utc = datetime.now(timezone.utc)
+                    delay_days = int(t.config.get("era5_delay_days", 5))
+                    buffer_hours = int(t.config.get("era5_buffer_hours", 6))
+                    def _needed_time(h: int):
+                        return gfs_init + timedelta(hours=h) + timedelta(days=delay_days) + timedelta(hours=buffer_hours)
+                    time_ready_leads = [h for h in leads if now_utc >= _needed_time(h)]
+                    if not time_ready_leads:
+                        await db.fail_validator_job(job["id"], "truth_not_ready", schedule_retry_in_seconds=3*3600)
                         return True
+                    # Fetch truth just for time-ready leads
+                    ds = await _get_era5_truth(t, int(rid), gfs_init, time_ready_leads)
+                    if ds is None:
+                        await db.fail_validator_job(job["id"], "truth_not_ready", schedule_retry_in_seconds=3*3600)
+                        return True
+                    # Confirm dataset contains the requested target times
+                    try:
+                        ds_times = getattr(ds, "indexes", None) and ds.indexes.get("time")
+                        if ds_times is None:
+                            ds_times = getattr(ds, "time", None) and ds["time"].values
+                    except Exception:
+                        ds_times = None
+                    confirmed = []
+                    if ds_times is not None:
+                        try:
+                            import numpy as np
+                            arr = np.array(ds_times)
+                            for h in time_ready_leads:
+                                target_dt = gfs_init + timedelta(hours=h)
+                                dt64 = np.datetime64(target_dt.replace(tzinfo=None))
+                                if np.any(arr == dt64):
+                                    confirmed.append(h)
+                        except Exception:
+                            confirmed = time_ready_leads[:]
                     else:
-                        # Truth not ready; reschedule guard for 12h later
-                        await db.fail_validator_job(job["id"], "truth_not_ready", schedule_retry_in_seconds=12*3600)
+                        confirmed = time_ready_leads[:]
+                    if not confirmed:
+                        await db.fail_validator_job(job["id"], "truth_times_missing", schedule_retry_in_seconds=3*3600)
                         return True
+                    # Enqueue/mark step rows per miner for these confirmed leads
+                    miners = await db.fetch_all(
+                        "SELECT DISTINCT miner_uid, miner_hotkey FROM weather_miner_responses WHERE run_id = :rid",
+                        {"rid": rid},
+                    )
+                    from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import _upsert
+                    created = 0
+                    for h in confirmed:
+                        for m in miners:
+                            try:
+                                await _upsert(
+                                    db,
+                                    run_id=int(rid),
+                                    miner_uid=int(m["miner_uid"]),
+                                    miner_hotkey=m.get("miner_hotkey") or "unknown",
+                                    step_name="era5",
+                                    substep="score",
+                                    lead_hours=int(h),
+                                    status="pending",
+                                )
+                                created += 1
+                            except Exception:
+                                pass
+                    await db.complete_validator_job(job["id"], result={"scheduled_leads": confirmed, "rows": created})
+                    return True
                 except Exception as e:
-                    await db.fail_validator_job(job["id"], f"truth_guard_exception: {e}", schedule_retry_in_seconds=12*3600)
+                    await db.fail_validator_job(job["id"], f"truth_guard_exception: {e}", schedule_retry_in_seconds=6*3600)
+                    return False
+            elif j == "era5.era5_truth_guard_all":
+                # Global guard: scan all unfinished runs and schedule per-lead ERA5 steps when truth is ready
+                try:
+                    from gaia.tasks.defined_tasks.weather.pipeline.steps.era5_step import _get_era5_truth
+                    from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+                    from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import _upsert
+                    t = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+                    runs = await db.fetch_all(
+                        """
+                        SELECT id, gfs_init_time_utc
+                        FROM weather_forecast_runs
+                        WHERE status NOT IN ('completed','failed')
+                        ORDER BY id
+                        """
+                    )
+                    total_created = 0
+                    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+                    now_utc = _dt.now(_tz.utc)
+                    leads_default = t.config.get("final_scoring_lead_hours", [24,48,72,96,120,144,168,192,216,240])
+                    delay_days = int(t.config.get("era5_delay_days", 5))
+                    buffer_hours = int(t.config.get("era5_buffer_hours", 6))
+                    def _needed_time(gfs_init, h: int):
+                        return gfs_init + _td(hours=h) + _td(days=delay_days) + _td(hours=buffer_hours)
+                    # Track dates found unavailable this cycle to avoid duplicate failing fetches
+                    unavailable_dates = set()  # set of 'YYYY-MM-DD'
+                    import numpy as np
+                    for run in runs:
+                        rid = int(run["id"])
+                        gfs_init = run.get("gfs_init_time_utc")
+                        if not gfs_init:
+                            continue
+                        time_ready_leads = [h for h in leads_default if now_utc >= _needed_time(gfs_init, h)]
+                        if not time_ready_leads:
+                            continue
+                        # Skip leads whose date was already found unavailable
+                        filtered_leads = []
+                        for h in time_ready_leads:
+                            dt = gfs_init + _td(hours=h)
+                            dkey = dt.strftime("%Y-%m-%d")
+                            if dkey in unavailable_dates:
+                                continue
+                            filtered_leads.append(h)
+                        if not filtered_leads:
+                            continue
+                        ds = await _get_era5_truth(t, rid, gfs_init, filtered_leads)
+                        if ds is None:
+                            continue
+                        try:
+                            ds_times = getattr(ds, "indexes", None) and ds.indexes.get("time")
+                            if ds_times is None:
+                                ds_times = getattr(ds, "time", None) and ds["time"].values
+                            arr = np.array(ds_times) if ds_times is not None else None
+                        except Exception:
+                            arr = None
+                        confirmed = []
+                        for h in filtered_leads:
+                            target_dt = gfs_init + _td(hours=h)
+                            ok = True
+                            if arr is not None:
+                                try:
+                                    dt64 = np.datetime64(target_dt.replace(tzinfo=None))
+                                    ok = np.any(arr == dt64)
+                                except Exception:
+                                    ok = False
+                            if ok:
+                                confirmed.append(h)
+                            else:
+                                try:
+                                    unavailable_dates.add(target_dt.strftime("%Y-%m-%d"))
+                                except Exception:
+                                    pass
+                        if not confirmed:
+                            continue
+                        miners = await db.fetch_all(
+                            "SELECT DISTINCT miner_uid, miner_hotkey FROM weather_miner_responses WHERE run_id = :rid",
+                            {"rid": rid},
+                        )
+                        # Build skip sets to avoid re-scoring already completed leads
+                        try:
+                            rows_succeeded = await db.fetch_all(
+                                """
+                                SELECT miner_uid, lead_hours
+                                FROM weather_forecast_steps
+                                WHERE run_id = :rid AND step_name = 'era5' AND substep = 'score' AND status = 'succeeded'
+                                """,
+                                {"rid": rid},
+                            )
+                        except Exception:
+                            rows_succeeded = []
+                        try:
+                            rows_failed = await db.fetch_all(
+                                """
+                                SELECT miner_uid, lead_hours
+                                FROM weather_forecast_steps
+                                WHERE run_id = :rid AND step_name = 'era5' AND substep = 'score' AND status = 'failed'
+                                """,
+                                {"rid": rid},
+                            )
+                        except Exception:
+                            rows_failed = []
+                        try:
+                            rows_scored = await db.fetch_all(
+                                """
+                                SELECT miner_uid, lead_hours
+                                FROM weather_miner_scores
+                                WHERE run_id = :rid AND lead_hours IS NOT NULL AND score_type LIKE 'era5_rmse_%'
+                                GROUP BY miner_uid, lead_hours
+                                """,
+                                {"rid": rid},
+                            )
+                        except Exception:
+                            rows_scored = []
+                        succeeded_set = {(int(r.get("miner_uid")), int(r.get("lead_hours"))) for r in rows_succeeded if r and r.get("lead_hours") is not None}
+                        failed_set = {(int(r.get("miner_uid")), int(r.get("lead_hours"))) for r in rows_failed if r and r.get("lead_hours") is not None}
+                        scored_set = {(int(r.get("miner_uid")), int(r.get("lead_hours"))) for r in rows_scored if r and r.get("lead_hours") is not None}
+                        try:
+                            logger.info(
+                                f"[ERA5 Guard] Run {rid}: confirmed leads {confirmed} — scheduling for {len(miners or [])} miners"
+                            )
+                        except Exception:
+                            pass
+                        run_created = 0
+                        for h in confirmed:
+                            for m in miners:
+                                key = (int(m["miner_uid"]), int(h))
+                                if key in succeeded_set or key in scored_set or key in failed_set:
+                                    continue
+                                try:
+                                    await _upsert(
+                                        db,
+                                        run_id=rid,
+                                        miner_uid=int(m["miner_uid"]),
+                                        miner_hotkey=m.get("miner_hotkey") or "unknown",
+                                        step_name="era5",
+                                        substep="score",
+                                        lead_hours=int(h),
+                                        status="pending",
+                                    )
+                                    total_created += 1
+                                    run_created += 1
+                                except Exception:
+                                    pass
+                        try:
+                            logger.info(
+                                f"[ERA5 Guard] Run {rid}: created {run_created} step rows"
+                            )
+                        except Exception:
+                            pass
+                    if total_created > 0:
+                        await db.complete_validator_job(job["id"], result={"scheduled_rows": total_created})
+                    else:
+                        # Reschedule in 3 hours if no work now
+                        await db.fail_validator_job(job["id"], "no_work_now", schedule_retry_in_seconds=3*3600)
+                    return True
+                except Exception as e:
+                    await db.fail_validator_job(job["id"], f"truth_guard_all_exception: {e}", schedule_retry_in_seconds=6*3600)
                     return False
             else:
                 # Placeholder for other era5.* jobs

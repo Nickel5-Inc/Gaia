@@ -176,17 +176,23 @@ class WeatherStatsManager:
             if initial_score is not None:
                 stats_data["forecast_score_initial"] = initial_score
             
-            # Add ERA5 scores
+            # Add ERA5 scores (clamped 0..1)
             if era5_scores:
                 completeness_count = 0
                 total_score = 0
                 for lead_hour, score in era5_scores.items():
+                    # Defensive clamp
+                    try:
+                        s_val = float(score)
+                    except Exception:
+                        continue
+                    s_val = max(0.0, min(1.0, s_val))
                     col_name = f"era5_score_{lead_hour}h"
                     if hasattr(weather_forecast_stats_table.c, col_name):
-                        stats_data[col_name] = score
-                        if score > 0:  # Count non-zero scores
+                        stats_data[col_name] = s_val
+                        if s_val > 0:  # Count non-zero scores
                             completeness_count += 1
-                            total_score += score
+                            total_score += s_val
                 
                 # Calculate combined score and completeness
                 max_timesteps = 10  # 24h to 240h in 24h increments
@@ -207,7 +213,13 @@ class WeatherStatsManager:
             if avg_skill_score is not None:
                 stats_data["avg_skill_score"] = avg_skill_score
             if overall_forecast_score is not None:
-                stats_data["overall_forecast_score"] = overall_forecast_score
+                # Defensive clamp overall score
+                try:
+                    overall_val = float(overall_forecast_score)
+                except Exception:
+                    overall_val = None
+                if overall_val is not None:
+                    stats_data["overall_forecast_score"] = max(0.0, min(1.0, overall_val))
             
             # Upsert the record
             stmt = insert(weather_forecast_stats_table).values(**stats_data)

@@ -38,58 +38,65 @@ class DataNotReadyError(Exception):
 _era5_truth_cache: Dict[Tuple[int, Tuple[int, ...]], Any] = {}
 
 
-async def _get_era5_truth(task: WeatherTask, run_id: int, gfs_init, leads: list[int]):
+async def _get_era5_truth(task: WeatherTask, run_id: int, gfs_init, leads: list[int], *, prefer_cache_only: bool = False):
     key = (run_id, tuple(leads))
     # Avoid asyncio Lock; concurrent reads are safe. If racing, later write just overwrites same reference.
     ds = _era5_truth_cache.get(key)
     if ds is not None:
         return ds
 
-    # Single-worker guard: use advisory lock per (run_id, 'era5') to prevent duplicate heavy fetch
-    lock_key = (0x45524135 ^ int(run_id))  # prefix 'ERA5' xor run_id
-    try:
-        db = task.db_manager
-        row = await db.fetch_one("SELECT pg_try_advisory_lock(:key) AS ok", {"key": lock_key})
-        have_lock = bool(row and row.get("ok"))
-    except Exception:
-        have_lock = False
+    have_lock = False
+    # Single-worker guard: only acquire advisory lock when doing heavy fetches
+    if not prefer_cache_only:
+        lock_key = (0x45524135 ^ int(run_id))  # prefix 'ERA5' xor run_id
+        try:
+            db = task.db_manager
+            row = await db.fetch_one("SELECT pg_try_advisory_lock(:key) AS ok", {"key": lock_key})
+            have_lock = bool(row and row.get("ok"))
+        except Exception:
+            have_lock = False
 
     target_datetimes = [gfs_init + timedelta(hours=h) for h in leads]
     ds = None
     try:
         cache_dir_str = task.config.get("era5_cache_dir", "./era5_cache")
-        # Only the lock holder performs the heavy fetch; others back off
-        if have_lock:
+        # FAST PATH: cache-only read; no lock, no wait
+        if prefer_cache_only:
+            try:
+                use_progressive_fetch = task.config.get("progressive_era5_fetch", True)
+                if use_progressive_fetch:
+                    from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data_progressive
+                    ds = await fetch_era5_data_progressive(
+                        target_datetimes, cache_dir=Path(cache_dir_str), cache_only=True
+                    )
+                else:
+                    ds = None
+            except Exception:
+                ds = None
+        elif have_lock:
             # Use progressive fetch for consistency with finalize worker and better caching
             use_progressive_fetch = task.config.get("progressive_era5_fetch", True)
             if use_progressive_fetch:
                 from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data_progressive
                 ds = await fetch_era5_data_progressive(
-                    target_datetimes, cache_dir=Path(cache_dir_str)
+                    target_datetimes, cache_dir=Path(cache_dir_str), cache_only=False
                 )
             else:
                 ds = await fetch_era5_data(
                     target_datetimes, cache_dir=Path(cache_dir_str)
                 )
         else:
-            # Non-lock holders should not hit the ERA5 API. Optionally wait briefly, then return None.
-            guard_wait_seconds = int(task.config.get("era5_guard_wait_seconds", 900))
-            try:
-                await asyncio.sleep(max(1, guard_wait_seconds))
-            except Exception:
-                pass
-            # Opportunistic cache read after wait (will be fast if lock holder saved files)
+            # Non-lock holders: do not hit API; attempt cache-only load without delay
             try:
                 use_progressive_fetch = task.config.get("progressive_era5_fetch", True)
                 if use_progressive_fetch:
                     from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data_progressive
                     ds = await fetch_era5_data_progressive(
-                        target_datetimes, cache_dir=Path(cache_dir_str)
+                        target_datetimes, cache_dir=Path(cache_dir_str), cache_only=True
                     )
                 else:
-                    ds = await fetch_era5_data(
-                        target_datetimes, cache_dir=Path(cache_dir_str)
-                    )
+                    # Non-progressive path has no cache-only mode; skip to None
+                    ds = None
             except Exception:
                 ds = None
     finally:
@@ -162,6 +169,52 @@ async def run_item(
     leads: list[int] = task.config.get(
         "final_scoring_lead_hours", [24, 48, 72, 96, 120, 144, 168, 192, 216, 240]
     )
+    # OPTIONAL OVERRIDE: Use per-lead scheduling from steps table if present
+    try:
+        override_rows = await db.fetch_all(
+            sa.text(
+                """
+                SELECT DISTINCT lead_hours
+                FROM weather_forecast_steps
+                WHERE run_id = :rid AND miner_uid = :uid
+                  AND step_name = 'era5' AND substep = 'score'
+                  AND lead_hours IS NOT NULL
+                  AND status IN ('pending', 'retry_scheduled', 'queued', 'in_progress')
+                ORDER BY lead_hours
+                """
+            ),
+            {"rid": run_id, "uid": miner_uid},
+        )
+        override_leads = [int(r.get("lead_hours")) for r in override_rows if r and r.get("lead_hours") is not None]
+        if override_leads:
+            allowed = set(leads)
+            leads = sorted([h for h in override_leads if h in allowed])
+            if not leads:
+                # If override produced no valid leads, fail fast to avoid useless attempts
+                logger.info(f"[ERA5] Run {run_id} Miner {miner_uid}: override leads present but none valid; skipping")
+                return False
+    except Exception:
+        pass
+
+    # If this step row is waiting_for_truth, avoid any API access and return DataNotReady to complete job
+    try:
+        st = await db.fetch_one(
+            sa.text(
+                """
+                SELECT status FROM weather_forecast_steps
+                WHERE run_id = :rid AND miner_uid = :uid
+                  AND step_name = 'era5' AND substep = 'score'
+                LIMIT 1
+                """
+            ),
+            {"rid": run_id, "uid": miner_uid},
+        )
+        if st and st.get("status") == "waiting_for_truth":
+            raise DataNotReadyError("waiting_for_truth step row")
+    except DataNotReadyError:
+        raise
+    except Exception:
+        pass
     # Existing score check
     rows = await db.fetch_all(
         sa.text(
@@ -183,6 +236,27 @@ async def run_item(
         if lh is not None and sc is not None:
             existing_scores[int(lh)] = float(sc)
     if len([h for h in leads if h in existing_scores]) >= len(leads):
+        # Metrics already exist for all requested leads. Compute/write normalized per-lead and overall via aggregator,
+        # rather than writing raw RMSE into stats.
+        try:
+            from gaia.tasks.defined_tasks.weather.processing.weather_logic import _calculate_and_store_aggregated_era5_score
+            vars_levels = task.config.get(
+                "final_scoring_variables_levels",
+                task.config.get("day1_variables_levels_to_score", []),
+            )
+            await _calculate_and_store_aggregated_era5_score(
+                task_instance=task,
+                run_id=run_id,
+                miner_uid=miner_uid,
+                miner_hotkey=miner_hotkey,
+                response_id=resp["id"],
+                lead_hours_scored=leads,
+                vars_levels_scored=vars_levels,
+            )
+        except Exception as agg_err:
+            logger.debug(f"[ERA5Step] Skipped normalized aggregate write due to error: {agg_err}")
+
+        # Update status to completed without overwriting normalized scores
         stats = WeatherStatsManager(
             db,
             validator_hotkey=(
@@ -196,7 +270,6 @@ async def run_item(
             miner_uid=miner_uid,
             miner_hotkey=miner_hotkey,
             status="completed",
-            era5_scores=existing_scores,
         )
         return True
     delay_days = int(getattr(task.config, "era5_delay_days", task.config.get("era5_delay_days", 5))) if hasattr(task, "config") else 5
@@ -239,21 +312,74 @@ async def run_item(
             f"[ERA5] Run {run_id} Miner {miner_uid}: No ERA5 data ready yet. "
             f"Next lead ready in {hours_until_ready:.1f} hours at {next_ready_time}"
         )
-        # Return a special exception to indicate data not ready (not a failure)
+        # Move step to waiting_for_truth and let guard job re-activate
+        try:
+            await db.execute(
+                """
+                UPDATE weather_forecast_steps
+                SET status = 'waiting_for_truth', next_retry_time = NULL
+                WHERE run_id = :rid AND miner_uid = :uid AND step_name = 'era5' AND substep = 'score'
+                """,
+                {"rid": run_id, "uid": miner_uid},
+            )
+        except Exception:
+            pass
+        # Signal not-ready to caller
         raise DataNotReadyError(
             f"ERA5 data not ready for {hours_until_ready:.1f} hours",
             next_ready_at=next_ready_time,
         )
     logger.info(f"[ERA5] Run {run_id} Miner {miner_uid}: Progressive scoring {len(ready_days)} days with {len(ready_leads)} lead times: {ready_leads}")
+    try:
+        logger.debug(f"[ERA5] Run {run_id} Miner {miner_uid}: Fetching ERA5 truth for {len(ready_leads)} targets")
+    except Exception:
+        pass
     
     # Load truth/climatology for only the ready leads (one day at a time)
-    truth = await _get_era5_truth(task, run_id, gfs_init, ready_leads)
+    # Truth fetching: rely on cache-only here; the guard job is the only one allowed to hit the API
+    truth = await _get_era5_truth(task, run_id, gfs_init, ready_leads, prefer_cache_only=True)
+    try:
+        n_times = 0
+        if truth is not None:
+            try:
+                n_times = len(getattr(truth, "indexes", None) and truth.indexes.get("time") or getattr(truth, "time", []))
+            except Exception:
+                n_times = 0
+        logger.debug(f"[ERA5] Run {run_id} Miner {miner_uid}: Truth dataset ready (time_count={n_times})")
+    except Exception:
+        pass
+    try:
+        logger.debug(f"[ERA5] Run {run_id} Miner {miner_uid}: Loading ERA5 climatology")
+    except Exception:
+        pass
     clim = await task._get_or_load_era5_climatology()
+    try:
+        logger.debug(f"[ERA5] Run {run_id} Miner {miner_uid}: Climatology loaded: {bool(clim)}")
+    except Exception:
+        pass
     if not truth or not clim:
-        # Signal data-not-ready so the worker schedules a long backoff instead of tight retries
-        backoff_hours = int(getattr(task.config, "era5_retry_backoff_hours", task.config.get("era5_retry_backoff_hours", 6))) if hasattr(task, "config") else 6
-        next_ready_time = datetime.now(timezone.utc) + timedelta(hours=max(1, backoff_hours))
-        raise DataNotReadyError("ERA5 truth/climatology not ready", next_ready_at=next_ready_time)
+        # Treat this as a fetch failure (likely miner/network), not truth gating; mark per-lead failed
+        try:
+            from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import _upsert as _sl_upsert
+            for _lh in ready_leads:
+                try:
+                    await _sl_upsert(
+                        db,
+                        run_id=run_id,
+                        miner_uid=miner_uid,
+                        miner_hotkey=miner_hotkey,
+                        step_name="era5",
+                        substep="score",
+                        lead_hours=int(_lh),
+                        status="failed",
+                        completed_at=datetime.now(timezone.utc),
+                        error_json={"type": "truth_or_clim_fetch_failed"},
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return False
 
     # Validate truth actually contains requested times; refine ready_leads accordingly
     try:
@@ -296,8 +422,28 @@ async def run_item(
             if _has_time(target_dt):
                 confirmed_ready_leads.append(h)
         if not confirmed_ready_leads:
-            # No actual matching times in truth; back off
-            raise DataNotReadyError("ERA5 truth missing requested times", next_ready_at=datetime.now(timezone.utc) + timedelta(hours=3))
+            # No matching times; mark failed rather than mislabel as truth gate
+            try:
+                from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import _upsert as _sl_upsert
+                for _lh in ready_leads:
+                    try:
+                        await _sl_upsert(
+                            db,
+                            run_id=run_id,
+                            miner_uid=miner_uid,
+                            miner_hotkey=miner_hotkey,
+                            step_name="era5",
+                            substep="score",
+                            lead_hours=int(_lh),
+                            status="failed",
+                            completed_at=datetime.now(timezone.utc),
+                            error_json={"type": "truth_times_missing"},
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return False
         # Use refined list
         ready_leads = sorted(confirmed_ready_leads)
     except DataNotReadyError:
@@ -312,7 +458,28 @@ async def run_item(
         "miner_uid": miner_uid,
         "job_id": resp.get("job_id"),
     }
-    @substep("era5", "score", should_retry=True, retry_delay_seconds=3600, max_retries=4, retry_backoff="none")
+    # Mark per-lead steps as in_progress now (ensures we don't re-enqueue them)
+    try:
+        from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import _upsert as _sl_upsert
+        now_ts = datetime.now(timezone.utc)
+        for _lh in ready_leads:
+            try:
+                await _sl_upsert(
+                    db,
+                    run_id=run_id,
+                    miner_uid=miner_uid,
+                    miner_hotkey=miner_hotkey,
+                    step_name="era5",
+                    substep="score",
+                    lead_hours=int(_lh),
+                    status="in_progress",
+                    started_at=now_ts,
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+    @substep("era5", "score", should_retry=False)
     async def _score_era5_item(db, task: WeatherTask, *, run_id: int, miner_uid: int, miner_hotkey: str):
         return await calculate_era5_miner_score(
             task_instance=task,
@@ -324,6 +491,7 @@ async def run_item(
     import time
     t0 = time.perf_counter()
     try:
+        # Execute scoring without an overall timeout; rely on internal guards and error handling
         ok = await _score_era5_item(
             db,
             task,
@@ -332,11 +500,41 @@ async def run_item(
             miner_hotkey=miner_hotkey,
         )
     except Exception as e:
+        import traceback as _tb
+        tb_text = _tb.format_exc()
         logger.exception(
-            f"[ERA5] Exception during scoring for run {run_id} miner {miner_uid} leads={ready_leads}: {e}"
+            f"[ERA5] Exception during scoring for run {run_id} miner {miner_uid} leads={ready_leads}: {e}\nTRACEBACK:\n{tb_text}"
         )
         ok = False
     if not ok:
+        # Mark per-lead steps as failed to prevent re-enqueue
+        try:
+            from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import _upsert as _sl_upsert
+            for _lh in ready_leads:
+                try:
+                    await _sl_upsert(
+                        db,
+                        run_id=run_id,
+                        miner_uid=miner_uid,
+                        miner_hotkey=miner_hotkey,
+                        step_name="era5",
+                        substep="score",
+                        lead_hours=int(_lh),
+                        status="failed",
+                        completed_at=datetime.now(timezone.utc),
+                    )
+                    # Additionally, clear any linked job_id so a fresh job can be created only if status returns to pending
+                    try:
+                        await db.execute(
+                            "UPDATE weather_forecast_steps SET job_id = NULL WHERE run_id = :rid AND miner_uid = :uid AND step_name = 'era5' AND substep = 'score' AND lead_hours = :lh",
+                            {"rid": run_id, "uid": miner_uid, "lh": int(_lh)},
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
         await log_failure(
             db,
             run_id=run_id,
@@ -352,6 +550,12 @@ async def run_item(
         )
         return False
     latency_ms = int((time.perf_counter() - t0) * 1000)
+    try:
+        logger.info(
+            f"[ERA5] Run {run_id} Miner {miner_uid}: Scoring complete for leads {ready_leads} in {latency_ms}ms"
+        )
+    except Exception:
+        pass
 
     # After scoring, compute normalized per-lead scores and overall (writes to weather_forecast_stats)
     try:
@@ -410,6 +614,26 @@ async def run_item(
                 {"run_id": run_id, "miner_uid": miner_uid}
             )
             logger.info(f"[ERA5Step] Recorded ERA5 completion and total pipeline duration for miner {miner_uid}")
+        # Mark per-lead steps as succeeded
+        try:
+            from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import _upsert as _sl_upsert
+            for _lh in ready_leads:
+                try:
+                    await _sl_upsert(
+                        db,
+                        run_id=run_id,
+                        miner_uid=miner_uid,
+                        miner_hotkey=miner_hotkey,
+                        step_name="era5",
+                        substep="score",
+                        lead_hours=int(_lh),
+                        status="succeeded",
+                        completed_at=datetime.now(timezone.utc),
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
         await log_success(
             db,
             run_id=run_id,

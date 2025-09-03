@@ -1597,14 +1597,18 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             steps = await self.fetch_all(
                 """
                 SELECT s.id AS step_id, s.run_id, s.miner_uid, s.step_name,
-                       r.id AS response_id, r.miner_hotkey, r.status as response_status, s.substep
+                       r.id AS response_id, r.miner_hotkey, r.status as response_status, s.substep, s.lead_hours
                 FROM weather_forecast_steps s
                 LEFT JOIN weather_miner_responses r
                   ON r.run_id = s.run_id AND r.miner_uid = s.miner_uid
-                WHERE s.step_name IN ('seed','day1','era5')
+                WHERE 
+                  (
+                    (s.step_name = 'seed' AND s.substep = 'download_gfs') OR
+                    (s.step_name = 'era5' AND s.substep = 'score' AND s.lead_hours IS NOT NULL)
+                  )
                   AND (
-                        s.status = 'pending'
-                        OR (s.status = 'retry_scheduled' AND (s.next_retry_time IS NULL OR s.next_retry_time <= NOW()))
+                    s.status = 'pending'
+                    OR (s.status = 'retry_scheduled' AND (s.next_retry_time IS NULL OR s.next_retry_time <= NOW()))
                   )
                 ORDER BY s.run_id ASC, s.miner_uid ASC
                 LIMIT :limit
@@ -1612,6 +1616,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 {"limit": limit},
             )
             inserted = 0
+            try:
+                logger.debug(f"[EnqueueSteps] Scanned {len(steps)} step rows for job creation")
+            except Exception:
+                pass
             for s in steps:
                 step_name = s.get("step_name")
                 
@@ -1652,10 +1660,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     job_id = int(row["id"]) if row else None
                     if job_id:
                         inserted += 1
-                        # Link from step to job for easier joins
+                        # Link from step to job for easier joins and mark queued to avoid re-enqueue
                         try:
                             await self.execute(
-                                "UPDATE weather_forecast_steps SET job_id = :jid WHERE id = :sid",
+                                "UPDATE weather_forecast_steps SET job_id = :jid, status = 'queued' WHERE id = :sid",
                                 {"jid": job_id, "sid": s["step_id"]},
                             )
                         except Exception:
@@ -1663,19 +1671,20 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     continue
                 
                 # For per-miner steps, require valid response
-                if step_name == "day1":
-                    # Only create day1 jobs for miners that have successfully submitted forecasts
-                    response_status = s.get("response_status")
-                    if response_status not in ("forecast_submitted", "forecast_ready", "day1_scored"):
+                if step_name == "era5":
+                    # Drop any legacy/leadless rows as extra safety
+                    if s.get("substep") != "score" or s.get("lead_hours") is None:
                         continue
-                elif step_name == "era5":
-                    # Only create era5 jobs for miners that have been day1 scored
+                    # Allow era5 jobs when forecast is ready or later (day1_scored, era5_scored)
                     response_status = s.get("response_status")
-                    if response_status not in ("day1_scored", "era5_scored"):
+                    if response_status not in ("forecast_ready", "day1_scored", "era5_scored"):
                         continue
-                    
+                    # Do not enqueue if step is marked waiting_for_truth
+                    if s.get("status") == "waiting_for_truth":
+                        continue
+
                 # Also skip if no response_id for scoring steps
-                if step_name in ("day1", "era5") and s.get("response_id") is None:
+                if step_name in ("era5",) and s.get("response_id") is None:
                     continue
                     
                 payload = {
@@ -1687,7 +1696,11 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     "miner_hotkey": s.get("miner_hotkey"),
                 }
                 # CRITICAL FIX: Use singleton jobs to prevent race condition duplicates
-                singleton_key = f"{step_name}_score_run_{s['run_id']}_miner_{s['miner_uid']}"
+                lh = s.get("lead_hours")
+                if lh is not None:
+                    singleton_key = f"{step_name}_score_run_{s['run_id']}_miner_{s['miner_uid']}_L{int(lh)}"
+                else:
+                    singleton_key = f"{step_name}_score_run_{s['run_id']}_miner_{s['miner_uid']}"
                 job_id = await self.enqueue_singleton_job(
                     singleton_key=singleton_key,
                     job_type=f"weather.{step_name}",
@@ -1698,14 +1711,18 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 )
                 if job_id:
                     inserted += 1
-                    # Link from step to job for easier joins
+                    # Link from step to job for easier joins and mark queued to avoid re-enqueue
                     try:
                         await self.execute(
-                            "UPDATE weather_forecast_steps SET job_id = :jid WHERE id = :sid",
+                            "UPDATE weather_forecast_steps SET job_id = :jid, status = 'queued' WHERE id = :sid",
                             {"jid": job_id, "sid": s["step_id"]},
                         )
                     except Exception:
                         pass
+            try:
+                logger.info(f"[EnqueueSteps] Created {inserted} jobs from steps")
+            except Exception:
+                pass
             return inserted
         except Exception as e:
             logger.error(f"enqueue_weather_step_jobs error: {e}")
@@ -1958,7 +1975,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             )
             results["cleaned_old_records"] = cleaned_count
 
-            # Check for orphaned records (miners no longer in metagraph)
+            # Check for orphaned records (miners not in metagraph)
             orphan_check_query = """
             SELECT COUNT(*) as orphan_count
             FROM geomagnetic_predictions gp

@@ -2643,6 +2643,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 )
                 if run_info_row and run_info_row.get("gfs_init_time_utc"):
                     gfs_dt = run_info_row["gfs_init_time_utc"].astimezone(timezone.utc)
+                    # Standardize to minute precision (short form)
                     gfs_str = gfs_dt.strftime("%Y%m%dT%H%MZ")
                 else:
                     gfs_str = "unknown"

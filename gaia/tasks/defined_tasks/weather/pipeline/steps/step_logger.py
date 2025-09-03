@@ -150,6 +150,9 @@ async def log_failure(
     latency_str = f" after {latency_ms}ms" if latency_ms else ""
     retry_str = f" (retry {retry_count})" if retry_count else ""
     msg = error_json.get("message", "Unknown error") if isinstance(error_json, dict) else "Unknown error"
+    tb = None
+    if isinstance(error_json, dict) and isinstance(error_json.get("traceback"), str):
+        tb = error_json["traceback"]
     # Compact context rendering to avoid massive logs
     ctx = None
     if isinstance(error_json, dict) and isinstance(error_json.get("context"), (dict, list)):
@@ -159,9 +162,14 @@ async def log_failure(
         except Exception:
             ctx = str(error_json.get("context"))[:300]
     context_str = f" | context={ctx}" if ctx else ""
-    logger.error(
-        f"❌ [Run {run_id}] Miner {miner_uid}: Failed {step_name}{substep_str}{lead_str}{latency_str}: {msg}{context_str}{retry_str}"
-    )
+    if tb:
+        logger.error(
+            f"❌ [Run {run_id}] Miner {miner_uid}: Failed {step_name}{substep_str}{lead_str}{latency_str}: {msg}{context_str}{retry_str}\nTRACEBACK:\n{tb}"
+        )
+    else:
+        logger.error(
+            f"❌ [Run {run_id}] Miner {miner_uid}: Failed {step_name}{substep_str}{lead_str}{latency_str}: {msg}{context_str}{retry_str}"
+        )
     
     await _upsert(
         db,

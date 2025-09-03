@@ -420,35 +420,35 @@ class CustomLogger:
     
     # Implement the same interface as fiber's logger with proper caller detection
     def debug(self, message: str, *args, **kwargs):
-        self._logger.opt(depth=1).debug(message, *args, **kwargs)
+        self._logger.opt(depth=1).debug("{}", message, *args, **kwargs)
     
     def info(self, message: str, *args, **kwargs):
-        self._logger.opt(depth=1).info(message, *args, **kwargs)
+        self._logger.opt(depth=1).info("{}", message, *args, **kwargs)
     
     def warning(self, message: str, *args, **kwargs):
-        self._logger.opt(depth=1).warning(message, *args, **kwargs)
+        self._logger.opt(depth=1).warning("{}", message, *args, **kwargs)
     
     def warn(self, message: str, *args, **kwargs):
         # Alias for warning to match standard logging
-        self._logger.opt(depth=1).warning(message, *args, **kwargs)
+        self._logger.opt(depth=1).warning("{}", message, *args, **kwargs)
     
     def error(self, message: str, *args, **kwargs):
-        self._logger.opt(depth=1).error(message, *args, **kwargs)
+        self._logger.opt(depth=1).error("{}", message, *args, **kwargs)
     
     def critical(self, message: str, *args, **kwargs):
-        self._logger.opt(depth=1).critical(message, *args, **kwargs)
+        self._logger.opt(depth=1).critical("{}", message, *args, **kwargs)
     
     def exception(self, message: str, *args, **kwargs):
         # Log with exception traceback
-        self._logger.opt(depth=1).exception(message, *args, **kwargs)
+        self._logger.opt(depth=1).exception("{}", message, *args, **kwargs)
     
     def success(self, message: str, *args, **kwargs):
         # Loguru's special success level
-        self._logger.opt(depth=1).success(message, *args, **kwargs)
+        self._logger.opt(depth=1).success("{}", message, *args, **kwargs)
     
     def trace(self, message: str, *args, **kwargs):
         # Loguru's trace level (more verbose than debug)
-        self._logger.opt(depth=1).trace(message, *args, **kwargs)
+        self._logger.opt(depth=1).trace("{}", message, *args, **kwargs)
     
     # Properties to match standard logger interface
     @property
@@ -470,28 +470,28 @@ class CustomLogger:
         # Convert numeric levels to loguru levels with proper depth
         if isinstance(level, int):
             if level >= 50:
-                self._logger.opt(depth=1).critical(message, *args, **kwargs)
+                self._logger.opt(depth=1).critical("{}", message, *args, **kwargs)
             elif level >= 40:
-                self._logger.opt(depth=1).error(message, *args, **kwargs)
+                self._logger.opt(depth=1).error("{}", message, *args, **kwargs)
             elif level >= 30:
-                self._logger.opt(depth=1).warning(message, *args, **kwargs)
+                self._logger.opt(depth=1).warning("{}", message, *args, **kwargs)
             elif level >= 20:
-                self._logger.opt(depth=1).info(message, *args, **kwargs)
+                self._logger.opt(depth=1).info("{}", message, *args, **kwargs)
             else:
-                self._logger.opt(depth=1).debug(message, *args, **kwargs)
+                self._logger.opt(depth=1).debug("{}", message, *args, **kwargs)
         else:
             # String level
             level_str = str(level).upper()
             if level_str == "CRITICAL":
-                self._logger.opt(depth=1).critical(message, *args, **kwargs)
+                self._logger.opt(depth=1).critical("{}", message, *args, **kwargs)
             elif level_str == "ERROR":
-                self._logger.opt(depth=1).error(message, *args, **kwargs)
+                self._logger.opt(depth=1).error("{}", message, *args, **kwargs)
             elif level_str == "WARNING":
-                self._logger.opt(depth=1).warning(message, *args, **kwargs)
+                self._logger.opt(depth=1).warning("{}", message, *args, **kwargs)
             elif level_str == "INFO":
-                self._logger.opt(depth=1).info(message, *args, **kwargs)
+                self._logger.opt(depth=1).info("{}", message, *args, **kwargs)
             else:
-                self._logger.opt(depth=1).debug(message, *args, **kwargs)
+                self._logger.opt(depth=1).debug("{}", message, *args, **kwargs)
 
 
 # Cache to store logger instances (like fiber does)

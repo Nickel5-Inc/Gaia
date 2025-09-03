@@ -495,56 +495,7 @@ async def run_item(
                     f"[Day1Step] Failed to update combined initial score row for run {run_id}: {e_comb}"
                 )
             
-            # SELF-MANAGING PIPELINE: Create ERA5 job upon Day1 completion, but schedule for when ERA5 is likely available
-            try:
-                # Compute earliest expected availability window for ERA5
-                run_row = await db.fetch_one(
-                    "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :rid",
-                    {"rid": run_id},
-                )
-                delay_days = int(getattr(task.config, "era5_delay_days", task.config.get("era5_delay_days", 5))) if hasattr(task, "config") else 5
-                buffer_hours = int(getattr(task.config, "era5_buffer_hours", task.config.get("era5_buffer_hours", 6))) if hasattr(task, "config") else 6
-                next_ready_time = None
-                if run_row and run_row.get("gfs_init_time_utc"):
-                    next_ready_time = run_row["gfs_init_time_utc"] + timedelta(days=delay_days, hours=buffer_hours)
-
-                era5_singleton_key = f"era5_score_run_{run_id}_miner_{miner_uid}"
-                era5_job_id = await db.enqueue_singleton_job(
-                    singleton_key=era5_singleton_key,
-                    job_type="weather.era5",
-                    payload={
-                        "run_id": run_id,
-                        "miner_uid": miner_uid,
-                        "miner_hotkey": miner_hotkey,
-                        "response_id": response_id,
-                    },
-                    priority=65,  # Slightly lower priority than Day1
-                    run_id=run_id,
-                    miner_uid=miner_uid,
-                    scheduled_at=next_ready_time,
-                )
-                if era5_job_id:
-                    logger.info(f"[Day1Step] ✓ Created ERA5 successor job {era5_job_id} for miner {miner_uid}")
-                else:
-                    logger.debug(f"[Day1Step] ERA5 job already exists for miner {miner_uid}")
-            except Exception as e:
-                logger.warning(f"[Day1Step] Failed to create ERA5 successor job for miner {miner_uid}: {e}")
-
-            # Also create a singleton guard job per run to check and pre-fetch ERA5 truth, then unblock all miners
-            try:
-                truth_key = f"era5_truth_guard_run_{run_id}"
-                _ = await db.enqueue_singleton_job(
-                    singleton_key=truth_key,
-                    job_type="era5.era5_truth_guard",
-                    payload={
-                        "run_id": run_id,
-                    },
-                    priority=60,
-                    run_id=run_id,
-                    scheduled_at=next_ready_time,
-                )
-            except Exception:
-                pass
+            # ERA5 successor job creation removed. Global guard will orchestrate lead-ready steps.
             
         from gaia.tasks.defined_tasks.weather.processing.weather_logic import _check_run_completion
         try:

@@ -698,7 +698,7 @@ AURORA_PRESSURE_LEVELS = [
 
 
 async def fetch_era5_data_progressive(
-    target_times: List[datetime], cache_dir: Path = Path("./era5_cache")
+    target_times: List[datetime], cache_dir: Path = Path("./era5_cache"), *, cache_only: bool = False
 ) -> Optional[xr.Dataset]:
     """
     Optimized ERA5 fetch for progressive scoring.
@@ -737,12 +737,13 @@ async def fetch_era5_data_progressive(
     downloads = 0
 
     for date_key, times_for_date in daily_groups.items():
+        logger.debug(f"[ERA5Fetch] Starting date {date_key} with {len(times_for_date)} times; cache_only={cache_only}")
         logger.debug(
             f"Processing date {date_key} with {len(times_for_date)} time points"
         )
 
         daily_ds, was_cache_hit = await _fetch_single_day_era5(
-            date_key, times_for_date, cache_dir
+            date_key, times_for_date, cache_dir, cache_only=cache_only
         )
         if daily_ds is not None:
             daily_datasets.append(daily_ds)
@@ -753,6 +754,7 @@ async def fetch_era5_data_progressive(
                 downloads += 1
             logger.debug(f"✅ Successfully fetched ERA5 data for date {date_key}")
         else:
+            logger.debug(f"[ERA5Fetch] Date {date_key} returned None (likely unavailable)")
             failed_dates.append(date_key)
             logger.warning(
                 f"❌ Failed to fetch ERA5 data for date {date_key} - data may not be available yet"
@@ -849,7 +851,7 @@ async def fetch_era5_data_progressive(
 
 
 async def _fetch_single_day_era5(
-    date_str: str, times_for_date: List[datetime], cache_dir: Path
+    date_str: str, times_for_date: List[datetime], cache_dir: Path, *, cache_only: bool = False
 ) -> Tuple[Optional[xr.Dataset], bool]:
     """
     Fetch ERA5 data for a single day with per-day caching.
@@ -900,6 +902,10 @@ async def _fetch_single_day_era5(
             logger.warning(f"Error loading cache for {date_str}: {e}")
             if cache_file.exists():
                 cache_file.unlink()
+
+    if cache_only:
+        logger.debug(f"Cache-only mode: skipping download for {date_str}; returning None")
+        return None, False
 
     # Fetch data from CDS API for this specific day
     logger.info(f"⬇ Downloading ERA5 data for {date_str} from CDS API (not in cache)")

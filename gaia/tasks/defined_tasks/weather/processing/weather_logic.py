@@ -1580,6 +1580,20 @@ async def calculate_era5_miner_score(
     try:
         # CRITICAL: Debug ERA5 scoring configuration like we did for Day1
         variables_to_score = final_scoring_config.get("variables_levels_to_score", [])
+        # Normalize string entries into dict form
+        normalized_vars = []
+        for vc in variables_to_score:
+            if isinstance(vc, str):
+                normalized_vars.append({"name": vc})
+            elif isinstance(vc, dict):
+                # Ensure at least a name field exists
+                if "name" in vc:
+                    normalized_vars.append(vc)
+                else:
+                    logger.warning(f"[FinalScore] Ignoring malformed variable config without 'name': {vc}")
+            else:
+                logger.warning(f"[FinalScore] Ignoring unknown variable config type: {type(vc)} -> {vc}")
+        variables_to_score = normalized_vars
         logger.info(
             f"[FinalScore] Miner {miner_hotkey[:8]}...{miner_hotkey[-8:]}: ERA5 scoring configuration:"
             f"\n  Variables to score: {len(variables_to_score)} variables"
@@ -1824,7 +1838,7 @@ async def calculate_era5_miner_score(
         preload_start_time = time.time()
         
         try:
-            variables_needed = [var_config["name"] for var_config in variables_to_score]
+            variables_needed = [var_config.get("name") for var_config in variables_to_score if isinstance(var_config, dict) and var_config.get("name")]
             variables_in_dataset = [var for var in variables_needed if var in miner_forecast_ds.data_vars]
             
             if variables_in_dataset:
@@ -2062,8 +2076,12 @@ async def calculate_era5_miner_score(
                     )
                     gfs_op_lead_slice = None
 
-            for var_config in final_scoring_config["variables_levels_to_score"]:
-                var_name = var_config["name"]
+            # Use normalized list to avoid KeyError on bare string configs
+            for var_config in variables_to_score:
+                var_name = var_config.get("name")
+                if not var_name:
+                    logger.warning(f"[FinalScore] Skipping variable with missing name in config: {var_config}")
+                    continue
                 var_level = var_config.get("level")
                 standard_name_for_clim = var_config.get("standard_name", var_name)
                 var_key = f"{var_name}{var_level if var_level and var_level != 'all' else ''}"
@@ -3220,21 +3238,38 @@ async def calculate_era5_miner_score(
                     import traceback
                     tb_str = traceback.format_exc()
                     error_msg = str(e_var_score)
+
+                    # Treat network/payload issues as hard failures for this miner/run
+                    critical_io_signatures = [
+                        "ContentLengthError",
+                        "ClientPayloadError",
+                        "Response payload is not completed",
+                        "Not enough data for satisfy content length header",
+                        "ClientOSError",
+                        "Connection reset by peer",
+                    ]
+                    if any(sig in error_msg for sig in critical_io_signatures):
+                        logger.error(
+                            f"[FinalScore] Hard-failing miner {miner_hotkey} run {run_id} due to IO/payload error while scoring {var_key} at {valid_time_dt}: {error_msg}"
+                        )
+                        return False
                     
                     logger.error(
-                        f"[FinalScore] Miner {miner_hotkey}: Error scoring {var_key} at {valid_time_dt}:\n"
-                        f"Error: {error_msg}\n"
-                        f"Variable config: {var_config}\n"
-                        f"Data shapes - Miner: {getattr(miner_forecast_lead_slice, 'shape', 'unknown')}, "
-                        f"Truth: {getattr(era5_truth_lead_slice, 'shape', 'unknown')}\n"
-                        f"Lead hours: {lead_hours}\n"
-                        f"Full traceback:\n{tb_str}",
+                        (
+                            f"[FinalScore] Miner {miner_hotkey}: Error scoring {var_key} at {valid_time_dt}:\n"
+                            f"Error: {error_msg}\n"
+                            f"Variable config: {var_config}\n"
+                            f"Data shapes - Miner: {getattr(miner_forecast_lead_slice, 'shape', 'unknown')}, "
+                            f"Truth: {getattr(era5_truth_lead_slice, 'shape', 'unknown')}\n"
+                            f"Lead hours: {lead_hours}\n"
+                            f"Full traceback:\n{tb_str}"
+                        ),
                         exc_info=True,
                     )
                     
                     # Add debug info for type errors
                     if "unsupported operand type" in error_msg:
-                        logger.error(f"[FinalScore] Type error debug info:")
+                        logger.error("[FinalScore] Type error debug info:")
                         logger.error(f"  - gfs_init_time_of_run type: {type(gfs_init_time_of_run)} = {gfs_init_time_of_run}")
                         logger.error(f"  - valid_time_dt type: {type(valid_time_dt)} = {valid_time_dt}")
                         logger.error(f"  - lead_hours type: {type(lead_hours)} = {lead_hours}")
@@ -3244,8 +3279,7 @@ async def calculate_era5_miner_score(
                     # Check for coordinate/dimension errors and fail fast
                     if any(coord_err in error_msg.lower() for coord_err in ['lat', 'lon', 'pressure_level', 'coordinate', 'dimension', 'keyerror']):
                         logger.error(
-                            f"[FinalScore] Miner {miner_hotkey}: CRITICAL coordinate/dimension error for {var_key} - "
-                            f"this indicates a fundamental data structure issue"
+                            f"[FinalScore] Miner {miner_hotkey}: CRITICAL coordinate/dimension error for {var_key} - this indicates a fundamental data structure issue",
                         )
                         return False  # Fail the entire ERA5 scoring for this miner
                     
@@ -3386,12 +3420,19 @@ async def _calculate_and_store_aggregated_era5_score(
         f"[AggFinalScore] Calculating aggregated ERA5 score for UID {miner_uid}, Run {run_id}"
     )
 
+    # Define clamp before any usage within this function to avoid local variable resolution errors
+    def clamp(x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
+
     skill_error_component_scores = []
     acc_component_scores = []
 
     for lead_h in lead_hours_scored:
         for var_config in vars_levels_scored:
-            var_name = var_config["name"]
+            var_name = var_config.get("name")
+            if not var_name:
+                logger.warning(f"[FinalScore] Skipping aggregation for variable with missing name in config: {var_config}")
+                continue
             var_level = var_config.get("level")
             # Match score_type var_key formatting used during scoring: omit 'all'
             var_key = f"{var_name}{var_level if var_level and var_level != 'all' else ''}"
@@ -3462,7 +3503,8 @@ async def _calculate_and_store_aggregated_era5_score(
 
             normalized_skill_error_item = 0.0
             if skill_score_val is not None:
-                normalized_skill_error_item = max(0.0, skill_score_val)
+                # Defensively clamp skill-based item to [0, 1]
+                normalized_skill_error_item = clamp(float(skill_score_val), 0.0, 1.0)
             elif rmse_score_val is not None and rmse_score_val >= 0:
                 normalized_skill_error_item = 1.0 / (1.0 + rmse_score_val)
             else:
@@ -3473,7 +3515,8 @@ async def _calculate_and_store_aggregated_era5_score(
 
             normalized_acc_item = 0.0
             if acc_score_val is not None:
-                normalized_acc_item = (acc_score_val + 1.0) / 2.0
+                # ACC expected in [-1, 1]; clamp normalized to [0, 1]
+                normalized_acc_item = clamp(((float(acc_score_val) + 1.0) / 2.0), 0.0, 1.0)
             else:
                 logger.warning(
                     f"[AggFinalScore] No valid ACC for {var_key} at lead {lead_h}h for UID {miner_uid}. ACC item will be 0."
@@ -3543,9 +3586,6 @@ async def _calculate_and_store_aggregated_era5_score(
             elif st.startswith("era5_rmse_"):
                 bucket["rmse"].append(float(sc))
 
-        def clamp(x: float, lo: float, hi: float) -> float:
-            return max(lo, min(hi, x))
-
         normalized_by_lead: Dict[int, float] = {}
         rmse_ref_by_lead: Dict[int, float] = {}
         # Establish a reference RMSE per lead as median of miner RMSEs for stability when GFS ref not present in table
@@ -3589,7 +3629,8 @@ async def _calculate_and_store_aggregated_era5_score(
                 normalized = rmse_norm
             else:
                 normalized = 0.0
-            normalized_by_lead[lh] = float(normalized)
+            # Clamp final per-lead normalized score to [0, 1]
+            normalized_by_lead[lh] = float(clamp(float(normalized), 0.0, 1.0))
 
         # Push per-lead normalized writes early, as part of final scoring loop
         stats_mgr = WeatherStatsManager(task_instance.db_manager, validator_hotkey=getattr(task_instance, "validator", None) and getattr(getattr(getattr(task_instance, "validator", None), "validator_wallet", None), "hotkey", None) and getattr(getattr(getattr(task_instance, "validator", None), "validator_wallet", None).hotkey, "ss58_address", None) or "unknown_validator")
@@ -3633,6 +3674,7 @@ async def _calculate_and_store_aggregated_era5_score(
             W_day1 /= norm
 
         overall_forecast_score = W_era5 * era5_norm_avg + W_day1 * day1_pass
+        overall_forecast_score = clamp(float(overall_forecast_score), 0.0, 1.0)
 
         await stats_mgr.update_forecast_stats(
             run_id=run_id,
