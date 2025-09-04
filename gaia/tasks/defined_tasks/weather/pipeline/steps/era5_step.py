@@ -304,6 +304,31 @@ async def run_item(
     # Sort ready leads for consistent processing order
     ready_leads = sorted(ready_leads)
     
+    # Dependency rule: do not attempt higher leads if an earlier lead exhausted retries
+    try:
+        min_expected = min(pending_leads + ready_leads) if (pending_leads or ready_leads) else None
+        if min_expected is not None:
+            from sqlalchemy import text as _text
+            row_block = await db.fetch_one(
+                _text(
+                    """
+                    SELECT 1
+                    FROM weather_forecast_steps
+                    WHERE run_id = :rid AND miner_uid = :uid AND step_name = 'era5' AND substep = 'score'
+                      AND lead_hours < :lh
+                      AND retry_count >= 3
+                      AND status = 'failed'
+                    LIMIT 1
+                    """
+                ),
+                {"rid": run_id, "uid": miner_uid, "lh": int(min_expected)},
+            )
+            if row_block:
+                logger.warning(f"[ERA5] Run {run_id} Miner {miner_uid}: Blocking higher leads due to exhausted retries on earlier lead")
+                return False
+    except Exception:
+        pass
+
     if not ready_leads:
         # Calculate when the earliest lead will be ready
         next_ready_time = min(needed_time_for_lead(h) for h in pending_leads)

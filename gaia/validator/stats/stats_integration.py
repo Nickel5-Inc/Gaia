@@ -77,6 +77,19 @@ class WeatherStatsIntegration:
             error_msg: Error message if failed
         """
         try:
+            # Log step start/success/failure for kerchunk fetch
+            from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_start, log_success, log_failure
+            try:
+                await log_start(
+                    self.db,
+                    run_id=run_id,
+                    miner_uid=miner_uid,
+                    miner_hotkey=miner_hotkey,
+                    step_name="fetch",
+                    substep="kerchunk",
+                )
+            except Exception:
+                pass
             hosting_status = "accessible" if success else "inaccessible"
             
             await self.stats_manager.update_forecast_stats(
@@ -89,6 +102,30 @@ class WeatherStatsIntegration:
                 hosting_latency_ms=latency_ms
             )
             
+            try:
+                if success:
+                    await log_success(
+                        self.db,
+                        run_id=run_id,
+                        miner_uid=miner_uid,
+                        miner_hotkey=miner_hotkey,
+                        step_name="fetch",
+                        substep="kerchunk",
+                        latency_ms=latency_ms,
+                    )
+                else:
+                    await log_failure(
+                        self.db,
+                        run_id=run_id,
+                        miner_uid=miner_uid,
+                        miner_hotkey=miner_hotkey,
+                        step_name="fetch",
+                        substep="kerchunk",
+                        error_json={"error": error_msg},
+                    )
+            except Exception:
+                pass
+
             logger.debug(f"Recorded kerchunk fetch {'success' if success else 'failure'} for miner {miner_uid}")
             
         except Exception as e:

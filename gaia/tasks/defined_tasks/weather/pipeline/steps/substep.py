@@ -91,7 +91,7 @@ def substep(
                     
                     # Test mode: drastically shorten retry delays for fast iteration  
                     is_test = bool(getattr(task, "test_mode", False))
-                    base_delay = 5 if is_test else retry_delay_seconds
+                    base_delay = 5 if is_test else max(1800, retry_delay_seconds)
                     
                     try:
                         nrt = compute_next_retry(

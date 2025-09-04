@@ -32,7 +32,7 @@ async def _upsert(
     next_retry_time: Optional[datetime] = None,
 ) -> None:
     # Normalize status
-    allowed_status = {"in_progress", "succeeded", "failed", "retry_scheduled"}
+    allowed_status = {"in_progress", "succeeded", "failed", "retry_scheduled", "waiting_for_truth"}
     norm_status = (status or "").strip().lower()
     status = norm_status if norm_status in allowed_status else "in_progress"
 
@@ -57,13 +57,30 @@ async def _upsert(
     if next_retry_time is not None:
         row["next_retry_time"] = next_retry_time
     stmt = insert(weather_forecast_steps_table).values(**row)
-    # Only update columns that are explicitly provided (non-None),
-    # so we don't erase timestamps or metrics with NULLs on later calls
-    non_key_updates = {
-        k: v
-        for k, v in row.items()
-        if k not in ("run_id", "miner_uid", "step_name", "substep", "lead_hours") and v is not None
-    }
+    # Build conflict update set to:
+    # - only update provided (non-None) fields
+    # - preserve first start time (COALESCE(existing, excluded))
+    # - make retry_count monotonic (GREATEST(existing, excluded))
+    excluded = stmt.excluded
+    updates = {}
+    for k, v in row.items():
+        if k in ("run_id", "miner_uid", "step_name", "substep", "lead_hours"):
+            continue
+        if v is None:
+            continue
+        if k == "started_at":
+            updates[k] = sa.func.coalesce(
+                weather_forecast_steps_table.c.started_at, excluded.started_at
+            )
+        elif k == "retry_count":
+            updates[k] = sa.func.greatest(
+                sa.func.coalesce(weather_forecast_steps_table.c.retry_count, 0),
+                excluded.retry_count,
+            )
+        else:
+            # Default: prefer new provided value from excluded
+            updates[k] = getattr(excluded, k)
+
     stmt = stmt.on_conflict_do_update(
         index_elements=[
             weather_forecast_steps_table.c.run_id,
@@ -72,7 +89,7 @@ async def _upsert(
             weather_forecast_steps_table.c.substep,
             weather_forecast_steps_table.c.lead_hours,
         ],
-        set_=non_key_updates,
+        set_=updates,
     )
     await db.execute(stmt)
 

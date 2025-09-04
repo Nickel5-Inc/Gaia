@@ -124,6 +124,30 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     await db.fail_validator_job(job["id"], "missing run_id")
                     ok = False
                 return ok
+            elif jtype == "weather.reconcile_era5_steps":
+                try:
+                    from scripts.reconcile_weather_era5_steps import reconcile_run
+                except Exception:
+                    reconcile_run = None
+                if reconcile_run is None:
+                    await db.fail_validator_job(job["id"], "reconcile module missing")
+                    return False
+                # Fetch all runs and reconcile
+                runs = await db.fetch_all("SELECT id FROM weather_forecast_runs ORDER BY id ASC")
+                total = 0
+                for r in runs:
+                    try:
+                        rid = int(r["id"])
+                    except Exception:
+                        continue
+                    try:
+                        n = await reconcile_run(db, rid)
+                        total += int(n or 0)
+                    except Exception:
+                        # Continue to next run on error
+                        continue
+                await db.complete_validator_job(job["id"], result={"ok": True, "reconciled": total})
+                return True
             elif jtype == "weather.initiate_fetch":
                 # Create individual query jobs for all miners (runs after seed completes)
                 from gaia.tasks.defined_tasks.weather.pipeline.orchestrator import handle_initiate_fetch_job

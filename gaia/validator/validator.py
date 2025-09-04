@@ -4022,6 +4022,21 @@ class GaiaValidator:
                                     priority=95,
                                     scheduled_at=now,
                                 )
+                            # Daily reconciliation of missing ERA5 steps at ~00:10 UTC
+                            if now.hour == 0 and now.minute == 10:
+                                try:
+                                    # Use a date-stamped singleton to ensure at most one per day
+                                    daily_key = f"weather_reconcile_era5_steps_{now.strftime('%Y%m%d')}"
+                                    await db.enqueue_singleton_job(
+                                        singleton_key=daily_key,
+                                        job_type="weather.reconcile_era5_steps",
+                                        payload={"ts": now.isoformat()},
+                                        priority=110,
+                                        scheduled_at=now,
+                                    )
+                                except Exception:
+                                    pass
+
                             # Ops status and DB monitor every 15 minutes
                             if now.minute % 15 == 0:
                                 await db.enqueue_singleton_job(
