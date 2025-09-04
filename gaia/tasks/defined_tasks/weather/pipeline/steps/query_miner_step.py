@@ -12,7 +12,7 @@ from gaia.validator.database.validator_database_manager import ValidatorDatabase
 from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import query_miner_for_weather
 from gaia.tasks.defined_tasks.weather.schemas.weather_outputs import WeatherTaskStatus
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
-from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_failure, log_success
+from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_failure, log_success, log_start
 
 from gaia.utils.custom_logger import get_logger
 logger = get_logger(__name__)
@@ -57,6 +57,18 @@ async def run_query_miner_job(
         gfs_t_minus_6 = gfs_init - timedelta(hours=6)
         
         logger.info(f"[Run {run_id}] Querying miner {miner_hotkey[:8]}...{miner_hotkey[-8:]} (UID {miner_uid})")
+        try:
+            await log_start(
+                db,
+                run_id=run_id,
+                miner_uid=miner_uid,
+                miner_hotkey=miner_hotkey,
+                step_name="query",
+                substep="initiate_fetch",
+                context={"validator_hotkey": validator_hotkey},
+            )
+        except Exception:
+            pass
         
         # CRITICAL: Validate that node_table hotkey matches job parameter
         # If they don't match, it indicates a serious issue in metagraph sync or job creation

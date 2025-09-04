@@ -46,7 +46,7 @@ async def backfill_overall_for_run(
     for r in rows:
         uid = int(r["miner_uid"])
         day1 = r.get("day1")
-        # Compute ERA5_norm_avg across non-null leads
+        # Compute ERA5_norm_avg with completeness penalty across the full 10 expected leads
         leads = [
             r.get("era5_score_24h"),
             r.get("era5_score_48h"),
@@ -60,7 +60,8 @@ async def backfill_overall_for_run(
             r.get("era5_score_240h"),
         ]
         vals = [float(x) for x in leads if x is not None]
-        era5_norm_avg = (sum(vals) / float(len(vals))) if vals else 0.0
+        # Divide by full horizon (10) so missing leads count as zeros
+        era5_norm_avg = (sum(vals) / 10.0) if vals else 0.0
 
         day1_pass = 1.0 if (day1 is not None and float(day1) >= qc_threshold) else 0.0
         overall = We * era5_norm_avg + Wd * day1_pass
@@ -69,11 +70,19 @@ async def backfill_overall_for_run(
             sa.text(
                 """
                 UPDATE weather_forecast_stats
-                SET overall_forecast_score = :overall
+                SET overall_forecast_score = :overall,
+                    era5_combined_score = :era5_combined,
+                    era5_completeness = :era5_completeness
                 WHERE run_id = :rid AND miner_uid = :uid
                 """
             ),
-            {"overall": overall, "rid": run_id, "uid": uid},
+            {
+                "overall": overall,
+                "era5_combined": era5_norm_avg,
+                "era5_completeness": (len(vals) / 10.0),
+                "rid": run_id,
+                "uid": uid,
+            },
         )
         updates += 1
 
@@ -81,6 +90,11 @@ async def backfill_overall_for_run(
     mgr = WeatherStatsManager(db, validator_hotkey="backfill")
     await mgr.recompute_era5_rollups_for_run(run_id)
     await mgr.update_miner_ranks_for_run(run_id)
+    # Refresh combined score row in score_table for this run
+    try:
+        await task.update_combined_weather_scores(run_id_trigger=run_id, force_phase="final")
+    except Exception:
+        pass
     return updates
 
 

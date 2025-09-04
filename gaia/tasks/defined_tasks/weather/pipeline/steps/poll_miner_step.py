@@ -49,6 +49,19 @@ async def run_poll_miner_job(
         logger.info(
             f"[Run {run_id}] Polling miner {miner_hotkey[:8]} (attempt {attempt}/{MAX_POLL_ATTEMPTS})"
         )
+        # Record step start per attempt
+        try:
+            await log_start(
+                db,
+                run_id=run_id,
+                miner_uid=miner_uid,
+                miner_hotkey=miner_hotkey,
+                step_name="inference",
+                substep="poll",
+                context={"attempt": attempt},
+            )
+        except Exception:
+            pass
         
         # Check current status
         response = await db.fetch_one(
@@ -158,6 +171,20 @@ async def run_poll_miner_job(
                     {"time": inference_time_seconds, "run_id": run_id, "miner_uid": miner_uid}
                 )
                 
+                # Log step success for polling
+                try:
+                    await log_success(
+                        db,
+                        run_id=run_id,
+                        miner_uid=miner_uid,
+                        miner_hotkey=miner_hotkey,
+                        step_name="inference",
+                        substep="poll",
+                        latency_ms=int(result.get("response_time", 0) * 1000),
+                    )
+                except Exception:
+                    pass
+
                 # Check if day1 job already exists
                 existing_day1 = await db.fetch_one(
                     """

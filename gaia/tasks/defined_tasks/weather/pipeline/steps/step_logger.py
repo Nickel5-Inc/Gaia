@@ -31,6 +31,11 @@ async def _upsert(
     retry_count: Optional[int] = None,
     next_retry_time: Optional[datetime] = None,
 ) -> None:
+    # Normalize status
+    allowed_status = {"in_progress", "succeeded", "failed", "retry_scheduled"}
+    norm_status = (status or "").strip().lower()
+    status = norm_status if norm_status in allowed_status else "in_progress"
+
     now = datetime.now(timezone.utc)
     row = {
         "run_id": run_id,
@@ -42,13 +47,23 @@ async def _upsert(
         "status": status,
         "started_at": started_at,
         "completed_at": completed_at,
-        "retry_count": retry_count if retry_count is not None else 0,
-        "next_retry_time": next_retry_time,
+        # retry_count and next_retry_time only when provided to avoid overwriting with NULL/defaults
         "latency_ms": latency_ms,
         "error_json": error_json,
         "context": context,
     }
+    if retry_count is not None:
+        row["retry_count"] = retry_count
+    if next_retry_time is not None:
+        row["next_retry_time"] = next_retry_time
     stmt = insert(weather_forecast_steps_table).values(**row)
+    # Only update columns that are explicitly provided (non-None),
+    # so we don't erase timestamps or metrics with NULLs on later calls
+    non_key_updates = {
+        k: v
+        for k, v in row.items()
+        if k not in ("run_id", "miner_uid", "step_name", "substep", "lead_hours") and v is not None
+    }
     stmt = stmt.on_conflict_do_update(
         index_elements=[
             weather_forecast_steps_table.c.run_id,
@@ -57,11 +72,7 @@ async def _upsert(
             weather_forecast_steps_table.c.substep,
             weather_forecast_steps_table.c.lead_hours,
         ],
-        set_={
-            k: v
-            for k, v in row.items()
-            if k not in ("run_id", "miner_uid", "step_name", "substep", "lead_hours")
-        },
+        set_=non_key_updates,
     )
     await db.execute(stmt)
 

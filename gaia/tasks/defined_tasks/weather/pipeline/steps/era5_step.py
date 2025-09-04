@@ -312,15 +312,19 @@ async def run_item(
             f"[ERA5] Run {run_id} Miner {miner_uid}: No ERA5 data ready yet. "
             f"Next lead ready in {hours_until_ready:.1f} hours at {next_ready_time}"
         )
-        # Move step to waiting_for_truth and let guard job re-activate
+        # Move step to waiting_for_truth and schedule next retry based on min(predicted_ready, now+poll_interval)
         try:
+            poll_minutes = int(getattr(task.config, "era5_poll_interval_minutes", task.config.get("era5_poll_interval_minutes", 60))) if hasattr(task, "config") else 60
+            from datetime import timedelta as _td
+            next_poll_time = now_utc + _td(minutes=poll_minutes)
+            nrt = next_ready_time if next_ready_time <= next_poll_time else next_poll_time
             await db.execute(
                 """
                 UPDATE weather_forecast_steps
-                SET status = 'waiting_for_truth', next_retry_time = NULL
+                SET status = 'waiting_for_truth', next_retry_time = :nrt
                 WHERE run_id = :rid AND miner_uid = :uid AND step_name = 'era5' AND substep = 'score'
                 """,
-                {"rid": run_id, "uid": miner_uid},
+                {"rid": run_id, "uid": miner_uid, "nrt": nrt},
             )
         except Exception:
             pass
@@ -336,8 +340,13 @@ async def run_item(
         pass
     
     # Load truth/climatology for only the ready leads (one day at a time)
-    # Truth fetching: rely on cache-only here; the guard job is the only one allowed to hit the API
+    # Try cache-only first (fast path). If missing, attempt guarded fetch to populate cache.
     truth = await _get_era5_truth(task, run_id, gfs_init, ready_leads, prefer_cache_only=True)
+    if truth is None:
+        try:
+            truth = await _get_era5_truth(task, run_id, gfs_init, ready_leads, prefer_cache_only=False)
+        except Exception:
+            truth = None
     try:
         n_times = 0
         if truth is not None:
@@ -360,10 +369,10 @@ async def run_item(
     if not truth or not clim:
         # Treat this as a fetch failure (likely miner/network), not truth gating; mark per-lead failed
         try:
-            from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import _upsert as _sl_upsert
+            from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_failure
             for _lh in ready_leads:
                 try:
-                    await _sl_upsert(
+                    await log_failure(
                         db,
                         run_id=run_id,
                         miner_uid=miner_uid,
@@ -371,8 +380,6 @@ async def run_item(
                         step_name="era5",
                         substep="score",
                         lead_hours=int(_lh),
-                        status="failed",
-                        completed_at=datetime.now(timezone.utc),
                         error_json={"type": "truth_or_clim_fetch_failed"},
                     )
                 except Exception:
@@ -509,10 +516,10 @@ async def run_item(
     if not ok:
         # Mark per-lead steps as failed to prevent re-enqueue
         try:
-            from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import _upsert as _sl_upsert
+            from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_failure
             for _lh in ready_leads:
                 try:
-                    await _sl_upsert(
+                    await log_failure(
                         db,
                         run_id=run_id,
                         miner_uid=miner_uid,
@@ -520,10 +527,8 @@ async def run_item(
                         step_name="era5",
                         substep="score",
                         lead_hours=int(_lh),
-                        status="failed",
-                        completed_at=datetime.now(timezone.utc),
+                        error_json={"type": "scoring_failed"},
                     )
-                    # Additionally, clear any linked job_id so a fresh job can be created only if status returns to pending
                     try:
                         await db.execute(
                             "UPDATE weather_forecast_steps SET job_id = NULL WHERE run_id = :rid AND miner_uid = :uid AND step_name = 'era5' AND substep = 'score' AND lead_hours = :lh",
@@ -616,10 +621,10 @@ async def run_item(
             logger.info(f"[ERA5Step] Recorded ERA5 completion and total pipeline duration for miner {miner_uid}")
         # Mark per-lead steps as succeeded
         try:
-            from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import _upsert as _sl_upsert
+            from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_success
             for _lh in ready_leads:
                 try:
-                    await _sl_upsert(
+                    await log_success(
                         db,
                         run_id=run_id,
                         miner_uid=miner_uid,
@@ -627,8 +632,7 @@ async def run_item(
                         step_name="era5",
                         substep="score",
                         lead_hours=int(_lh),
-                        status="succeeded",
-                        completed_at=datetime.now(timezone.utc),
+                        latency_ms=latency_ms,
                     )
                 except Exception:
                     pass

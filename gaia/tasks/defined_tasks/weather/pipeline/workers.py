@@ -823,19 +823,19 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     else:
                         confirmed = time_ready_leads[:]
                     if not confirmed:
-                        await db.fail_validator_job(job["id"], "truth_times_missing", schedule_retry_in_seconds=3*3600)
+                        await db.fail_validator_job(job["id"], "truth_times_missing", schedule_retry_in_seconds=3600)
                         return True
                     # Enqueue/mark step rows per miner for these confirmed leads
                     miners = await db.fetch_all(
                         "SELECT DISTINCT miner_uid, miner_hotkey FROM weather_miner_responses WHERE run_id = :rid",
                         {"rid": rid},
                     )
-                    from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import _upsert
+                    from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_start
                     created = 0
                     for h in confirmed:
                         for m in miners:
                             try:
-                                await _upsert(
+                                await log_start(
                                     db,
                                     run_id=int(rid),
                                     miner_uid=int(m["miner_uid"]),
@@ -843,7 +843,6 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                                     step_name="era5",
                                     substep="score",
                                     lead_hours=int(h),
-                                    status="pending",
                                 )
                                 created += 1
                             except Exception:
@@ -858,7 +857,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 try:
                     from gaia.tasks.defined_tasks.weather.pipeline.steps.era5_step import _get_era5_truth
                     from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
-                    from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import _upsert
+                    from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_start
                     t = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
                     runs = await db.fetch_all(
                         """
@@ -981,7 +980,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                                 if key in succeeded_set or key in scored_set or key in failed_set:
                                     continue
                                 try:
-                                    await _upsert(
+                                    await log_start(
                                         db,
                                         run_id=rid,
                                         miner_uid=int(m["miner_uid"]),
@@ -989,7 +988,6 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                                         step_name="era5",
                                         substep="score",
                                         lead_hours=int(h),
-                                        status="pending",
                                     )
                                     total_created += 1
                                     run_created += 1
@@ -1004,8 +1002,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     if total_created > 0:
                         await db.complete_validator_job(job["id"], result={"scheduled_rows": total_created})
                     else:
-                        # Reschedule in 3 hours if no work now
-                        await db.fail_validator_job(job["id"], "no_work_now", schedule_retry_in_seconds=3*3600)
+                        # Reschedule in 1 hour to keep polling ERA5 availability
+                        await db.fail_validator_job(job["id"], "no_work_now", schedule_retry_in_seconds=3600)
                     return True
                 except Exception as e:
                     await db.fail_validator_job(job["id"], f"truth_guard_all_exception: {e}", schedule_retry_in_seconds=6*3600)

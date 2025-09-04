@@ -137,6 +137,27 @@ class WeatherStatsManager:
             True if successful, False otherwise
         """
         try:
+            # Normalize and validate status
+            allowed_statuses = {
+                "pending",
+                "seeded",
+                "input_received",
+                "day1_scoring",
+                "era5_scoring",
+                "completed",
+                "failed",
+            }
+            norm_status = (status or "").strip().lower()
+            if norm_status not in allowed_statuses:
+                # Map common synonyms
+                synonyms = {
+                    "received": "input_received",
+                    "in_progress": "era5_scoring",
+                    "done": "completed",
+                    "error": "failed",
+                }
+                norm_status = synonyms.get(norm_status, "failed" if error_msg else "pending")
+
             # Get forecast run details
             run_data = await self.db.fetch_one(
                 sa.select(
@@ -162,56 +183,77 @@ class WeatherStatsManager:
                 "forecast_run_id": forecast_run_id,
                 "run_id": run_id,
                 "forecast_init_time": run_data["gfs_init_time_utc"],
-                "forecast_status": status,
-                "current_forecast_stage": status,
+                "forecast_status": norm_status,
+                "current_forecast_stage": norm_status,
                 "validator_hotkey": self.validator_hotkey,
                 "updated_at": datetime.now(timezone.utc)
             }
             
             # Add error message if present
             if error_msg:
-                stats_data["forecast_error_msg"] = self.sanitize_error_message(error_msg)
+                # Record sanitized JSON and a short text mirror for quick filtering
+                sanitized = self.sanitize_error_message(error_msg if isinstance(error_msg, str) else json.dumps(error_msg))
+                if sanitized:
+                    stats_data["forecast_error_msg"] = sanitized
+                    stats_data["last_error_message"] = sanitized.get("message")
             
             # Add initial score
             if initial_score is not None:
-                stats_data["forecast_score_initial"] = initial_score
+                try:
+                    stats_data["forecast_score_initial"] = float(initial_score)
+                except Exception:
+                    pass
             
             # Add ERA5 scores (clamped 0..1)
             if era5_scores:
                 completeness_count = 0
-                total_score = 0
-                for lead_hour, score in era5_scores.items():
-                    # Defensive clamp
-                    try:
-                        s_val = float(score)
-                    except Exception:
-                        continue
-                    s_val = max(0.0, min(1.0, s_val))
-                    col_name = f"era5_score_{lead_hour}h"
-                    if hasattr(weather_forecast_stats_table.c, col_name):
-                        stats_data[col_name] = s_val
-                        if s_val > 0:  # Count non-zero scores
-                            completeness_count += 1
-                            total_score += s_val
-                
-                # Calculate combined score and completeness
-                max_timesteps = 10  # 24h to 240h in 24h increments
-                stats_data["era5_completeness"] = completeness_count / max_timesteps
-                stats_data["era5_combined_score"] = total_score / max_timesteps if max_timesteps > 0 else 0
+                total_score = 0.0
+                fixed_leads = [24, 48, 72, 96, 120, 144, 168, 192, 216, 240]
+                for lead_hour in fixed_leads:
+                    # Only count provided (non-null) leads for completeness, but combined score is against full horizon
+                    if lead_hour in era5_scores:
+                        try:
+                            s_val = float(era5_scores[lead_hour])
+                        except Exception:
+                            continue
+                        s_val = max(0.0, min(1.0, s_val))
+                        col_name = f"era5_score_{lead_hour}h"
+                        if hasattr(weather_forecast_stats_table.c, col_name):
+                            stats_data[col_name] = s_val
+                        completeness_count += 1
+                        total_score += s_val
+                # Calculate combined score and completeness (complete horizon is 10 steps)
+                max_timesteps = 10
+                stats_data["era5_completeness"] = (completeness_count / max_timesteps) if max_timesteps else 0.0
+                stats_data["era5_combined_score"] = (total_score / max_timesteps) if max_timesteps else 0.0
             
             # Add hosting metrics
             if hosting_status:
-                stats_data["hosting_status"] = hosting_status
+                allowed_hosting = {"accessible", "inaccessible", "timeout", "error"}
+                h = (hosting_status or "").strip().lower()
+                stats_data["hosting_status"] = h if h in allowed_hosting else "error"
             if hosting_latency_ms is not None:
-                stats_data["hosting_latency_ms"] = hosting_latency_ms
+                try:
+                    stats_data["hosting_latency_ms"] = max(0, int(hosting_latency_ms))
+                except Exception:
+                    pass
             
             # Add average component metrics
             if avg_rmse is not None:
-                stats_data["avg_rmse"] = avg_rmse
+                try:
+                    stats_data["avg_rmse"] = float(avg_rmse)
+                except Exception:
+                    pass
             if avg_acc is not None:
-                stats_data["avg_acc"] = avg_acc
+                try:
+                    stats_data["avg_acc"] = float(avg_acc)
+                except Exception:
+                    pass
             if avg_skill_score is not None:
-                stats_data["avg_skill_score"] = avg_skill_score
+                try:
+                    stats_data["avg_skill_score"] = float(avg_skill_score)
+                except Exception:
+                    pass
             if overall_forecast_score is not None:
                 # Defensive clamp overall score
                 try:
@@ -670,14 +712,22 @@ class WeatherStatsManager:
                 run_data["target_forecast_time_utc"]
             )
             
+            # Normalize stage/status
+            stage_norm = (stage or "").strip().lower()
+            status_norm = (status or "").strip().lower()
             update_data = {
-                "current_forecast_stage": stage,
-                "current_forecast_status": status,
+                "current_forecast_stage": stage_norm,
+                "current_forecast_status": status_norm,
                 "updated_at": datetime.now(timezone.utc)
             }
             
             if error:
-                update_data["last_error_message"] = error[:500]  # Limit error message length
+                # Store short text and sanitized JSON
+                msg = error if isinstance(error, str) else json.dumps(error)
+                update_data["last_error_message"] = msg[:500]
+                sanitized = self.sanitize_error_message(msg)
+                if sanitized:
+                    update_data["forecast_error_msg"] = sanitized
             
             if retry_info:
                 update_data["retries_remaining"] = retry_info.get("retries_remaining")

@@ -156,7 +156,7 @@ from fiber.encrypted.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
 from fiber.chain.interface import get_substrate
 from substrateinterface import SubstrateInterface
-from gaia.APIcalls.miner_score_sender import MinerScoreSender
+from gaia.websync.process import start_websync_subprocess
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 try:
     mp.set_start_method("spawn", force=True)
@@ -616,10 +616,7 @@ class GaiaValidator:
             transport=httpx.AsyncHTTPTransport(retries=3),
         )
 
-        # Now create MinerScoreSender with the initialized api_client
-        self.miner_score_sender = MinerScoreSender(
-            database_manager=self.database_manager, api_client=self.api_client
-        )
+        # Legacy MinerScoreSender removed: superseded by websync subprocess
 
         self.last_successful_weight_set = time.time()
         self.last_successful_dereg_check = time.time()
@@ -2506,10 +2503,12 @@ class GaiaValidator:
             if health["status"] == "idle":
                 continue
 
-            # Use operation-specific timeout (e.g., "monitoring" has extended timeout)
-            timeout = health["timeouts"].get(
-                health.get("current_operation"), health["timeouts"]["default"]
-            )
+            # Use operation-specific timeout, with special handling for scoring's monitoring
+            op_key = health.get("current_operation")
+            if task_name == "scoring" and op_key == "monitoring":
+                # Scoring rarely uses the loop now; treat monitoring as idle monitoring
+                op_key = "monitoring_idle"
+            timeout = health["timeouts"].get(op_key, health["timeouts"]["default"])
 
             if (
                 health["operation_start"]
@@ -3126,6 +3125,23 @@ class GaiaValidator:
                 self._weather_worker_processes.clear()
                 logger.info("Weather worker processes stopped")
 
+            # Stop WebSync subprocess if running
+            if hasattr(self, "_websync_process") and self._websync_process is not None:
+                try:
+                    p = self._websync_process
+                    if p.is_alive():
+                        logger.info("Stopping WebSync subprocess...")
+                        p.terminate()
+                        p.join(timeout=2)
+                        if p.is_alive():
+                            logger.warning("Force-killing WebSync subprocess")
+                            p.kill()
+                            p.join(timeout=1)
+                except Exception as e:
+                    logger.debug(f"Error stopping WebSync subprocess: {e}")
+                finally:
+                    self._websync_process = None
+
             # First clean up database resources
             if hasattr(self, "database_manager"):
                 # Weather-only: no legacy geomagnetic cleanups
@@ -3159,10 +3175,7 @@ class GaiaValidator:
                 logger.info("Closed API HTTP client")
 
             # Clean up task-specific resources
-            if hasattr(self, "miner_score_sender"):
-                if hasattr(self.miner_score_sender, "cleanup"):
-                    await self.miner_score_sender.cleanup()
-                logger.info("Cleaned up miner score sender resources")
+            # Legacy MinerScoreSender cleanup removed
 
             # Clean up WeatherTask resources that might be using gcsfs
             try:
@@ -3312,47 +3325,75 @@ class GaiaValidator:
                 await asyncio.sleep(30)  # Check every 30 seconds
                 logger.debug("Worker monitoring: Checking worker health...")
                 
-                if not self._weather_worker_processes:
-                    continue
+                # Monitor weather worker processes
+                if self._weather_worker_processes:
+                    dead_workers = []
+                    total_workers = self._weather_worker_num
                     
-                dead_workers = []
-                total_workers = self._weather_worker_num
-                
-                # Check which workers are dead
-                for i, process in enumerate(self._weather_worker_processes):
-                    if not process.is_alive():
-                        exit_code = process.exitcode
-                        logger.warning(f"Worker {process.name} (pid={process.pid}) has died with exit code {exit_code}")
-                        dead_workers.append((i, process))
-                
-                # Restart dead workers
-                if dead_workers:
-                    logger.info(f"Restarting {len(dead_workers)} dead worker(s)")
+                    # Check which workers are dead
+                    for i, process in enumerate(self._weather_worker_processes):
+                        if not process.is_alive():
+                            exit_code = process.exitcode
+                            logger.warning(f"Worker {process.name} (pid={process.pid}) has died with exit code {exit_code}")
+                            dead_workers.append((i, process))
                     
-                    for i, dead_process in dead_workers:
+                    # Restart dead workers
+                    if dead_workers:
+                        logger.info(f"Restarting {len(dead_workers)} dead worker(s)")
+                        
+                        for i, dead_process in dead_workers:
+                            try:
+                                # Clean up the dead process
+                                dead_process.join(timeout=1)
+                                
+                                # Create a new worker with the same name format
+                                worker_num = i + 1
+                                name = f"worker-{worker_num}/{total_workers}"
+                                new_process = mp.Process(name=name, target=_weather_worker_entrypoint, daemon=True)
+                                new_process.start()
+                                
+                                # Replace the dead process in the list
+                                self._weather_worker_processes[i] = new_process
+                                
+                                logger.info(f"✅ Restarted worker {name} (new pid={new_process.pid})")
+                                
+                            except Exception as e:
+                                logger.error(f"Failed to restart worker {dead_process.name}: {e}")
+                
+                # Monitor websync subprocess (respawn if dead)
+                try:
+                    websync_enabled = os.getenv("WEBSYNC_ON", "true").lower() == "true"
+                except Exception:
+                    websync_enabled = True
+                
+                if websync_enabled:
+                    p = getattr(self, "_websync_process", None)
+                    if p is None:
                         try:
-                            # Clean up the dead process
-                            dead_process.join(timeout=1)
-                            
-                            # Create a new worker with the same name format
-                            worker_num = i + 1
-                            name = f"worker-{worker_num}/{total_workers}"
-                            new_process = mp.Process(name=name, target=_weather_worker_entrypoint, daemon=True)
-                            new_process.start()
-                            
-                            # Replace the dead process in the list
-                            self._weather_worker_processes[i] = new_process
-                            
-                            logger.info(f"✅ Restarted worker {name} (new pid={new_process.pid})")
-                            
+                            self._websync_process = start_websync_subprocess()
                         except Exception as e:
-                            logger.error(f"Failed to restart worker {dead_process.name}: {e}")
-                
+                            logger.error(f"WebSync: failed to spawn subprocess from monitor: {e}")
+                    else:
+                        if not p.is_alive():
+                            exit_code = p.exitcode
+                            logger.warning(f"WebSync subprocess (pid={p.pid}) died with exit code {exit_code}; respawning")
+                            try:
+                                # join stale
+                                p.join(timeout=1)
+                            except Exception:
+                                pass
+                            try:
+                                self._websync_process = start_websync_subprocess()
+                            except Exception as e:
+                                logger.error(f"WebSync: failed to respawn subprocess: {e}")
+                    
                 # Log worker health summary periodically (every 5 minutes)
                 if hasattr(self, '_last_worker_health_log'):
                     if time.time() - self._last_worker_health_log > 300:
-                        alive_count = sum(1 for p in self._weather_worker_processes if p.is_alive())
-                        logger.info(f"Worker health: {alive_count}/{len(self._weather_worker_processes)} workers alive")
+                        alive_count = sum(1 for p in self._weather_worker_processes if p.is_alive()) if self._weather_worker_processes else 0
+                        ws = getattr(self, "_websync_process", None)
+                        ws_status = "alive" if (ws and ws.is_alive()) else "dead"
+                        logger.info(f"Worker health: {alive_count}/{len(self._weather_worker_processes)} workers alive | WebSync: {ws_status}")
                         self._last_worker_health_log = time.time()
                 else:
                     self._last_worker_health_log = time.time()
@@ -3972,7 +4013,8 @@ class GaiaValidator:
                                     scheduled_at=now,
                                 )
                             # Global ERA5 truth guard every 3 hours (time-gates leads and enqueues per-lead steps)
-                            if now.minute == 0 and (now.hour % 3 == 0):
+                            # Run global ERA5 truth guard hourly to discover new lead times promptly
+                            if now.minute == 0:
                                 await db.enqueue_singleton_job(
                                     singleton_key="era5_guard_all",
                                     job_type="era5.era5_truth_guard_all",
@@ -4129,13 +4171,14 @@ class GaiaValidator:
                     logger.info("🚀 Starting job enqueuer (AutoSyncManager not active)")
                     self.create_tracked_task(_enqueue_recurring_jobs(), "job_enqueuer")
 
-                # Conditionally add miner_score_sender task
-                score_sender_on_str = os.getenv("SCORE_SENDER_ON", "False")
-                if score_sender_on_str.lower() == "true":
-                    logger.info(
-                        "SCORE_SENDER_ON is True, enabling MinerScoreSender task."
-                    )
-                    tasks_lambdas.insert(5, lambda: self.miner_score_sender.run_async())
+                # Legacy MinerScoreSender removed (replaced by websync subprocess)
+
+                # Conditionally start WebSync subprocess for streaming updates to webserver
+                if os.getenv("WEBSYNC_ON", "true").lower() == "true":
+                    try:
+                        self._websync_process = start_websync_subprocess()
+                    except Exception as ws_err:
+                        logger.error(f"WebSync: failed to start subprocess: {ws_err}")
 
                 active_service_tasks = (
                     []

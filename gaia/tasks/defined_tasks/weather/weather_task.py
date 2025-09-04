@@ -206,6 +206,10 @@ def _load_config(self):
         os.getenv("WEATHER_ERA5_DELAY_DAYS", "4")
     )  # Reduced from 5 to 4 days
     config["era5_buffer_hours"] = int(os.getenv("WEATHER_ERA5_BUFFER_HOURS", "6"))
+    # After the initial delay window, poll ERA5 regularly for new lead times
+    config["era5_poll_interval_minutes"] = int(
+        os.getenv("WEATHER_ERA5_POLL_INTERVAL_MINUTES", "60")
+    )  # Default hourly polling
     # Smart retry backoff: avoid redundant API calls for known-unavailable ERA5 dates
     config["era5_retry_backoff_hours"] = int(
         os.getenv("WEATHER_ERA5_RETRY_BACKOFF_HOURS", "6")

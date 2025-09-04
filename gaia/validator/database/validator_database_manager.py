@@ -1597,7 +1597,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             steps = await self.fetch_all(
                 """
                 SELECT s.id AS step_id, s.run_id, s.miner_uid, s.step_name,
-                       r.id AS response_id, r.miner_hotkey, r.status as response_status, s.substep, s.lead_hours
+                       r.id AS response_id, r.miner_hotkey, r.status as response_status, r.verification_passed, s.substep, s.lead_hours
                 FROM weather_forecast_steps s
                 LEFT JOIN weather_miner_responses r
                   ON r.run_id = s.run_id AND r.miner_uid = s.miner_uid
@@ -1609,6 +1609,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                   AND (
                     s.status = 'pending'
                     OR (s.status = 'retry_scheduled' AND (s.next_retry_time IS NULL OR s.next_retry_time <= NOW()))
+                    OR (s.status = 'waiting_for_truth' AND s.next_retry_time IS NOT NULL AND s.next_retry_time <= NOW())
                   )
                 ORDER BY s.run_id ASC, s.miner_uid ASC
                 LIMIT :limit
@@ -1675,9 +1676,13 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     # Drop any legacy/leadless rows as extra safety
                     if s.get("substep") != "score" or s.get("lead_hours") is None:
                         continue
-                    # Allow era5 jobs when forecast is ready or later (day1_scored, era5_scored)
+                    # Require verified responses or acceptable status before scoring
                     response_status = s.get("response_status")
-                    if response_status not in ("forecast_ready", "day1_scored", "era5_scored"):
+                    verification_passed = s.get("verification_passed") is True
+                    if not (
+                        verification_passed
+                        or response_status in ("forecast_ready", "day1_scored", "era5_scored")
+                    ):
                         continue
                     # Do not enqueue if step is marked waiting_for_truth
                     if s.get("status") == "waiting_for_truth":
