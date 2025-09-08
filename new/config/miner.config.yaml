@@ -1,0 +1,22 @@
+role: miner
+proxy:
+  enabled: true
+  server_name: miner.example.com
+  server_ip: 127.0.0.1
+  public_port: 44333
+  forwarding_port: 44334
+  tls_mode: self_signed  # options: self_signed, letsencrypt, off
+  # letsencrypt settings (used when tls_mode=letsencrypt)
+  email: admin@example.com
+  challenge: http-01  # http-01 | dns-01
+  dns_provider: null  # e.g., cloudflare|route53 (dns-01 only)
+hosting:
+  mode: static  # options: static, s3, r2, minio
+  root_path: /var/data/zarr  # used when mode=static
+  # static_public_port: 44343  # optional, defaults to proxy.public_port+10
+  # s3/r2/minio fields for signer-only control-plane (no nginx changes):
+  # endpoint: https://s3.amazonaws.com
+  # bucket: my-bucket
+  # region: us-east-1
+
+

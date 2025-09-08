@@ -1,0 +1,1 @@
+# aggregate scores from all subtasks and calculate the main score

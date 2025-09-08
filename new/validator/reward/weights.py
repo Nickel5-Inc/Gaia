@@ -1,0 +1,1 @@
+# sets weights for validator

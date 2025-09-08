@@ -1,0 +1,38 @@
+role: validator
+proxy:
+  enabled: true
+  server_name: validator.example.com
+  server_ip: 127.0.0.1
+  public_port: 33333
+  forwarding_port: 33334
+  tls_mode: self_signed  # options: self_signed, letsencrypt, off
+  # letsencrypt settings (used when tls_mode=letsencrypt)
+  email: admin@example.com
+  challenge: http-01  # http-01 | dns-01
+  dns_provider: null  # e.g., cloudflare|route53 (dns-01 only)
+endpoints:
+  - https://miner.example.com:44333/
+scheduler:
+  workers:
+    concurrency: 4
+    lease_seconds: 30
+  recurring:
+    - name: query_miners
+      job_type: query_miners
+      interval_seconds: 60
+      jitter_seconds: 5
+      payload:
+        kind: weather.forward
+        payload: {}
+    - name: sync_metagraph
+      job_type: sync_metagraph
+      interval_seconds: 300
+      jitter_seconds: 10
+      payload: {}
+    - name: process_deregistrations
+      job_type: process_deregistrations
+      interval_seconds: 600
+      jitter_seconds: 15
+      payload: {}
+
+
