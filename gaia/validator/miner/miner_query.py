@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from typing import Optional, Dict, Any
 import asyncio
 import base64
+from typing import Any, Dict, Optional
 
 import httpx
-
-from fiber.encrypted.validator import client as vali_client, handshake
 from cryptography.fernet import Fernet
+from fiber.encrypted.validator import client as vali_client
+from fiber.encrypted.validator import handshake
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 
 
 async def _handshake_and_request(

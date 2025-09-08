@@ -1,19 +1,20 @@
 import asyncio
 import gc
+import ipaddress
 import os
 import time
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
+import traceback
 import uuid
-import numpy as np
-import xarray as xr
-import pandas as pd
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
 import fsspec
 import jwt
-import traceback
-import ipaddress
+import numpy as np
+import pandas as pd
+import xarray as xr
 import xskillscore as xs
-from typing import TYPE_CHECKING, Any, Optional, Dict, List, Tuple
 
 if TYPE_CHECKING:
     from ..weather_task import WeatherTask
@@ -31,24 +32,23 @@ except ImportError:
         return json.loads(s)
 
 
-from ..utils.remote_access import open_verified_remote_zarr_dataset
-from ..utils.json_sanitizer import safe_json_dumps_for_db
-from ..utils.era5_api import fetch_era5_data
-from ..utils.gfs_api import fetch_gfs_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
-from ..utils.variable_maps import AURORA_TO_GFS_VAR_MAP
-from ..utils.hashing import compute_verification_hash
-from ..weather_scoring.metrics import (
-    calculate_rmse,
-    calculate_mse_skill_score,
-    calculate_acc,
-    calculate_bias_corrected_forecast,
-    _calculate_latitude_weights,
-    perform_sanity_checks,
-)
-from gaia.utils.custom_logger import get_logger
-from ..weather_scoring.scoring import VARIABLE_WEIGHTS
 import sqlalchemy as sa
+
+from gaia.utils.custom_logger import get_logger
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
+
+from ..utils.era5_api import fetch_era5_data
+from ..utils.gfs_api import GFS_ATMOS_VARS, GFS_SURFACE_VARS, fetch_gfs_data
+from ..utils.hashing import compute_verification_hash
+from ..utils.json_sanitizer import safe_json_dumps_for_db
+from ..utils.remote_access import open_verified_remote_zarr_dataset
+from ..utils.variable_maps import AURORA_TO_GFS_VAR_MAP
+from ..weather_scoring.metrics import (_calculate_latitude_weights,
+                                       calculate_acc,
+                                       calculate_bias_corrected_forecast,
+                                       calculate_mse_skill_score,
+                                       calculate_rmse, perform_sanity_checks)
+from ..weather_scoring.scoring import VARIABLE_WEIGHTS
 
 logger = get_logger(__name__)
 
@@ -164,7 +164,7 @@ async def _check_run_completion(task_instance: "WeatherTask", run_id: int) -> bo
         bool: True if run should be completed, False if it should continue
     """
     import time
-    
+
     # Check cache to avoid spamming the same check
     cache_key = f"run_{run_id}"
     now = time.time()
@@ -747,7 +747,8 @@ async def get_ground_truth_data(
         # Use progressive fetch for consistency with other ERA5 fetching and better caching
         use_progressive_fetch = task_instance.config.get("progressive_era5_fetch", True)
         if use_progressive_fetch:
-            from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data_progressive
+            from gaia.tasks.defined_tasks.weather.utils.era5_api import \
+                fetch_era5_data_progressive
             ground_truth_ds = await fetch_era5_data_progressive(
                 target_times=target_datetimes, cache_dir=era5_cache_dir
             )
@@ -822,7 +823,8 @@ async def _request_fresh_token(
         f"[VerifyLogic] Requesting fresh token/manifest_hash for job {job_id} from miner {miner_hotkey[:12]}..."
     )
     forecast_request_payload = {"nonce": str(uuid.uuid4()), "data": {"job_id": job_id}}
-    from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import query_single_miner
+    from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import \
+        query_single_miner
     endpoint_to_call = "/weather-kerchunk-request"
     try:
         response_dict = await query_single_miner(
@@ -1670,8 +1672,9 @@ async def calculate_era5_miner_score(
         )
 
         # RIGOR: Full rehash verification of remote store before any reads
-        from ..utils.hashing import recompute_remote_manifest_content_hash
-        from ..utils.hashing import is_rehash_verified, verify_minimal_chunks_and_reconstruct_manifest_hash
+        from ..utils.hashing import (
+            is_rehash_verified, recompute_remote_manifest_content_hash,
+            verify_minimal_chunks_and_reconstruct_manifest_hash)
         if not is_rehash_verified(current_zarr_store_url, stored_manifest_hash):
             # Efficient path: verify only needed chunks for this scoring window (variables/times/levels), then reconstruct manifest hash
             variables = [vc["name"] for vc in variables_to_score if isinstance(vc, dict) and "name" in vc]
@@ -2883,7 +2886,8 @@ async def calculate_era5_miner_score(
                         logger.debug(f"  truth: dims={truth_acc_input.dims}, coords={list(truth_acc_input.coords.keys())}")
                         logger.debug(f"  climatology: dims={climatology_acc_input.dims}, coords={list(climatology_acc_input.coords.keys())}")
                         
-                        from ..weather_scoring.metrics import calculate_acc_by_pressure_level
+                        from ..weather_scoring.metrics import \
+                            calculate_acc_by_pressure_level
                         per_level_acc = await calculate_acc_by_pressure_level(
                             miner_acc_input,
                             truth_acc_input,
@@ -2999,7 +3003,8 @@ async def calculate_era5_miner_score(
                                 # For atmospheric variables with multiple pressure levels, compute per-level skill
                                 per_level_skill_gfs = None
                                 if "per_level_mse" in current_metrics:
-                                    from ..weather_scoring.metrics import calculate_mse_skill_score_by_pressure_level
+                                    from ..weather_scoring.metrics import \
+                                        calculate_mse_skill_score_by_pressure_level
                                     per_level_skill_map = await calculate_mse_skill_score_by_pressure_level(
                                         forecast_bc_da,
                                         truth_var_da_final,
@@ -3096,7 +3101,8 @@ async def calculate_era5_miner_score(
                                     climatology_skill_input = climatology_skill_input.transpose(*truth_var_da_final.dims)
                             per_level_skill_clim = None
                             if "per_level_mse" in current_metrics:
-                                from ..weather_scoring.metrics import calculate_mse_skill_score_by_pressure_level
+                                from ..weather_scoring.metrics import \
+                                    calculate_mse_skill_score_by_pressure_level
                                 per_level_skill_map = await calculate_mse_skill_score_by_pressure_level(
                                     forecast_bc_da,
                                     truth_var_da_final,

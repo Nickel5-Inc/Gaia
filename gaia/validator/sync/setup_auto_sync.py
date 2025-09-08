@@ -16,8 +16,8 @@ Usage:
     python setup_auto_sync.py --primary --test
 """
 
-import asyncio
 import argparse
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -26,8 +26,8 @@ from pathlib import Path
 project_root = Path(__file__).parents[3]
 sys.path.insert(0, str(project_root))
 
-from gaia.validator.sync.auto_sync_manager import get_auto_sync_manager
 from gaia.utils.custom_logger import get_logger
+from gaia.validator.sync.auto_sync_manager import get_auto_sync_manager
 
 logger = get_logger(__name__)
 

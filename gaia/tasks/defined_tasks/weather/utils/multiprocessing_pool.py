@@ -11,13 +11,13 @@ import gc
 import multiprocessing as mp
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import traceback
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import xarray as xr
-from pathlib import Path
 
 from gaia.utils.custom_logger import get_logger
 
@@ -62,7 +62,8 @@ class MemoryAwareProcessPool:
 
         # Register this pool for global memory cleanup coordination
         try:
-            from gaia.utils.global_memory_manager import register_thread_cleanup
+            from gaia.utils.global_memory_manager import \
+                register_thread_cleanup
 
             def cleanup_process_pool_caches():
                 # Clear any caches that accumulate in the process pool management

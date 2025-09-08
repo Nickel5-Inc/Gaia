@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Optional
 
-
 TLSMode = Literal["self_signed", "letsencrypt", "off"]
 HostingMode = Literal["s3", "r2", "minio", "static"]
 Role = Literal["validator", "miner"]

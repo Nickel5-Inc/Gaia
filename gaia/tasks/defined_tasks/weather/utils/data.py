@@ -1,6 +1,7 @@
+from typing import Any, Dict, Tuple, Union
+
 import numpy as np
 import xarray as xr
-from typing import Dict, Any, Tuple, Union
 
 """
 Data handling utilities for weather task.

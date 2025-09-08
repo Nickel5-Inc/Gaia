@@ -7,21 +7,22 @@ Replaces fiber.logging_utils.get_logger with enhanced functionality:
 - Fun colors and improved readability
 """
 
-import sys
+import inspect
+import logging
+import multiprocessing as mp
 import os
 import re
-import multiprocessing as mp
-from typing import Optional, Dict, Any
-from loguru import logger
-import inspect
+import sys
 from pathlib import Path
-import logging
+from typing import Any, Dict, Optional
+
+from loguru import logger
 
 # Early monkey-patch to silence fiber logging noise
 try:
     # Try to import and patch fiber's get_logger before it's used
     import fiber.logging_utils
-    
+
     # Store original function
     _original_fiber_get_logger = fiber.logging_utils.get_logger
     

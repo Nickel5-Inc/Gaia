@@ -3,10 +3,12 @@ import os
 import time
 import traceback
 from typing import Dict, List, Optional
+
 import fsspec
-import xarray as xr
-import psutil
 import pandas as pd
+import psutil
+import xarray as xr
+
 from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
@@ -30,7 +32,6 @@ def get_last_verified_open_error(job_id: str) -> Optional[str]:
 try:
     import blosc
     import numcodecs
-
     # Force registration of blosc codec - correct way is to just import it
     import numcodecs.blosc
 
@@ -49,10 +50,10 @@ except Exception as e:
     )
 
 try:
-    from .hashing import get_trusted_manifest, VerifyingChunkMapper
+    from .hashing import VerifyingChunkMapper, get_trusted_manifest
 except ImportError:
     try:
-        from hashing import get_trusted_manifest, VerifyingChunkMapper
+        from hashing import VerifyingChunkMapper, get_trusted_manifest
     except ImportError as e:
         print(
             f"CRITICAL: Could not import hashing utilities from hashing.py. Error: {e}"
@@ -108,8 +109,9 @@ def _synchronous_zarr_open_unverified(
 
         # More robust codec registration
         try:
-            from numcodecs import Blosc, LZ4, Zstd
             import importlib
+
+            from numcodecs import LZ4, Blosc, Zstd
 
             importlib.reload(numcodecs.blosc)
 
@@ -292,7 +294,7 @@ def _synchronous_open_with_verifying_mapper(
             importlib.reload(numcodecs.blosc)
 
             # Explicitly register all standard codecs
-            from numcodecs import Blosc, LZ4, Zstd, GZip, BZ2
+            from numcodecs import BZ2, LZ4, Blosc, GZip, Zstd
 
             # Register blosc with all common configurations
             for cname in ["lz4", "lz4hc", "snappy", "zlib", "zstd"]:

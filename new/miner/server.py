@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
-
 import inspect
-from typing import Callable
+from typing import Callable, Optional
 
 import bittensor as bt  # type: ignore
 
-from new.miner.router.forward import ForwardRouter, build_default_router, forward as axon_forward
+from new.miner.router.forward import ForwardRouter, build_default_router
+from new.miner.router.forward import forward as axon_forward
 
 
 class MinerServer:

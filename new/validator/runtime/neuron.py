@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import bittensor as bt  # type: ignore
+
 from new.core.neuron import BaseNeuron
 from new.core.utils import config as cfg_utils
-import bittensor as bt  # type: ignore
 
 
 class ValidatorNeuron(BaseNeuron):

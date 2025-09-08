@@ -3,30 +3,32 @@ from __future__ import annotations
 import asyncio
 import logging
 import multiprocessing as mp
-from typing import Optional, Dict, Any
-import sqlalchemy as sa
+from typing import Any, Dict, Optional
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+import sqlalchemy as sa
 
 # Use custom logger for consistency and proper formatting
 from gaia.utils.custom_logger import get_logger
-logger = get_logger(__name__)
-from gaia.tasks.defined_tasks.weather.pipeline.scheduler import MinerWorkScheduler
-from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
-from gaia.tasks.defined_tasks.weather.pipeline.steps import day1_step, era5_step
-from gaia.tasks.defined_tasks.weather.pipeline.steps import seed_step
-from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import (
-    evaluate_miner_forecast_day1,
-)
-from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
-from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
-    fetch_gfs_analysis_data,
-    fetch_gfs_data,
-)
-from gaia.validator.utils.substrate_manager import get_process_isolated_substrate
-from fiber.chain.fetch_nodes import get_nodes_for_netuid
-from gaia.validator.weights.weight_service import commit_weights_if_eligible
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 
+logger = get_logger(__name__)
+from fiber.chain.fetch_nodes import get_nodes_for_netuid
+
+from gaia.tasks.defined_tasks.weather.pipeline.scheduler import \
+    MinerWorkScheduler
+from gaia.tasks.defined_tasks.weather.pipeline.steps import (day1_step,
+                                                             era5_step,
+                                                             seed_step)
+from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
+    fetch_gfs_analysis_data, fetch_gfs_data)
+from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import \
+    evaluate_miner_forecast_day1
+from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
+from gaia.validator.utils.substrate_manager import \
+    get_process_isolated_substrate
+from gaia.validator.weights.weight_service import commit_weights_if_eligible
 
 # verification removed
 
@@ -71,7 +73,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     payload = {}
             if jtype == "weather.run.orchestrate":
                 # High-level run orchestration
-                from gaia.tasks.defined_tasks.weather.pipeline.orchestrator import orchestrate_run
+                from gaia.tasks.defined_tasks.weather.pipeline.orchestrator import \
+                    orchestrate_run
                 rid = payload.get("run_id")
                 vhk = payload.get("validator_hotkey", "unknown_validator")
                 if rid:
@@ -86,7 +89,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 return ok
             elif jtype == "weather.initiate_fetch":
                 # Create individual query jobs for all miners (runs after seed completes)
-                from gaia.tasks.defined_tasks.weather.pipeline.orchestrator import handle_initiate_fetch_job
+                from gaia.tasks.defined_tasks.weather.pipeline.orchestrator import \
+                    handle_initiate_fetch_job
                 rid = payload.get("run_id")
                 vhk = payload.get("validator_hotkey", "unknown_validator")
                 if rid:
@@ -101,8 +105,10 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 return ok
             elif jtype == "weather.query_miner":
                 # Query individual miner to start inference
-                from gaia.tasks.defined_tasks.weather.pipeline.steps.query_miner_step import run_query_miner_job
-                from datetime import datetime, timezone, timedelta
+                from datetime import datetime, timedelta, timezone
+
+                from gaia.tasks.defined_tasks.weather.pipeline.steps.query_miner_step import \
+                    run_query_miner_job
                 
                 rid = payload.get("run_id")
                 muid = job.get("miner_uid")
@@ -204,7 +210,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 return ok
             elif jtype == "weather.poll_miner":
                 # Poll miner for inference status
-                from gaia.tasks.defined_tasks.weather.pipeline.steps.poll_miner_step import run_poll_miner_job
+                from gaia.tasks.defined_tasks.weather.pipeline.steps.poll_miner_step import \
+                    run_poll_miner_job
                 rid = payload.get("run_id")
                 muid = job.get("miner_uid")
                 mhk = payload.get("miner_hotkey", "unknown")
@@ -255,7 +262,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     # Update forecast metadata for all miners
                     import json
                     from datetime import timedelta
-                    
+
                     # Get GFS init time from the run
                     run_info = await db.fetch_one(
                         "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id",
@@ -476,11 +483,13 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 pass
             j = job.get("job_type")
             if j == "stats.aggregate":
-                from gaia.tasks.defined_tasks.weather.pipeline.steps.aggregate_step import run_miner_aggregation
+                from gaia.tasks.defined_tasks.weather.pipeline.steps.aggregate_step import \
+                    run_miner_aggregation
 
                 ok = await run_miner_aggregation(db, validator=validator)
             elif j == "stats.subnet_snapshot":
-                from gaia.tasks.defined_tasks.weather.pipeline.steps.aggregate_step import compute_subnet_stats
+                from gaia.tasks.defined_tasks.weather.pipeline.steps.aggregate_step import \
+                    compute_subnet_stats
 
                 _ = await compute_subnet_stats(db)
                 ok = True
@@ -573,7 +582,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                         await db.complete_validator_job(job["id"], result={"cancelled": "miner_not_found"})
                         return True
                     try:
-                        from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import poll_miner_job_status
+                        from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import \
+                            poll_miner_job_status
                         status_response = await poll_miner_job_status(
                             validator=validator,
                             miner_hotkey=miner_hotkey,
@@ -740,10 +750,13 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 payload = job.get("payload") or {}
                 rid = payload.get("run_id") or job.get("run_id")
                 try:
-                    from gaia.tasks.defined_tasks.weather.pipeline.steps.era5_step import _get_era5_truth
-                    from gaia.tasks.defined_tasks.weather.pipeline.steps.util_time import get_effective_gfs_init
+                    from gaia.tasks.defined_tasks.weather.pipeline.steps.era5_step import \
+                        _get_era5_truth
+                    from gaia.tasks.defined_tasks.weather.pipeline.steps.util_time import \
+                        get_effective_gfs_init
                     # Use a lightweight WeatherTask for config access
-                    from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+                    from gaia.tasks.defined_tasks.weather.weather_task import \
+                        WeatherTask
                     t = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
                     run_row = await db.fetch_one(
                         "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :rid",

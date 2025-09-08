@@ -1,10 +1,12 @@
-import threading
-from typing import Any, Dict, Optional
-import httpx
-from gaia.utils.custom_logger import get_logger
-import numpy as np
 import asyncio
 import math
+import threading
+from typing import Any, Dict, Optional
+
+import httpx
+import numpy as np
+
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 

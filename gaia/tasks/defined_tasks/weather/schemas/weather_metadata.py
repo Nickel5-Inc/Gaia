@@ -1,6 +1,8 @@
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional
+
 from pydantic import validator
-from gaia.tasks.base.components.metadata import Metadata, CoreMetadata
+
+from gaia.tasks.base.components.metadata import CoreMetadata, Metadata
 from gaia.tasks.base.decorators import handle_validation_error
 
 

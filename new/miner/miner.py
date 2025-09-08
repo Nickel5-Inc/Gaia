@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
+import bittensor as bt  # type: ignore
 import yaml
 
-from new.miner.server import MinerServer
-from new.miner.router.forward import build_default_router
 from new.core.neuron import BaseNeuron
-import bittensor as bt  # type: ignore
 from new.core.utils import config as cfg_utils
+from new.miner.router.forward import build_default_router
+from new.miner.server import MinerServer
 
 
 def _load_yaml(config_path: str) -> dict:

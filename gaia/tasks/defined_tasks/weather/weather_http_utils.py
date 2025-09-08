@@ -1,17 +1,18 @@
-import pickle
 import base64
-from typing import Optional, List, Callable
-import xarray as xr
-from aurora import Batch  # Assuming Batch is importable here, or adjust as needed
-import logging  # For logger instance
 import gzip
-import fsspec
-import uuid
 import io  # Added for BytesIO
+import logging  # For logger instance
+import pickle
 import tarfile
-from datetime import (
-    datetime,
-)  # For base_time typing, though not used in this function directly
+import uuid
+from datetime import \
+    datetime  # For base_time typing, though not used in this function directly
+from typing import Callable, List, Optional
+
+import fsspec
+import xarray as xr
+from aurora import \
+    Batch  # Assuming Batch is importable here, or adjust as needed
 
 # It's good practice to have a module-level logger if these utils become complex
 # For now, we'll expect a logger instance to be passed if needed by specific functions.

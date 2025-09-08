@@ -1,42 +1,43 @@
-import os
-import sys  # Add sys import
-import traceback  # Add traceback import
-import subprocess  # For managing inference server subprocess
-  # To ensure inference server is stopped
-import time  # For health check delays
-import httpx  # For health checking inference server
-from urllib.parse import urlparse  # To parse service URL
-from dotenv import load_dotenv
 import argparse
-from fiber import SubstrateInterface
+import asyncio
+import ipaddress
+import logging
+import os
+import ssl
+import subprocess  # For managing inference server subprocess
+import sys  # Add sys import
+# Removed asynccontextmanager import - using traditional startup/shutdown events
+import time  # For health check delays
+import traceback  # Add traceback import
+import warnings
+from typing import Optional
+from urllib.parse import urlparse  # To parse service URL
+
+import httpx  # For health checking inference server
 import uvicorn
-from gaia.utils.custom_logger import get_logger
+from alembic import command  # Add Alembic import
+# Imports for Alembic check
+from alembic.config import Config  # Add Alembic import
+from alembic.util import CommandError  # Add Alembic import
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse
+from fiber import SubstrateInterface, logging_utils
+from fiber.chain import chain_utils, fetch_nodes
 from fiber.encrypted.miner import server as fiber_server
 from fiber.encrypted.miner.core import configuration
 from fiber.encrypted.miner.middleware import configure_extra_logging_middleware
-from fiber.chain import chain_utils, fetch_nodes
-from gaia.miner.utils.subnet import factory_router
-from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 
+from gaia.miner.database.miner_database_manager import MinerDatabaseManager
+from gaia.miner.utils.subnet import factory_router
 # Geomagnetic and soil moisture tasks disabled
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
-import ssl
-import logging
-from fiber import logging_utils
-from fastapi import FastAPI, Request, Depends
-from fastapi.responses import JSONResponse
-import asyncio
-import ipaddress
-from typing import Optional
-import warnings
+from gaia.utils.custom_logger import get_logger
 
-# Removed asynccontextmanager import - using traditional startup/shutdown events
-import time
+  # To ensure inference server is stopped
 
-# Imports for Alembic check
-from alembic.config import Config  # Add Alembic import
-from alembic import command  # Add Alembic import
-from alembic.util import CommandError  # Add Alembic import
+
+
 
 MAX_REQUEST_SIZE = 100 * 1024 * 1024  # Reduced from 800MB to 100MB
 
@@ -974,6 +975,7 @@ class Miner:
 
         try:
             import threading
+
             import psutil
 
             system_memory = psutil.virtual_memory()
@@ -1274,18 +1276,18 @@ class Miner:
     def _memory_monitor_sync_loop(self):
         """Synchronous memory monitoring loop that runs in a separate thread."""
         try:
-            import psutil
-            import time
             import gc
+            import time
+
+            import psutil
 
             process = psutil.Process()
             last_log_time = 0
 
             # Register this thread for global memory cleanup coordination
             try:
-                from gaia.utils.global_memory_manager import (
-                    create_thread_cleanup_helper,
-                )
+                from gaia.utils.global_memory_manager import \
+                    create_thread_cleanup_helper
 
                 cleanup_helper = create_thread_cleanup_helper()
 

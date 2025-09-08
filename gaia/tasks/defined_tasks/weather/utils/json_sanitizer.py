@@ -7,8 +7,10 @@ sanitize these values before database insertion.
 
 import json
 import math
-import numpy as np
 from typing import Any, Dict, List, Union
+
+import numpy as np
+
 from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)

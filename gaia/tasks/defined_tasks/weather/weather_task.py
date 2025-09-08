@@ -1,13 +1,14 @@
 import asyncio
-import traceback
-from typing import Any, Dict, List, Optional, Union, Tuple, Set
-from uuid import uuid4
-from datetime import datetime, timezone, timedelta
-import os
-import sys
 import importlib.util
-from pydantic import Field, ConfigDict
+import os
 import random
+import sys
+import traceback
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from uuid import uuid4
+
+from pydantic import ConfigDict, Field
 
 # High-performance JSON operations for weather task
 try:
@@ -22,47 +23,47 @@ except ImportError:
         return json.loads(s)
 
 
-from gaia.utils.custom_logger import get_logger
-from gaia.tasks.base.task import Task
-from gaia.tasks.base.deterministic_job_id import DeterministicJobID
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-from gaia.miner.database.miner_database_manager import MinerDatabaseManager
-import uuid
-import time
-from pathlib import Path
-import xarray as xr
-import pickle
 import base64
-import jwt
-import numpy as np
-import torch
-import fsspec
-from kerchunk.hdf import SingleHdf5ToZarr
-import pandas as pd
-from cryptography.fernet import Fernet
-from fiber.encrypted.validator import handshake
-from fiber.encrypted.validator import client as vali_client
-from sqlalchemy import text, bindparam, TEXT
-import httpx
 import gc
-import shutil
-import zarr
-import numcodecs
-from typing import Dict
 import gzip
-import tarfile
 import io
-import tempfile
+import pickle
+import shutil
 import subprocess
+import tarfile
+import tempfile
+import time
+import uuid
+from pathlib import Path
+from typing import Dict
 
 import boto3  # For R2
+import fsspec
+import httpx
+import jwt
+import numcodecs
+import numpy as np
+import pandas as pd
+import torch
+import xarray as xr
+import zarr
+from cryptography.fernet import Fernet
+from fiber.encrypted.validator import client as vali_client
+from fiber.encrypted.validator import handshake
+from kerchunk.hdf import SingleHdf5ToZarr
+from sqlalchemy import TEXT, bindparam, text
 
+from gaia.miner.database.miner_database_manager import MinerDatabaseManager
+from gaia.tasks.base.deterministic_job_id import DeterministicJobID
+from gaia.tasks.base.task import Task
+from gaia.utils.custom_logger import get_logger
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 
 # Ensure blosc codec is available for zarr operations
 try:
     import blosc
     import numcodecs
-
     # Force registration of blosc codec - correct way is to just import it
     import numcodecs.blosc
 
@@ -80,58 +81,46 @@ except Exception as e:
         f"[WeatherTask] Failed to verify blosc codec availability: {e}. Zarr datasets using blosc compression may fail to open."
     )
 
+from gaia.tasks.defined_tasks.weather.utils.inference_class import \
+    WeatherInferenceRunner
+
+from .hardening_integration import WeatherTaskHardeningMixin
+from .processing.weather_logic import (_request_fresh_token,
+                                       _trigger_final_scoring,
+                                       _trigger_initial_scoring,
+                                       _update_run_status, build_score_row,
+                                       get_ground_truth_data,
+                                       get_job_by_gfs_init_time,
+                                       update_job_paths, update_job_status,
+                                       verify_miner_response)
+from .processing.weather_miner_preprocessing import \
+    prepare_miner_batch_from_payload
+from .processing.weather_workers import (cleanup_worker,
+                                         fetch_and_hash_gfs_task,
+                                         initial_scoring_worker,
+                                         poll_runpod_job_worker,
+                                         r2_cleanup_worker,
+                                         run_inference_background,
+                                         weather_job_status_logger)
+from .schemas.weather_inputs import (WeatherForecastRequest,
+                                     WeatherGetInputStatusData,
+                                     WeatherInitiateFetchData,
+                                     WeatherInputData, WeatherInputs,
+                                     WeatherStartInferenceData)
+from .schemas.weather_metadata import WeatherMetadata
+from .schemas.weather_outputs import (WeatherFileLocation,
+                                      WeatherGetInputStatusResponse,
+                                      WeatherInitiateFetchResponse,
+                                      WeatherKerchunkResponseData,
+                                      WeatherOutputs, WeatherProgressUpdate,
+                                      WeatherStartInferenceResponse,
+                                      WeatherTaskStatus)
+from .utils.data_prep import create_aurora_batch_from_gfs
 from .utils.era5_api import fetch_era5_data
 from .utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data
-from .utils.hashing import compute_verification_hash, compute_input_data_hash
+from .utils.hashing import compute_input_data_hash, compute_verification_hash
 from .utils.kerchunk_utils import generate_kerchunk_json_from_local_file
-from .utils.data_prep import create_aurora_batch_from_gfs
-from .schemas.weather_metadata import WeatherMetadata
-from .schemas.weather_inputs import (
-    WeatherInputs,
-    WeatherForecastRequest,
-    WeatherInputData,
-    WeatherInitiateFetchData,
-    WeatherGetInputStatusData,
-    WeatherStartInferenceData,
-)
-from .schemas.weather_outputs import (
-    WeatherOutputs,
-    WeatherKerchunkResponseData,
-    WeatherTaskStatus,
-)
-from .schemas.weather_outputs import (
-    WeatherInitiateFetchResponse,
-    WeatherGetInputStatusResponse,
-    WeatherStartInferenceResponse,
-)
-from .schemas.weather_outputs import WeatherProgressUpdate, WeatherFileLocation
 from .weather_scoring.metrics import calculate_rmse
-from .processing.weather_miner_preprocessing import prepare_miner_batch_from_payload
-from .processing.weather_logic import (
-    _update_run_status,
-    build_score_row,
-    get_ground_truth_data,
-    _trigger_initial_scoring,
-    _request_fresh_token,
-    verify_miner_response,
-    get_job_by_gfs_init_time,
-    update_job_status,
-    update_job_paths,
-    _trigger_final_scoring,
-)
-from .hardening_integration import WeatherTaskHardeningMixin
-from .processing.weather_workers import (
-    initial_scoring_worker,
-    cleanup_worker,
-    run_inference_background,
-    fetch_and_hash_gfs_task,
-    r2_cleanup_worker,
-    poll_runpod_job_worker,
-    weather_job_status_logger,
-)
-from gaia.tasks.defined_tasks.weather.utils.inference_class import (
-    WeatherInferenceRunner,
-)
 
 logger = get_logger(__name__)
 from aurora import Batch
@@ -1469,8 +1458,9 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         self, climatology_path: str
     ) -> Optional[xr.Dataset]:
         """Synchronous helper to load ERA5 climatology with thread-safe blosc support."""
-        import xarray as xr
         import os
+
+        import xarray as xr
 
         # THREADING FIX: Simple blosc codec registration in this executor thread
         def ensure_blosc_in_thread():
@@ -2054,9 +2044,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 if self.test_mode:
                     # Centralize hindcast shift configuration via util_time.get_effective_gfs_init
                     # Default shift is -7 days; configurable via config fields test_hindcast_days/hours.
-                    from gaia.tasks.defined_tasks.weather.pipeline.steps.util_time import (
-                        get_effective_gfs_init,
-                    )
+                    from gaia.tasks.defined_tasks.weather.pipeline.steps.util_time import \
+                        get_effective_gfs_init
                     shifted = get_effective_gfs_init(self, now_utc)
                     if shifted != now_utc:
                         logger.info(
@@ -2974,7 +2963,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 )
 
                 # Import the fallback function
-                from .processing.weather_logic import find_job_by_alternative_methods
+                from .processing.weather_logic import \
+                    find_job_by_alternative_methods
 
                 fallback_job = await find_job_by_alternative_methods(
                     self, job_id, "current_miner"
@@ -3012,9 +3002,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         if zarr_path.exists():
                             # Generate manifest and signature for the existing zarr store
                             def _generate_manifest_sync():
-                                from .utils.hashing import (
-                                    generate_manifest_and_signature,
-                                )
+                                from .utils.hashing import \
+                                    generate_manifest_and_signature
 
                                 return generate_manifest_and_signature(
                                     zarr_store_path=zarr_path,
@@ -3406,7 +3395,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     )
 
                     # Relaunch the combined background task (fetch + inference).
-                    from .processing.weather_workers import fetch_and_run_inference_task
+                    from .processing.weather_workers import \
+                        fetch_and_run_inference_task
                     asyncio.create_task(
                         fetch_and_run_inference_task(
                             task_instance=self,
@@ -3532,7 +3522,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         )
                                     # NEW: Immediately start inference after reusing existing GFS data
                 try:
-                    from .processing.weather_workers import run_inference_background
+                    from .processing.weather_workers import \
+                        run_inference_background
                     logger.info(f"[Miner Job {job_id}] Starting inference immediately with existing GFS data")
                     asyncio.create_task(run_inference_background(self, job_id))
                 except Exception as inf_err:
@@ -3588,7 +3579,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
                 # NEW: Start combined GFS fetch and inference task
                 # This task will fetch GFS data and immediately start inference
-                from .processing.weather_workers import fetch_and_run_inference_task
+                from .processing.weather_workers import \
+                    fetch_and_run_inference_task
                 asyncio.create_task(
                     fetch_and_run_inference_task(
                         task_instance=self,
@@ -4264,7 +4256,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 "data": status_payload_data.model_dump(),
                             }
 
-                            from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import poll_miner_job_status
+                            from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import \
+                                poll_miner_job_status
                             status_response = await poll_miner_job_status(
                                 validator=self.validator,
                                 miner_hotkey=miner_hk,
@@ -5164,7 +5157,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     }
 
                 try:
-                    from .schemas.weather_inputs import WeatherGetInputStatusData
+                    from .schemas.weather_inputs import \
+                        WeatherGetInputStatusData
 
                     status_payload_data = WeatherGetInputStatusData(job_id=miner_job_id)
                     status_payload = {
@@ -5173,7 +5167,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     }
                     endpoint = "/weather-poll-job-status"
 
-                    from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import poll_miner_job_status
+                    from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import \
+                        poll_miner_job_status
                     status_response = await poll_miner_job_status(
                         validator=self.validator,
                         miner_hotkey=miner_hk,
@@ -5225,8 +5220,9 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 logger.info(
                     f"[Run {run_id}] Validator computing its own reference input hash..."
                 )
-                from .utils.hashing import compute_input_data_hash
                 from pathlib import Path
+
+                from .utils.hashing import compute_input_data_hash
 
                 gfs_cache_dir = Path(
                     self.config.get("gfs_analysis_cache_dir", "./gfs_analysis_cache")

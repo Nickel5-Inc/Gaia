@@ -13,14 +13,16 @@ CRITICAL TIMING DESIGN:
 - Database sync happens at :39, ensuring all validators have the seed well in advance
 """
 
+import asyncio
+import hashlib
 import os
 import secrets
-import hashlib
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple
+
 import numpy as np
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Tuple, Dict, Any
+
 from gaia.utils.custom_logger import get_logger
-import asyncio
 
 logger = get_logger(__name__)
 

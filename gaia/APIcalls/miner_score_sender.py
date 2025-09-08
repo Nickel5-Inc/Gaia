@@ -1,18 +1,17 @@
 import asyncio
-from sqlalchemy import text
-from gaia.utils.custom_logger import get_logger
-import pprint
-import math
-import traceback
-import httpx
 import json
-from gaia.APIcalls.website_api import GaiaCommunicator
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+import math
+import pprint
+import traceback
 from typing import Dict, Optional
 
+import httpx
+from sqlalchemy import text
 
-
-
+from gaia.APIcalls.website_api import GaiaCommunicator
+from gaia.utils.custom_logger import get_logger
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 
 logger = get_logger(__name__)
 

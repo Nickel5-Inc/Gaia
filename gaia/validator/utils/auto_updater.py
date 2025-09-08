@@ -1,13 +1,13 @@
-import subprocess
-import traceback
-import os
-import json
-import configparser
-import time
 import asyncio
-import sys
-from pathlib import Path
+import configparser
+import json
 import logging
+import os
+import subprocess
+import sys
+import time
+import traceback
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 

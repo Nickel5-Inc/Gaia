@@ -1,18 +1,17 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
-import logging
 import sqlalchemy as sa
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-from gaia.database.validator_schema import (
-    weather_miner_responses_table,
-    weather_miner_scores_table,
-    weather_forecast_steps_table,
-)
+from gaia.database.validator_schema import (weather_forecast_steps_table,
+                                            weather_miner_responses_table,
+                                            weather_miner_scores_table)
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 
 
 @dataclass

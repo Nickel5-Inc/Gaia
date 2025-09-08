@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import os
+
 import yaml
 
-from new.validator.jobs.base import JobType
-from new.validator.jobs.queue_memory import InMemoryJobQueue
-from new.validator.jobs.registry import JobRegistry
-from new.validator.jobs.queue_db import DbJobQueue
 from new.validator.database.database_manager import DatabaseManager
-from new.validator.scheduler.recurring import RecurringScheduler, RecurringSpec
-from new.validator.workers.pool import WorkerPool
+from new.validator.handlers.process_deregistrations import \
+    handle_process_deregistrations
 from new.validator.handlers.query_miners import handle_query_miners
 from new.validator.handlers.sync_metagraph import handle_sync_metagraph
-from new.validator.handlers.process_deregistrations import handle_process_deregistrations
+from new.validator.jobs.base import JobType
+from new.validator.jobs.queue_db import DbJobQueue
+from new.validator.jobs.queue_memory import InMemoryJobQueue
+from new.validator.jobs.registry import JobRegistry
+from new.validator.scheduler.recurring import RecurringScheduler, RecurringSpec
+from new.validator.workers.pool import WorkerPool
+
 
 def _load_yaml(config_path: str) -> dict:
     with open(config_path, "r", encoding="utf-8") as f:

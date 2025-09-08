@@ -1,16 +1,9 @@
-from sqlalchemy import (
-    Column,
-    Integer,
-    String,
-    Float,
-    DateTime,
-    Boolean,
-    Text,
-)
+import datetime
+
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB  # For JSONB type
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql import func
-import datetime
 
 # Define a new Base for miner-specific tables
 # This helps in organizing models and potentially managing them separately if needed in the future,

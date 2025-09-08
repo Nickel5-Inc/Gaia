@@ -2,11 +2,13 @@
 Memory monitoring utilities for the weather task to prevent OOM kills.
 """
 
-import psutil
-import os
 import gc
+import os
 import time
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
+
+import psutil
+
 from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)

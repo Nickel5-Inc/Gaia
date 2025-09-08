@@ -1,71 +1,55 @@
 import asyncio
-import traceback
+import base64
 import gc
-import os
+import gzip
 import json
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-import uuid
-import numpy as np
-import xarray as xr
-import pandas as pd
+import os
+import pickle
 import shutil
 import time
-import zarr
+import traceback
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+# Import WeatherTask for type annotations
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+import httpx
 import numcodecs
-from typing import Dict, Optional, List, Tuple
-import base64
-import pickle
-import httpx
-import gzip
-import httpx
-import gzip
+import numpy as np
+import pandas as pd
 import psutil
+import xarray as xr
+import zarr
+from aurora import Batch
 
 from gaia.utils.custom_logger import get_logger
-from aurora import Batch
 
 from ..utils.data_prep import create_aurora_batch_from_gfs
 from ..utils.variable_maps import AURORA_TO_GFS_VAR_MAP
-
-# Import WeatherTask for type annotations
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..weather_task import WeatherTask
     from .....miner.inference_service.app.inference_runner import BatchType
 
-from .weather_logic import (
-    _request_fresh_token,
-    _update_run_status,
-    update_job_status,
-    update_job_paths,
-    get_ground_truth_data,
-    calculate_era5_miner_score,
-    _calculate_and_store_aggregated_era5_score,
-)
-
-from ..utils.gfs_api import (
-    fetch_gfs_analysis_data,
-    fetch_gfs_data,
-    GFS_SURFACE_VARS,
-    GFS_ATMOS_VARS,
-)
-from ..utils.era5_api import fetch_era5_data, fetch_era5_data_progressive
-from ..utils.hashing import (
-    compute_verification_hash,
-    compute_input_data_hash,
-    CANONICAL_VARS_FOR_HASHING,
-)
-from ..weather_scoring.metrics import calculate_rmse
-from ..weather_scoring_mechanism import (
-    evaluate_miner_forecast_day1,
-    precompute_climatology_cache,
-)
-from ..schemas.weather_outputs import WeatherProgressUpdate
-
 from sqlalchemy import update
+
 from gaia.database.validator_schema import weather_forecast_runs_table
+
+from ..schemas.weather_outputs import WeatherProgressUpdate
+from ..utils.era5_api import fetch_era5_data, fetch_era5_data_progressive
+from ..utils.gfs_api import (GFS_ATMOS_VARS, GFS_SURFACE_VARS,
+                             fetch_gfs_analysis_data, fetch_gfs_data)
+from ..utils.hashing import (CANONICAL_VARS_FOR_HASHING,
+                             compute_input_data_hash,
+                             compute_verification_hash)
+from ..weather_scoring.metrics import calculate_rmse
+from ..weather_scoring_mechanism import (evaluate_miner_forecast_day1,
+                                         precompute_climatology_cache)
+from .weather_logic import (_calculate_and_store_aggregated_era5_score,
+                            _request_fresh_token, _update_run_status,
+                            calculate_era5_miner_score, get_ground_truth_data,
+                            update_job_paths, update_job_status)
 
 logger = get_logger(__name__)
 
@@ -1095,7 +1079,8 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
                     if miner_keypair:
 
                         def _generate_manifest_sync():
-                            from ..utils.hashing import generate_manifest_and_signature
+                            from ..utils.hashing import \
+                                generate_manifest_and_signature
 
                             return generate_manifest_and_signature(
                                 zarr_store_path=Path(output_zarr_path),
@@ -1850,7 +1835,6 @@ async def initial_scoring_worker(task_instance: "WeatherTask"):
                 # AGGRESSIVE MEMORY CLEANUP inspired by substrate manager approach
                 try:
                     import sys
-
                     # 1. Clear module-level caches AND LRU caches
                     import warnings
 
@@ -2055,7 +2039,8 @@ async def initial_scoring_worker(task_instance: "WeatherTask"):
                     if result and isinstance(result, dict):
                         resp_id = result.get("response_id")
                         # Use safe JSON serialization to handle infinity/NaN values
-                        from ..utils.json_sanitizer import safe_json_dumps_for_db
+                        from ..utils.json_sanitizer import \
+                            safe_json_dumps_for_db
 
                         lead_scores_json = await asyncio.to_thread(
                             safe_json_dumps_for_db, result.get("lead_time_scores")
@@ -3938,10 +3923,11 @@ async def _download_forecast_from_r2_to_local(
 
             # Load and combine NetCDF files into a single zarr store
             try:
-                import xarray as xr
-                import pandas as pd
-                from pathlib import Path as PathlibPath
                 import gc  # For explicit garbage collection
+                from pathlib import Path as PathlibPath
+
+                import pandas as pd
+                import xarray as xr
 
                 # Create local zarr path first
                 gfs_init_time = None
@@ -3972,9 +3958,8 @@ async def _download_forecast_from_r2_to_local(
                 dirname_zarr = f"weather_forecast_{gfs_time_str}_miner_hk_{miner_hotkey_for_filename[:10]}_{unique_suffix}.zarr"
 
                 # Use the same forecast directory as local inference
-                from gaia.tasks.defined_tasks.weather.weather_task import (
-                    MINER_FORECAST_DIR_BG,
-                )
+                from gaia.tasks.defined_tasks.weather.weather_task import \
+                    MINER_FORECAST_DIR_BG
 
                 MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
                 output_zarr_path = MINER_FORECAST_DIR_BG / dirname_zarr
@@ -4310,7 +4295,8 @@ async def _download_forecast_from_r2_to_local(
                     if miner_keypair:
 
                         def _generate_manifest_sync():
-                            from ..utils.hashing import generate_manifest_and_signature
+                            from ..utils.hashing import \
+                                generate_manifest_and_signature
 
                             return generate_manifest_and_signature(
                                 zarr_store_path=Path(output_zarr_path),

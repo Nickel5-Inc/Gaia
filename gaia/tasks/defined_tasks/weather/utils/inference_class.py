@@ -1,10 +1,12 @@
+import os
+import traceback
+from typing import List
+
 import torch
 from aurora import Aurora, Batch, rollout
-from typing import List
+from aurora.foundry import BlobStorageChannel, FoundryClient, submit
+
 from gaia.utils.custom_logger import get_logger
-import os
-from aurora.foundry import FoundryClient, BlobStorageChannel, submit
-import traceback
 
 logger = get_logger(__name__)
 

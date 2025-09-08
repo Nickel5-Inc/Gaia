@@ -1,15 +1,17 @@
-import os
-from gaia.utils.custom_logger import get_logger
-from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Union, Tuple
-import numpy as np
-import xarray as xr
-import warnings
 import asyncio
 import hashlib
+import os
 import tempfile
 import traceback
+import warnings
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import List, Optional, Tuple, Union
+
+import numpy as np
+import xarray as xr
+
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger("gfs_api")
 G = 9.80665
@@ -119,8 +121,8 @@ async def fetch_gfs_data(
         # THREADING FIX: Explicitly import netCDF4 in thread context to ensure backend availability
         try:
             import netCDF4
-            import xarray as xr
             import numpy as np
+            import xarray as xr
 
             # Force re-registration of netcdf4 backend in this thread
             try:
@@ -336,6 +338,7 @@ async def fetch_gfs_data(
                         # Convert to UTC and remove timezone info for saving
                         if 'time' in ds.coords:
                             import pandas as pd
+
                             # numpy is already imported globally as np
                             time_vals = ds.time.values
                             # Check if time values are timezone-aware
@@ -736,8 +739,8 @@ async def fetch_gfs_analysis_data(
         # THREADING FIX: Explicitly import netCDF4 in thread context to ensure backend availability
         try:
             import netCDF4
-            import xarray as xr
             import numpy as np
+            import xarray as xr
 
             # Force re-registration of netcdf4 backend in this thread
             try:

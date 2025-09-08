@@ -2,29 +2,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
-import numpy as np
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
 
 from gaia.utils.custom_logger import get_logger
+
 logger = get_logger(__name__)
 
 import sqlalchemy as sa
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from gaia.tasks.defined_tasks.weather.processing.weather_logic import \
+    calculate_era5_miner_score
+from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data
 # REMOVED: MinerWorkScheduler import - no longer needed since run() method was removed
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
-from gaia.tasks.defined_tasks.weather.processing.weather_logic import (
-    calculate_era5_miner_score,
-)
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
-from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data
-from .step_logger import log_start, log_success, log_failure, schedule_retry
+
+from .step_logger import log_failure, log_start, log_success, schedule_retry
 from .substep import substep
 from .util_time import get_effective_gfs_init
-
-
 
 
 class DataNotReadyError(Exception):
@@ -63,7 +64,8 @@ async def _get_era5_truth(task: WeatherTask, run_id: int, gfs_init, leads: list[
             # Use progressive fetch for consistency with finalize worker and better caching
             use_progressive_fetch = task.config.get("progressive_era5_fetch", True)
             if use_progressive_fetch:
-                from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data_progressive
+                from gaia.tasks.defined_tasks.weather.utils.era5_api import \
+                    fetch_era5_data_progressive
                 ds = await fetch_era5_data_progressive(
                     target_datetimes, cache_dir=Path(cache_dir_str)
                 )
@@ -82,7 +84,8 @@ async def _get_era5_truth(task: WeatherTask, run_id: int, gfs_init, leads: list[
             try:
                 use_progressive_fetch = task.config.get("progressive_era5_fetch", True)
                 if use_progressive_fetch:
-                    from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data_progressive
+                    from gaia.tasks.defined_tasks.weather.utils.era5_api import \
+                        fetch_era5_data_progressive
                     ds = await fetch_era5_data_progressive(
                         target_datetimes, cache_dir=Path(cache_dir_str)
                     )
@@ -355,7 +358,9 @@ async def run_item(
 
     # After scoring, compute normalized per-lead scores and overall (writes to weather_forecast_stats)
     try:
-        from gaia.tasks.defined_tasks.weather.processing.weather_logic import _calculate_and_store_aggregated_era5_score
+        from gaia.tasks.defined_tasks.weather.processing.weather_logic import \
+            _calculate_and_store_aggregated_era5_score
+
         # Use task.config variables list; fallback to day1 list if unset
         vars_levels = task.config.get(
             "final_scoring_variables_levels",

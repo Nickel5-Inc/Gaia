@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from new.core.utils.config import Config
-from new.shared.networking.protocol import ForwardRequest, ForwardResponse
 from new.shared.networking.endpoint import Endpoint
+from new.shared.networking.protocol import ForwardRequest, ForwardResponse
 from new.validator.network.dendrite_client import DendriteClientAdapter
 
 

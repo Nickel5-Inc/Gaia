@@ -1,27 +1,31 @@
 from __future__ import annotations
 
 import logging
-import numpy as np
 import os
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+import numpy as np
 
 from gaia.utils.custom_logger import get_logger
+
 logger = get_logger(__name__)
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 import sqlalchemy as sa
+
+from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import \
+    evaluate_miner_forecast_day1
 # REMOVED: MinerWorkScheduler import - no longer needed since run() method was removed
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
-from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import (
-    evaluate_miner_forecast_day1,
-)
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
-from .step_logger import log_start, log_success, log_failure
+
+from ...weather_scoring.scoring import VARIABLE_WEIGHTS
 from .clim_cache import cleanup_clim_cache_if_done
+from .step_logger import log_failure, log_start, log_success
 from .substep import substep
 from .util_time import get_effective_gfs_init
-from ...weather_scoring.scoring import VARIABLE_WEIGHTS
 
 
 async def _score_variable_batch(
@@ -56,11 +60,10 @@ async def _score_variable_batch(
 
 @substep("day1", "load_inputs", should_retry=True, retry_delay_seconds=600, max_retries=5, retry_backoff="exponential")
 async def _load_inputs(db, task: WeatherTask, *, run_id: int, miner_uid: int, miner_hotkey: str, gfs_init):
-    from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
-        fetch_gfs_analysis_data,
-        fetch_gfs_data,
-    )
     from pathlib import Path
+
+    from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
+        fetch_gfs_analysis_data, fetch_gfs_data)
     cache_dir = Path(task.config.get("gfs_analysis_cache_dir", "./gfs_analysis_cache"))
     
     # day1 uses initial scoring leads
@@ -90,9 +93,8 @@ async def _load_inputs(db, task: WeatherTask, *, run_id: int, miner_uid: int, mi
 
 @substep("day1", "score", should_retry=True, retry_delay_seconds=900, max_retries=3, retry_backoff="linear")
 async def _score_day1(db, task: WeatherTask, *, run_id: int, miner_uid: int, miner_hotkey: str, gfs_init, miner_record: dict, gfs_analysis_ds, gfs_ref_ds, era5_clim, day1_cfg: dict, precomputed_cache=None):
-    from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import (
-        evaluate_miner_forecast_day1,
-    )
+    from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import \
+        evaluate_miner_forecast_day1
     return await evaluate_miner_forecast_day1(
         task_instance=task,
         miner_response_db_record=miner_record,
@@ -266,7 +268,7 @@ async def run_item(
         # Force garbage collection to clear any lingering references
         import gc
         import sys
-        
+
         # Clear any module-level caches that might hold dataset references
         try:
             # Clear xarray caches
@@ -390,7 +392,8 @@ async def run_item(
                         
                         # Record detailed component scores directly using batch insert
                         if component_scores_to_insert:
-                            from gaia.tasks.defined_tasks.weather.processing.weather_logic import _batch_insert_component_scores
+                            from gaia.tasks.defined_tasks.weather.processing.weather_logic import \
+                                _batch_insert_component_scores
                             success = await _batch_insert_component_scores(
                                 db, component_scores_to_insert, batch_size=50
                             )
@@ -546,7 +549,8 @@ async def run_item(
             except Exception:
                 pass
             
-        from gaia.tasks.defined_tasks.weather.processing.weather_logic import _check_run_completion
+        from gaia.tasks.defined_tasks.weather.processing.weather_logic import \
+            _check_run_completion
         try:
             await _check_run_completion(task, run_id)
         except Exception:
@@ -557,7 +561,8 @@ async def run_item(
             pass
     except Exception as e:
         try:
-            from gaia.tasks.defined_tasks.weather.pipeline.retry_policy import next_retry_time as _nrt
+            from gaia.tasks.defined_tasks.weather.pipeline.retry_policy import \
+                next_retry_time as _nrt
             nrt = _nrt("day1", 1)
             await log_failure(
                 db,

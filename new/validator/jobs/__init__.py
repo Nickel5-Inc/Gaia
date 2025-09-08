@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from .base import JobType, Job, JobResult, JobContext
-from .registry import JobRegistry
-from .queue_memory import InMemoryJobQueue
+from .base import Job, JobContext, JobResult, JobType
 from .queue_db import DbJobQueue
+from .queue_memory import InMemoryJobQueue
+from .registry import JobRegistry
 
 __all__ = [
     "JobType",

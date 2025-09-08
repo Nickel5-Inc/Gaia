@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 from typing import Generic, TypeVar
 
-from new.validator.core.contracts import Job, Queue, TaskContext, TaskResult, Worker
+from new.validator.core.contracts import (Job, Queue, TaskContext, TaskResult,
+                                          Worker)
 
 PayloadT = TypeVar("PayloadT")
 ResultT = TypeVar("ResultT")

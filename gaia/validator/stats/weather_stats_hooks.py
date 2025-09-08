@@ -6,17 +6,16 @@ database operations to avoid duplicate calculations and queries.
 """
 
 import time
-from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
-from loguru import logger
-import sqlalchemy as sa
+from typing import Any, Dict, List, Optional
 
+import sqlalchemy as sa
+from loguru import logger
+
+from gaia.database.validator_schema import (weather_forecast_stats_table,
+                                            weather_miner_responses_table,
+                                            weather_miner_scores_table)
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
-from gaia.database.validator_schema import (
-    weather_forecast_stats_table,
-    weather_miner_scores_table,
-    weather_miner_responses_table,
-)
 
 
 class WeatherStatsHooks:

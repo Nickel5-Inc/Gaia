@@ -15,19 +15,20 @@ the database is always ready for the validator to operate.
 """
 
 import asyncio
-import os
-import sys
-import subprocess
-import shutil
-import tempfile
 import json
-import time
+import os
+import shutil
 import signal
-import psutil
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, List, Tuple, Any
+import subprocess
+import sys
+import tempfile
+import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import psutil
 
 # Add project root to path for imports
 project_root = Path(__file__).parent.parent.parent.parent
@@ -1081,9 +1082,8 @@ class ComprehensiveDatabaseSetup:
         # CRITICAL: Check for and repair alembic_version corruption BEFORE attempting migrations
         logger.info("🔍 Pre-migration corruption check...")
         try:
-            from gaia.validator.database.alembic_corruption_repair import (
-                repair_alembic_corruption,
-            )
+            from gaia.validator.database.alembic_corruption_repair import \
+                repair_alembic_corruption
 
             repair_success = repair_alembic_corruption(db_url)
             if not repair_success:
@@ -1129,9 +1129,8 @@ class ComprehensiveDatabaseSetup:
                     "🔧 Migration failed with corruption symptoms - attempting repair and retry..."
                 )
                 try:
-                    from gaia.validator.database.alembic_corruption_repair import (
-                        repair_alembic_corruption,
-                    )
+                    from gaia.validator.database.alembic_corruption_repair import \
+                        repair_alembic_corruption
 
                     repair_success = repair_alembic_corruption(db_url)
                     if repair_success:

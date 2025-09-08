@@ -1,36 +1,36 @@
+import asyncio
+import base64
+import glob
+import json
+import os
+import traceback
+from datetime import datetime, timezone
 from functools import partial
-from fastapi import Depends, Request, HTTPException, Path
-from fastapi.responses import FileResponse, Response
-from fastapi.routing import APIRouter
-from pydantic import BaseModel, Field
-from fiber.encrypted.miner.dependencies import blacklist_low_stake, verify_request
-from fiber.encrypted.miner.security.encryption import decrypt_general_payload
-from gaia.utils.custom_logger import get_logger
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
 
+import jwt
 # Geomagnetic and soil moisture tasks disabled
 import numpy as np
-from datetime import datetime, timezone
-
-import traceback
-from gaia.miner.database.miner_database_manager import MinerDatabaseManager
-from pydantic import ValidationError
-import os
-from pathlib import Path
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import jwt
-from typing import Any, Dict, Optional, Set, List
-import glob
-
-import base64
-import asyncio
-import json
+from fastapi import Depends, HTTPException, Path, Request
+from fastapi.responses import FileResponse, Response
+from fastapi.routing import APIRouter
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fiber.encrypted.miner.dependencies import (blacklist_low_stake,
+                                                verify_request)
+from fiber.encrypted.miner.security.encryption import decrypt_general_payload
+from pydantic import BaseModel, Field, ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
+from gaia.miner.database.miner_database_manager import MinerDatabaseManager
+from gaia.utils.custom_logger import get_logger
+
 # High-performance JSON operations for miner routes
 try:
-    from gaia.utils.performance import dumps, loads
     from fastapi.responses import JSONResponse as _FastAPIJSONResponse
+
+    from gaia.utils.performance import dumps, loads
 
     class JSONResponse(_FastAPIJSONResponse):
         """Optimized JSONResponse using orjson for 2-3x faster miner route responses."""
@@ -55,20 +55,13 @@ except ImportError:
     )
 
 from gaia.tasks.defined_tasks.weather.schemas.weather_inputs import (
-    WeatherForecastRequest,
-    WeatherKerchunkRequest,
-    WeatherInputData,
-    WeatherInitiateFetchRequest,
-    WeatherGetInputStatusRequest,
-    WeatherStartInferenceRequest,
-)
+    WeatherForecastRequest, WeatherGetInputStatusRequest,
+    WeatherInitiateFetchRequest, WeatherInputData, WeatherKerchunkRequest,
+    WeatherStartInferenceRequest)
 from gaia.tasks.defined_tasks.weather.schemas.weather_outputs import (
-    WeatherKerchunkResponseData,
-    WeatherInitiateFetchResponse,
-    WeatherGetInputStatusResponse,
-    WeatherStartInferenceResponse,
-    WeatherTaskStatus,
-)
+    WeatherGetInputStatusResponse, WeatherInitiateFetchResponse,
+    WeatherKerchunkResponseData, WeatherStartInferenceResponse,
+    WeatherTaskStatus)
 
 MAX_REQUEST_SIZE = 800 * 1024 * 1024  # 800MB
 
@@ -222,7 +215,8 @@ async def enhanced_verify_request_with_blacklist(request: Request) -> dict:
     """
     # First, run Fiber's standard verification
     # This validates the signature and extracts the sender's hotkey
-    from fiber.encrypted.miner.dependencies import verify_request as fiber_verify
+    from fiber.encrypted.miner.dependencies import \
+        verify_request as fiber_verify
     
     try:
         # Run the standard Fiber verification

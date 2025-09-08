@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Generic, Optional, Protocol, TypeVar
+from typing import (Any, Awaitable, Callable, Dict, Generic, Optional,
+                    Protocol, TypeVar)
 
 PayloadT = TypeVar("PayloadT")
 ResultT = TypeVar("ResultT")

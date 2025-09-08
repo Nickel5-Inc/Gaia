@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import Awaitable, Callable, Dict
 
-from bittensor import Synapse  # Adapter surface only; handlers use our protocol
+from bittensor import \
+    Synapse  # Adapter surface only; handlers use our protocol
 
-from new.shared.networking.protocol import ForwardRequest, ForwardResponse, is_fresh, PROTO_VERSION
-
+from new.shared.networking.protocol import (PROTO_VERSION, ForwardRequest,
+                                            ForwardResponse, is_fresh)
 
 Handler = Callable[[ForwardRequest], Awaitable[ForwardResponse]]
 

@@ -8,7 +8,8 @@ from typing import Any, Dict
 
 import yaml
 
-from new.core.config.node_config import MinerConfig, ValidatorConfig, NodeConfig, ProxyConfig
+from new.core.config.node_config import (MinerConfig, NodeConfig, ProxyConfig,
+                                         ValidatorConfig)
 
 
 def _load_yaml(config_path: str) -> Dict[str, Any]:

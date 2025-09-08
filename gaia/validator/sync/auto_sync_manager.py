@@ -26,18 +26,20 @@ Advanced gap handling can be added as needed based on operational requirements.
 """
 
 import asyncio
-import os
-import subprocess
 import json
-import tempfile
-import shutil
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, List, Tuple
-from pathlib import Path
-from gaia.utils.custom_logger import get_logger
-import time
+import os
 import re
+import shutil
+import subprocess
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import aiofiles
+
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -112,9 +114,8 @@ class AutoSyncManager:
         """Acquire an exclusive advisory lock to pause app DB operations."""
         # Prefer direct DB execution to avoid shell/psql dependency
         try:
-            from gaia.validator.database.validator_database_manager import (
-                ValidatorDatabaseManager,
-            )
+            from gaia.validator.database.validator_database_manager import \
+                ValidatorDatabaseManager
 
             db = ValidatorDatabaseManager()
             await db.ensure_engine_initialized()
@@ -147,9 +148,8 @@ class AutoSyncManager:
         """Release the exclusive advisory lock."""
         # Prefer direct DB execution
         try:
-            from gaia.validator.database.validator_database_manager import (
-                ValidatorDatabaseManager,
-            )
+            from gaia.validator.database.validator_database_manager import \
+                ValidatorDatabaseManager
 
             db = ValidatorDatabaseManager()
             await db.ensure_engine_initialized()
@@ -2228,7 +2228,8 @@ pg1-user={self.config['pguser']}
         """Resilient backup scheduling with catch-up logic and multiple trigger opportunities."""
         # Register this scheduler for global memory cleanup coordination
         try:
-            from gaia.utils.global_memory_manager import register_thread_cleanup
+            from gaia.utils.global_memory_manager import \
+                register_thread_cleanup
 
             def cleanup_backup_caches():
                 # Clear any caches that accumulate during backup operations
@@ -2520,7 +2521,8 @@ pg1-user={self.config['pguser']}
         """Application-controlled replica sync scheduling coordinated with primary backups."""
         # Register this scheduler for global memory cleanup coordination
         try:
-            from gaia.utils.global_memory_manager import register_thread_cleanup
+            from gaia.utils.global_memory_manager import \
+                register_thread_cleanup
 
             def cleanup_replica_caches():
                 # Clear any caches that accumulate during replica sync operations
@@ -2976,8 +2978,8 @@ pg1-user={self.config['pguser']}
 
                         # Check if this backup was created recently (within last 10 minutes)
                         try:
-                            from datetime import datetime
                             import re
+                            from datetime import datetime
 
                             # Parse timestamp - pgBackRest can return various formats
                             if backup_timestamp != "unknown":

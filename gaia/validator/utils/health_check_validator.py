@@ -1,7 +1,8 @@
 import os
 import sys
-from gaia.utils.custom_logger import get_logger
 from unittest.mock import patch
+
+from gaia.utils.custom_logger import get_logger
 
 #####Temp Health Check to run on local
 
@@ -16,11 +17,11 @@ with patch.dict(
     "os.environ",
     {"EARTHDATA_USERNAME": "mock_user", "EARTHDATA_PASSWORD": "mock_password"},
 ):
-    from gaia.validator.validator import GaiaValidator
-    from gaia.validator.database.validator_database_manager import (
-        ValidatorDatabaseManager,
-    )
     import requests
+
+    from gaia.validator.database.validator_database_manager import \
+        ValidatorDatabaseManager
+    from gaia.validator.validator import GaiaValidator
 
 logger = get_logger(__name__)
 

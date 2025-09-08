@@ -1,7 +1,8 @@
+import json
+from typing import Any, Dict
+
 import fsspec
 import kerchunk.hdf
-import json
-from typing import Dict, Any
 
 
 def generate_kerchunk_json_from_local_file(

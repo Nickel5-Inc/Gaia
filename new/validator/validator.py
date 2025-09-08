@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from new.validator.runtime.entry import run_validator
+from new.validator.runtime.neuron import ValidatorNeuron
+from new.validator.runtime.query import query_miners
+
 # Thin facade: import public entrypoints/classes from submodules to preserve existing import paths
 
-from new.validator.runtime.neuron import ValidatorNeuron  
-from new.validator.runtime.query import query_miners  
-from new.validator.runtime.entry import run_validator  
 
 
 if __name__ == "__main__":

@@ -10,19 +10,19 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any, Tuple
-from loguru import logger
+from typing import Any, Dict, List, Optional, Tuple
+
 import sqlalchemy as sa
+from loguru import logger
 from sqlalchemy.dialects.postgresql import insert
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-from gaia.database.validator_schema import (
-    weather_forecast_stats_table,
-    miner_stats_table,
-    weather_forecast_runs_table,
-    weather_miner_responses_table,
-    weather_miner_scores_table,
-)
+from gaia.database.validator_schema import (miner_stats_table,
+                                            weather_forecast_runs_table,
+                                            weather_forecast_stats_table,
+                                            weather_miner_responses_table,
+                                            weather_miner_scores_table)
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 
 
 class WeatherStatsManager:
@@ -714,7 +714,8 @@ class WeatherStatsManager:
             True if successful, False otherwise
         """
         try:
-            from gaia.database.validator_schema import weather_forecast_component_scores_table
+            from gaia.database.validator_schema import \
+                weather_forecast_component_scores_table
             
             rows = []
             for variable, metrics in variable_scores.items():

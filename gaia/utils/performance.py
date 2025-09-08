@@ -3,10 +3,10 @@ Performance Utilities - Drop-in replacements for common operations
 Provides 2-10x performance improvements with graceful fallbacks.
 """
 
-import sys
 import logging
-from typing import Any, Dict, Optional, Union, List, Tuple
+import sys
 import warnings
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 

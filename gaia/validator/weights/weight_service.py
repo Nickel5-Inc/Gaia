@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import numpy as np
 from typing import List
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-from gaia.validator.weights.set_weights import FiberWeightSetter
+import numpy as np
 from fiber.chain import weights as w
+
 from gaia.utils.custom_logger import get_logger
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
+from gaia.validator.weights.set_weights import FiberWeightSetter
 
 logger = get_logger(__name__)
 

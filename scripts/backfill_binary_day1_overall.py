@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 import asyncio
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 
 import sqlalchemy as sa
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
+from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
 
 
 async def list_runs(db: ValidatorDatabaseManager) -> List[int]:

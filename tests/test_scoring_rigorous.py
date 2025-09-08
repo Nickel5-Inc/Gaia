@@ -1,16 +1,12 @@
-import numpy as np
-import xarray as xr
 import asyncio
 
+import numpy as np
+import xarray as xr
+
 from gaia.tasks.defined_tasks.weather.weather_scoring.metrics import (
-    calculate_mse_skill_score_by_pressure_level,
-    calculate_mse_skill_score,
-    calculate_acc_by_pressure_level,
-    calculate_acc,
-    calculate_rmse_by_pressure_level,
-    calculate_rmse,
-    calculate_bias,
-)
+    calculate_acc, calculate_acc_by_pressure_level, calculate_bias,
+    calculate_mse_skill_score, calculate_mse_skill_score_by_pressure_level,
+    calculate_rmse, calculate_rmse_by_pressure_level)
 
 
 def _lat_lon_grid(nlat=5, nlon=8):

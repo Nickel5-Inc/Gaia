@@ -6,14 +6,16 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone, timedelta
 import random
-from typing import Optional, Dict, Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-from gaia.tasks.defined_tasks.weather.pipeline.steps.seed_step import seed_forecast_run
-
+from gaia.tasks.defined_tasks.weather.pipeline.steps.seed_step import \
+    seed_forecast_run
 from gaia.utils.custom_logger import get_logger
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
+
 logger = get_logger(__name__)
 
 

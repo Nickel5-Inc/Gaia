@@ -1,7 +1,9 @@
+import traceback
+
 import torch
 from aurora import Aurora
+
 from gaia.utils.custom_logger import get_logger
-import traceback
 
 logger = get_logger(__name__)
 

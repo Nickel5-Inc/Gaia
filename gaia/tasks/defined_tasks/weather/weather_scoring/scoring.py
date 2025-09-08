@@ -1,8 +1,10 @@
+import asyncio
+import gc
+from typing import Dict, List, Optional, Tuple, Union
+
 import numpy as np
 import xarray as xr
-from typing import Dict, List, Tuple, Union, Optional
-import gc
-import asyncio
+
 from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)

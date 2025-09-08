@@ -1,9 +1,10 @@
-import os
-import sys
-import subprocess
-from pathlib import Path
 import getpass
+import os
 import shutil
+import subprocess
+import sys
+from pathlib import Path
+
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 

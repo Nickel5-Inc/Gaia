@@ -1,9 +1,11 @@
+import logging
 import os
 import sys
-import logging
 from unittest.mock import patch
-from gaia.miner.miner import Miner
+
 import requests
+
+from gaia.miner.miner import Miner
 from gaia.utils.custom_logger import get_logger
 
 ######Temp Health Check to run on local

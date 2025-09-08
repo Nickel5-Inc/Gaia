@@ -33,17 +33,17 @@ python -m scripts.weather_sweep --runs 10 --out /tmp/weather_sweep.json
 """
 from __future__ import annotations
 
-import os
+import argparse
+import asyncio
 import json
 import math
-import argparse
-from typing import Dict, Any, List, Tuple, Optional
+import os
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-import asyncio
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 
 def _env_csv(name: str, default_csv: str) -> List[float]:

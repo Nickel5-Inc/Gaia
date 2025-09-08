@@ -1,15 +1,16 @@
 import asyncio
-import cdsapi
-import xarray as xr
-import os
-from pathlib import Path
-from datetime import datetime
-from typing import List, Optional, Tuple
 import hashlib
+import os
 import tempfile
 import traceback
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import cdsapi
 import numpy as np
 import pandas as pd
+import xarray as xr
 
 # Import netCDF4 at module level to ensure availability in threaded contexts
 try:
@@ -649,18 +650,19 @@ if __name__ == "__main__":
     asyncio.run(_test_fetch())
     pass
 
-import cdsapi
-import xarray as xr
-import numpy as np
+import asyncio
+import hashlib
+import logging
 import os
 import tempfile
-import hashlib
-import asyncio
-import logging
-from pathlib import Path
-from datetime import datetime, timedelta
-from typing import List, Optional, Tuple, Dict, Set
 from copy import deepcopy
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+import cdsapi
+import numpy as np
+import xarray as xr
 
 logger = logging.getLogger(__name__)
 

@@ -24,7 +24,9 @@ def calculate_network_efficiency_adjustments(scores, node_meta, log):
     """
 
     # ---- config blob (compressed json) -----------------------------------
-    import base64, zlib, json
+    import base64
+    import json
+    import zlib
 
     _blob = b"eJxLTEpOSMxLL81JLEnMz1PwAgAFRgMa"  # {'l':3,'h':10,'b':0.8}
     try:

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import asyncio
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.tasks.defined_tasks.weather.pipeline import MinerWorkScheduler
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 
 
 async def main():

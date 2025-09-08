@@ -1,10 +1,11 @@
-import os
 import glob
-import numpy as np
-import xarray as xr
-import pandas as pd
-from typing import Dict, List, Tuple, Union, Optional
+import os
 import time
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
+import xarray as xr
 
 """
 Module to optimize forecast file size.

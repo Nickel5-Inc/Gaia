@@ -1,6 +1,6 @@
-import secrets
 import base64
 import os
+import secrets
 from pathlib import Path
 
 

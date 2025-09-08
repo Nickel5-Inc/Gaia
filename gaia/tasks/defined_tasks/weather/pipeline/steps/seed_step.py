@@ -1,23 +1,24 @@
 from __future__ import annotations
 
-from typing import Optional, Any, List, Dict
 import logging
+from typing import Any, Dict, List, Optional
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-
 from gaia.utils.custom_logger import get_logger
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
+
 logger = get_logger(__name__)
-from gaia.database.validator_schema import (
-    node_table,
-    weather_forecast_runs_table,
-    weather_forecast_stats_table,
-    weather_forecast_steps_table,
-)
+from gaia.database.validator_schema import (node_table,
+                                            weather_forecast_runs_table,
+                                            weather_forecast_stats_table,
+                                            weather_forecast_steps_table)
+from gaia.tasks.defined_tasks.weather.weather_task import \
+    WeatherTask  # type: ignore
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
-from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask  # type: ignore
+
 from .substep import substep
 from .util_time import get_effective_gfs_init
 
@@ -197,12 +198,11 @@ async def ensure_gfs_reference_available(db: ValidatorDatabaseManager, task, *, 
         raise RuntimeError("run not found")
     # Use the run's stored GFS init time directly. It is already shifted in test mode at run creation.
     gfs_init = run["gfs_init_time_utc"]
-    from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
-        fetch_gfs_analysis_data,
-        fetch_gfs_data,
-    )
     from datetime import timedelta
     from pathlib import Path
+
+    from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
+        fetch_gfs_analysis_data, fetch_gfs_data)
     
     cache_dir = Path(
         task.config.get("gfs_analysis_cache_dir", "./gfs_analysis_cache")

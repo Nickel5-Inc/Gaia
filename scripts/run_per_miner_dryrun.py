@@ -7,12 +7,12 @@ import asyncio
 import os
 from datetime import timezone
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.tasks.defined_tasks.weather.pipeline import MinerWorkScheduler
+from gaia.tasks.defined_tasks.weather.processing.weather_logic import \
+    verify_miner_response
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
-from gaia.tasks.defined_tasks.weather.processing.weather_logic import (
-    verify_miner_response,
-)
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 
 
 async def run_verify_one(db: ValidatorDatabaseManager) -> None:

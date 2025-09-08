@@ -1,17 +1,17 @@
+import concurrent.futures
 import gc
+import glob
 import logging
-import sys
 import math
 import multiprocessing as mp
-from datetime import datetime, timezone, timedelta
 import os
-import time
-import threading
-import concurrent.futures
-import glob
 import signal
 import sys
+import threading
+import time
 import tracemalloc  # Added import
+from datetime import datetime, timedelta, timezone
+
 import memray  # Added for programmatic memray tracking
 
 from gaia.database.database_manager import DatabaseTimeout
@@ -32,12 +32,10 @@ os.environ["NODE_TYPE"] = "validator"
 
 import asyncio
 
-
-
 # === WEIGHT TRACING INTEGRATION ===
 try:
-    import sys
     import os
+    import sys
 
     # Add the root directory to Python path to find runtime_weight_tracer
     root_dir = os.path.dirname(
@@ -56,18 +54,19 @@ except Exception as e:
     print(f"⚠️ [MAIN] Weight tracing not available: {e}")
 # === END WEIGHT TRACING INTEGRATION ===
 
+import random
 import ssl
 import traceback
-import random
-from typing import Any, Optional, List, Dict, Set
-from dotenv import load_dotenv
-from cryptography.fernet import Fernet
+from typing import Any, Dict, List, Optional, Set
+
 import httpx
+from cryptography.fernet import Fernet
+from dotenv import load_dotenv
 from fiber.chain import chain_utils
 from fiber.chain import weights as w
-
 # Note: get_nodes_for_netuid replaced with process-isolated _fetch_nodes_process_isolated
 from fiber.chain.chain_utils import query_substrate
+
 from gaia.utils.custom_logger import get_logger
 
 # Patch query_substrate to handle ProcessIsolatedSubstrate results
@@ -147,58 +146,58 @@ def patched_query_substrate(
 import fiber.chain.chain_utils
 
 fiber.chain.chain_utils.query_substrate = patched_query_substrate
-from fiber.encrypted.validator import client as vali_client, handshake
-from fiber.encrypted.validator import client as vali_client, handshake
-from fiber.chain.metagraph import Metagraph
 from fiber.chain.interface import get_substrate
+from fiber.chain.metagraph import Metagraph
+from fiber.encrypted.validator import client as vali_client
+from fiber.encrypted.validator import handshake
 from substrateinterface import SubstrateInterface
+
 from gaia.APIcalls.miner_score_sender import MinerScoreSender
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
+
 try:
     mp.set_start_method("spawn", force=True)
 except Exception:
     pass
-from argparse import ArgumentParser
-import pandas as pd
-import json
-from gaia.validator.weights.set_weights import FiberWeightSetter
 import base64
+import base64 as _b64
+import importlib as _il
+import json
 import math
-from gaia.validator.utils.auto_updater import perform_update
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import declarative_base
-from sqlalchemy import text
+import random  # for staggering db sync tasks
+from argparse import ArgumentParser
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-import numpy as np
-from gaia.validator.basemodel_evaluator import BaseModelEvaluator
-from gaia.validator.utils.db_wipe import handle_db_wipe
-from gaia.validator.utils.earthdata_tokens import ensure_valid_earthdata_token
-from gaia.validator.utils.substrate_manager import (
-    get_substrate_manager,
-    cleanup_global_substrate_manager,
-    get_fresh_substrate_connection,
-    get_process_isolated_substrate,
-    force_substrate_cleanup,
-)
-from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
-from gaia.tasks.defined_tasks.weather.pipeline.workers import process_one
-from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
-from gaia.tasks.defined_tasks.weather.pipeline.steps.aggregate_step import compute_subnet_stats
-from gaia.utils import consensus_metrics
-import importlib as _il
-import base64 as _b64
 
+import numpy as np
+import pandas as pd
+from alembic import command
 # Imports for Alembic check
 from alembic.config import Config
-from alembic import command
 from alembic.util import CommandError  # Import CommandError
-from sqlalchemy import create_engine, pool
+from sqlalchemy import create_engine, pool, text
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import declarative_base
 
+from gaia.tasks.defined_tasks.weather.pipeline.steps.aggregate_step import \
+    compute_subnet_stats
+from gaia.tasks.defined_tasks.weather.pipeline.workers import process_one
+from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+from gaia.utils import consensus_metrics
+from gaia.validator.basemodel_evaluator import BaseModelEvaluator
+from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
 # New imports for DB Sync
 # Legacy backup/restore managers removed - using AutoSyncManager only
 from gaia.validator.sync.auto_sync_manager import get_auto_sync_manager
-import random  # for staggering db sync tasks
+from gaia.validator.utils.auto_updater import perform_update
+from gaia.validator.utils.db_wipe import handle_db_wipe
+from gaia.validator.utils.earthdata_tokens import ensure_valid_earthdata_token
+from gaia.validator.utils.substrate_manager import (
+    cleanup_global_substrate_manager, force_substrate_cleanup,
+    get_fresh_substrate_connection, get_process_isolated_substrate,
+    get_substrate_manager)
+from gaia.validator.weights.set_weights import FiberWeightSetter
 
 logger = get_logger(__name__)
 
@@ -310,7 +309,9 @@ async def perform_handshake_with_retry(
 def _weather_worker_entrypoint() -> None:
     # Child process entrypoint for per-miner worker
     import asyncio
-    from gaia.tasks.defined_tasks.weather.pipeline.worker_main import main as worker_main
+
+    from gaia.tasks.defined_tasks.weather.pipeline.worker_main import \
+        main as worker_main
 
     asyncio.run(worker_main())
 
@@ -327,9 +328,9 @@ class GaiaValidator:
         Solution: Detect and remove problematic asyncio packages, forcing use of built-in asyncio.
         """
         try:
-            import sys
             import os
             import shutil
+            import sys
 
             print("[STARTUP] Checking asyncio compatibility for multiprocessing...")
 
@@ -460,8 +461,8 @@ class GaiaValidator:
     def _clear_pycache_files(self):
         """Clear all Python bytecode cache files in the repository to prevent caching issues."""
         try:
-            import subprocess
             import os
+            import subprocess
 
             # Get the repository root (where this file is located, go up to find gaia root)
             repo_root = os.path.dirname(
@@ -2081,8 +2082,9 @@ class GaiaValidator:
     async def _check_memory_usage(self, current_time):
         """Check overall validator memory usage and trigger restart if needed."""
         try:
-            import psutil
             import gc
+
+            import psutil
 
             process = psutil.Process()
             memory_info = process.memory_info()
@@ -2313,8 +2315,8 @@ class GaiaValidator:
                 return None  # Not running under PM2
 
             # Use PM2 to get process info
-            import subprocess
             import json
+            import subprocess
 
             result = await asyncio.to_thread(
                 lambda: subprocess.run(["pm2", "jlist"], capture_output=True, text=True)
@@ -2518,8 +2520,8 @@ class GaiaValidator:
                 )
 
             # More aggressive patching - patch multiple possible import locations
-            import fiber.chain.interface as fiber_interface
             import fiber.chain.fetch_nodes as fetch_nodes_module
+            import fiber.chain.interface as fiber_interface
 
             # Store originals
             original_get_substrate = fiber_interface.get_substrate
@@ -2894,8 +2896,8 @@ class GaiaValidator:
     def _aggressive_substrate_cleanup(self, context: str = "substrate_cleanup"):
         """Aggressive cleanup of substrate/scalecodec module caches."""
         try:
-            import sys
             import gc
+            import sys
 
             substrate_modules_cleared = 0
             cache_objects_cleared = 0
@@ -3680,10 +3682,7 @@ class GaiaValidator:
                 # Initialize weight perturbation manager for anti-weight-copying defense
                 try:
                     from gaia.validator.weight_perturbation import (
-                        WeightPerturbationManager,
-                        ENABLE_PERTURBATION,
-                        P_MOVE,
-                    )
+                        ENABLE_PERTURBATION, P_MOVE, WeightPerturbationManager)
 
                     validator_hotkey = None
                     if (
@@ -3818,7 +3817,8 @@ class GaiaValidator:
                                 if self.validator_uid is not None:
                                     try:
                                         # Import here to avoid circular imports
-                                        from gaia.validator.weights.weight_service import get_last_weight_set_block_from_chain
+                                        from gaia.validator.weights.weight_service import \
+                                            get_last_weight_set_block_from_chain
                                         last_weight_block_chain = await get_last_weight_set_block_from_chain(
                                             self.substrate, self.netuid, int(self.validator_uid)
                                         )
@@ -3829,7 +3829,8 @@ class GaiaValidator:
                                         if blocks_since_weights >= target_block_interval:
                                             logger.info(f"[WeightScheduler] Setting weights directly - {blocks_since_weights} blocks since last set (target: {target_block_interval})")
                                             # Execute weight setting directly in main process (has substrate access)
-                                            from gaia.validator.weights.weight_service import commit_weights_if_eligible
+                                            from gaia.validator.weights.weight_service import \
+                                                commit_weights_if_eligible
                                             weight_success = await commit_weights_if_eligible(self)
                                             if weight_success:
                                                 logger.success("[WeightScheduler] ✅ Weight setting completed successfully")
@@ -3845,7 +3846,8 @@ class GaiaValidator:
                                         
                                         if blocks_since_weights >= target_block_interval:
                                             logger.info(f"[WeightScheduler] Setting weights directly (fallback) - {blocks_since_weights} blocks since last set")
-                                            from gaia.validator.weights.weight_service import commit_weights_if_eligible
+                                            from gaia.validator.weights.weight_service import \
+                                                commit_weights_if_eligible
                                             weight_success = await commit_weights_if_eligible(self)
                                             if weight_success:
                                                 logger.success("[WeightScheduler] ✅ Weight setting completed successfully (fallback)")
@@ -4232,8 +4234,8 @@ class GaiaValidator:
 
                     # Clear scalecodec caches after reconnection
                     try:
-                        import sys
                         import gc
+                        import sys
 
                         cleared_count = 0
 
@@ -4312,7 +4314,8 @@ class GaiaValidator:
                     # Use chain-based weight tracking for accurate status (same as scheduler)
                     try:
                         if self.validator_uid is not None:
-                            from gaia.validator.weights.weight_service import get_last_weight_set_block_from_chain
+                            from gaia.validator.weights.weight_service import \
+                                get_last_weight_set_block_from_chain
                             last_weight_block_chain = await get_last_weight_set_block_from_chain(
                                 self.substrate, self.netuid, int(self.validator_uid)
                             )
@@ -4337,8 +4340,8 @@ class GaiaValidator:
 
                         # Clear scalecodec caches after status logger reconnection
                         try:
-                            import sys
                             import gc
+                            import sys
 
                             cleared_count = 0
 
@@ -4387,9 +4390,8 @@ class GaiaValidator:
 
                 # Get substrate manager stats
                 try:
-                    from gaia.validator.utils.substrate_manager import (
-                        get_substrate_manager,
-                    )
+                    from gaia.validator.utils.substrate_manager import \
+                        get_substrate_manager
 
                     manager = get_substrate_manager(
                         self.subtensor_network, self.subtensor_chain_endpoint
@@ -5804,8 +5806,8 @@ class GaiaValidator:
             import matplotlib
 
             matplotlib.use("Agg")  # Use Agg backend for non-interactive plotting
-            import matplotlib.pyplot as plt
             import matplotlib.dates as mdates
+            import matplotlib.pyplot as plt
         except ImportError as e:
             logger.error(
                 f"Matplotlib import error in sync plot generation: {e}. Plotting will be disabled for this cycle."
@@ -6256,9 +6258,8 @@ class GaiaValidator:
                     # Trigger coordinated cleanup across all background threads (all cleanup levels)
                     if cleanup_level != "none":
                         try:
-                            from gaia.utils.global_memory_manager import (
-                                trigger_global_cleanup,
-                            )
+                            from gaia.utils.global_memory_manager import \
+                                trigger_global_cleanup
 
                             global_stats = trigger_global_cleanup(cleanup_level)
                             if global_stats.get("callbacks_attempted", 0) > 0:
@@ -6670,8 +6671,9 @@ class GaiaValidator:
 if __name__ == "__main__":
     # Configure uvloop for better async performance (2-4x faster event loop)
     try:
-        import uvloop
         import platform
+
+        import uvloop
 
         # uvloop works best on Unix-like systems
         if platform.system() in ["Linux", "Darwin"]:  # Linux or macOS
@@ -6725,9 +6727,7 @@ if __name__ == "__main__":
 
             # Import the comprehensive database setup
             from gaia.validator.database.comprehensive_db_setup import (
-                setup_comprehensive_database,
-                DatabaseConfig,
-            )
+                DatabaseConfig, setup_comprehensive_database)
 
             # Create database configuration from environment variables
             db_config = DatabaseConfig(

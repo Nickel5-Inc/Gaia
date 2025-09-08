@@ -5,13 +5,13 @@ This module provides integration between the Gaia validator and pgBackRest
 for database synchronization across validator nodes.
 """
 
-import os
-import subprocess
-import logging
 import asyncio
 import configparser
+import logging
+import os
+import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 

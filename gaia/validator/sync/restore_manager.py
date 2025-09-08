@@ -2,8 +2,9 @@
 import asyncio
 import os
 import subprocess  # For pgBackRest commands
-from gaia.utils.custom_logger import get_logger
 from typing import Optional
+
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 

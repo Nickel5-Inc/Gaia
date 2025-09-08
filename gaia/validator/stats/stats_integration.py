@@ -5,12 +5,14 @@ This module provides integration points for the WeatherStatsManager to be called
 from the existing validator weather scoring pipeline.
 """
 
-from typing import Optional, Dict, Any
 from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
 from loguru import logger
 
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 
 
 class WeatherStatsIntegration:
@@ -239,7 +241,9 @@ class WeatherStatsIntegration:
         try:
             # Build query for weather_forecast_stats
             import sqlalchemy as sa
-            from gaia.database.validator_schema import weather_forecast_stats_table, miner_stats_table
+
+            from gaia.database.validator_schema import (
+                miner_stats_table, weather_forecast_stats_table)
             
             forecast_query = sa.select(weather_forecast_stats_table)
             if since:

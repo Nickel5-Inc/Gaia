@@ -1,19 +1,23 @@
-import torch
-from datetime import datetime, timezone, timedelta
-from typing import List, Optional
 import asyncio
-import traceback
-from fiber.chain import chain_utils, weights as w
-from fiber.chain.fetch_nodes import get_nodes_for_netuid
-from fiber import SubstrateInterface
-from fiber.chain.interface import get_substrate
-import sys
 import os
-from dotenv import load_dotenv
-from gaia.utils.custom_logger import get_logger
+import sys
+import traceback
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional
+
 import numpy as np
+import torch
+from dotenv import load_dotenv
+from fiber import SubstrateInterface
+from fiber.chain import chain_utils
+from fiber.chain import weights as w
+from fiber.chain.fetch_nodes import get_nodes_for_netuid
+from fiber.chain.interface import get_substrate
+
 from gaia import __spec_version__
-from gaia.validator.utils.substrate_manager import get_process_isolated_substrate
+from gaia.utils.custom_logger import get_logger
+from gaia.validator.utils.substrate_manager import \
+    get_process_isolated_substrate
 
 logger = get_logger(__name__)
 

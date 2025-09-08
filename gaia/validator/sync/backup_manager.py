@@ -2,9 +2,11 @@
 import asyncio
 import os
 import subprocess  # For running pgBackRest
-from gaia.utils.custom_logger import get_logger
-from datetime import datetime, timezone  # Keep for logging or potential future use
+from datetime import (datetime,  # Keep for logging or potential future use
+                      timezone)
 from typing import Optional
+
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 

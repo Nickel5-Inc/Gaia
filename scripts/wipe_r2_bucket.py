@@ -13,12 +13,13 @@ Options:
     --dry-run: Show what would be deleted without actually deleting
 """
 
-import boto3
+import argparse
 import os
 import sys
 from pathlib import Path
-from typing import List, Dict
-import argparse
+from typing import Dict, List
+
+import boto3
 from dotenv import load_dotenv
 
 

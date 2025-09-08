@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from typing import Optional, Any, Dict
+from typing import Any, Dict, Optional
 
 import sqlalchemy as sa
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from gaia.database.validator_schema import (miner_stats_table,
+                                            weather_forecast_stats_table)
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
-from gaia.database.validator_schema import (
-    weather_forecast_stats_table,
-    miner_stats_table,
-)
 
 
 async def run_miner_aggregation(db: ValidatorDatabaseManager, validator: Optional[Any] = None, miner_uid: Optional[int] = None) -> bool:

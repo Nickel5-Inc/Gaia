@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 from functools import wraps
-from typing import Optional, Callable, Any, Dict
+from typing import Any, Callable, Dict, Optional
 
 from loguru import logger
-from .step_logger import log_start, log_success, log_failure, schedule_retry
+
 from ..retry_policy import compute_next_retry
+from .step_logger import log_failure, log_start, log_success, schedule_retry
 
 
 def substep(

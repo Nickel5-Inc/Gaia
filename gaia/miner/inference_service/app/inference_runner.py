@@ -1,8 +1,8 @@
 import asyncio
-import traceback
 import logging
-from typing import Any, Dict, Optional, List
+import traceback
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -15,11 +15,9 @@ BatchType: Any
 RolloutFuncType: Any
 
 try:
-    from aurora import (
-        Aurora as AuroraActual,
-        Batch as BatchActual,
-        rollout as RolloutActual,
-    )
+    from aurora import Aurora as AuroraActual
+    from aurora import Batch as BatchActual
+    from aurora import rollout as RolloutActual
 
     AuroraModelType = AuroraActual
     BatchType = BatchActual

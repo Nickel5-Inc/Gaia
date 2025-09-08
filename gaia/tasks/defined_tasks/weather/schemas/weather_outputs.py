@@ -1,18 +1,14 @@
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any, Union, Set, Literal
+from enum import Enum
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
+
 import numpy as np
 import xarray as xr
-from pydantic import (
-    BaseModel,
-    Field,
-    validator,
-    ConfigDict,
-    model_validator,
-)
+from pydantic import BaseModel, ConfigDict, Field, model_validator, validator
+
 from gaia.tasks.base.components.outputs import Outputs
 from gaia.tasks.base.decorators import handle_validation_error
 from gaia.utils.custom_logger import get_logger
-from enum import Enum
 
 logger = get_logger(__name__)
 

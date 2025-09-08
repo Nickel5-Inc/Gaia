@@ -9,17 +9,19 @@ Usage:
     python scripts/backfill_weather_stats.py [--days 7] [--batch-size 100]
 """
 
-import asyncio
 import argparse
-from datetime import datetime, timedelta, timezone
-from loguru import logger
-import sys
+import asyncio
 import os
+import sys
+from datetime import datetime, timedelta, timezone
+
+from loguru import logger
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 from gaia.validator.stats.weather_stats_hooks import WeatherStatsHooks
 
 
@@ -157,7 +159,8 @@ async def backfill_stats(days: int = 7, batch_size: int = 100, validator_hotkey:
         
         # Final aggregation
         logger.info("Running final aggregation...")
-        from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
+        from gaia.validator.stats.weather_stats_manager import \
+            WeatherStatsManager
         stats_manager = WeatherStatsManager(db_manager, validator_hotkey)
         
         # Update overall miner stats

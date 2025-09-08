@@ -3,12 +3,13 @@ Memory management utilities for weather scoring workers.
 Provides per-miner cleanup and global LRU cache limits for handling many miners efficiently.
 """
 
+import functools
 import gc
+import os
 import sys
 import warnings
-import os
-import functools
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
+
 from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)

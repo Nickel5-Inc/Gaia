@@ -5,40 +5,39 @@ print("[MAIN_PY_DEBUG] Script execution started.", flush=True)
 
 import asyncio
 import base64
+import gzip
+import io
 import logging
 import os
 import pickle
-from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional, List, Tuple
-
-import uvicorn
-import yaml
-from fastapi import FastAPI, HTTPException, Request, status, Response
-from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel
-import pandas as pd
-import runpod 
-
-from pathlib import Path
-import uuid
-import tarfile
-import subprocess
 import shutil
-import tempfile
-import gzip
-import io
-import time
-from datetime import timezone, timedelta
+import subprocess
 import sys  # Ensure sys is imported if you use it for stdout/stderr explicitly later
+import tarfile
+import tempfile
+import time
+import uuid
+from contextlib import asynccontextmanager
+from datetime import timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import boto3  # For R2
-from botocore.exceptions import ClientError  # For R2 error handling
+import pandas as pd
+import runpod
+import uvicorn
+import yaml
 from botocore.config import Config
+from botocore.exceptions import ClientError  # For R2 error handling
+from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel
 
 # High-performance JSON operations for inference service
 try:
-    from gaia.utils.performance import dumps, loads
     from fastapi.responses import JSONResponse as _FastAPIJSONResponse
+
+    from gaia.utils.performance import dumps, loads
 
     class JSONResponse(_FastAPIJSONResponse):
         """Optimized JSONResponse using orjson for 2-3x faster inference service responses."""
@@ -95,18 +94,18 @@ _logger.info(f"Initial logging configured with level: {_log_level_str}")
 
 # --- Actual imports from local modules ---
 
+import numpy as np  # Add import for numpy
+import xarray as xr  # Add import for xarray
+
 from . import inference_runner as ir_module  # Import the module itself
-from .inference_runner import (
-    initialize_inference_runner,
-    run_model_inference,
-    BatchType as Batch,  # Use BatchType as Batch, or directly BatchType
-    _AURORA_AVAILABLE,  # Import the module-level variable
-)
+from .inference_runner import \
+    _AURORA_AVAILABLE  # Import the module-level variable
+from .inference_runner import \
+    BatchType as Batch  # Use BatchType as Batch, or directly BatchType
+from .inference_runner import initialize_inference_runner, run_model_inference
 
 # Note: If Aurora SDK is unavailable, BatchType will be 'Any' as defined in inference_runner.py
 
-import xarray as xr  # Add import for xarray
-import numpy as np  # Add import for numpy
 
 # --- Configuration Loading Function ---
 CONFIG_PATH = os.getenv("INFERENCE_CONFIG_PATH", "config/settings.yaml")

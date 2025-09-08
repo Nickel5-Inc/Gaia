@@ -4,22 +4,23 @@ Worker-friendly miner communication utilities with proper fiber handshake.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
-import base64
 import time
 import traceback
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 
 import httpx
-from fiber import Keypair
-from fiber.encrypted.validator import handshake
-from fiber.encrypted.validator import client as vali_client
 from cryptography.fernet import Fernet
+from fiber import Keypair
+from fiber.encrypted.validator import client as vali_client
+from fiber.encrypted.validator import handshake
 
 from gaia.utils.custom_logger import get_logger
+
 logger = get_logger(__name__)
 
 # Cache duration for symmetric keys (2 hours)
@@ -32,7 +33,7 @@ async def _get_cached_symmetric_key(db, miner_uid: int) -> Optional[Dict[str, An
     Returns:
         Dict with 'key' (base64 encoded), 'uuid', and 'age_minutes' if found, None otherwise
     """
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     
     try:
         query = """
@@ -64,8 +65,8 @@ async def _cache_symmetric_key(db, miner_uid: int, symmetric_key: bytes, symmetr
     """
     Cache a symmetric key for future use.
     """
-    from datetime import datetime, timezone, timedelta
     import base64
+    from datetime import datetime, timedelta, timezone
     
     try:
         now = datetime.now(timezone.utc)
@@ -698,6 +699,7 @@ async def query_miner_for_weather(
                 # Update error tracking separately to avoid complex JSONB parameter issues
                 # Use text() with parameters passed separately to execute()
                 from sqlalchemy import text
+
                 # Explicitly cast the key parameter to text to avoid ambiguous type errors in Postgres
                 error_query = text("""
                     UPDATE miner_stats

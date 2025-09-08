@@ -10,14 +10,14 @@ Usage:
     python monitor_job_id_health.py --node-type miner --output health_report.json
 """
 
-import asyncio
 import argparse
+import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Dict, List, Optional
 
 # Configure logging
 logging.basicConfig(
@@ -50,9 +50,8 @@ class JobIDHealthMonitor:
 
         if weather_task:
             # Use the actual health check function
-            from gaia.tasks.defined_tasks.weather.processing.weather_logic import (
-                check_job_id_health,
-            )
+            from gaia.tasks.defined_tasks.weather.processing.weather_logic import \
+                check_job_id_health
 
             try:
                 health_report = await check_job_id_health(weather_task)

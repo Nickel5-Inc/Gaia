@@ -1,8 +1,8 @@
-from functools import wraps
 import time
 import traceback
-from pydantic import ValidationError
+from functools import wraps
 
+from pydantic import ValidationError
 
 """
 Decorators for task module base classes.

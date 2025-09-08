@@ -1,3 +1,2 @@
-from . import day1_step, era5_step, aggregate_step, step_logger, seed_step, clim_cache, query_miner_step, poll_miner_step
-
-
+from . import (aggregate_step, clim_cache, day1_step, era5_step,
+               poll_miner_step, query_miner_step, seed_step, step_logger)

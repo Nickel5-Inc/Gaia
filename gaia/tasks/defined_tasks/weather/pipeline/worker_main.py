@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-import time
+import logging
+import multiprocessing as mp
 import os
 import signal
-import multiprocessing as mp
-from typing import Optional
-import logging
 import sys
+import time
+from typing import Optional
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager, DatabaseError
 from gaia.tasks.defined_tasks.weather.pipeline.workers import process_one
 from gaia.utils.custom_logger import get_logger
+from gaia.validator.database.validator_database_manager import (
+    DatabaseError, ValidatorDatabaseManager)
 
 # Use custom logger for consistency with other modules
 logger = get_logger(__name__)
@@ -58,10 +59,12 @@ async def worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0, mem
     # Create a WeatherTask instance for this worker
     # This provides the necessary validator context for miner communication
     try:
-        from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
-        from fiber.chain import chain_utils
         import os
-        
+
+        from fiber.chain import chain_utils
+
+        from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+
         # Load the validator keypair from wallet
         wallet_name = os.getenv("WALLET_NAME", "default")
         hotkey_name = os.getenv("HOTKEY_NAME", "default")

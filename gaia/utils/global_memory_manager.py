@@ -5,12 +5,12 @@ Coordinates memory cleanup across all threads, background workers, and processes
 to prevent sneaky cache growth in areas not covered by the main validator cleanup.
 """
 
-import threading
-
 import gc
+import threading
 import time
-from typing import Callable, Dict, List, Optional, Set
 from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Dict, List, Optional, Set
+
 from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)

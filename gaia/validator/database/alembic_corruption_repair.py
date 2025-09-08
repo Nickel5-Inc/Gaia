@@ -9,11 +9,13 @@ This addresses the issue where nodes have phantom migration IDs that prevent
 Alembic from functioning at all.
 """
 
-import os
 import asyncio
+import os
 from pathlib import Path
 from typing import Optional
+
 from sqlalchemy import create_engine, text
+
 from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)

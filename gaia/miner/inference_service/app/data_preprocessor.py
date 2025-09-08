@@ -1,6 +1,6 @@
 import base64
-import pickle
 import logging
+import pickle
 from typing import Any, Dict, Optional
 
 # High-performance JSON operations for inference service

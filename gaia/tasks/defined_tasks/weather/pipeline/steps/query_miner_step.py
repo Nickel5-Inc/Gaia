@@ -5,16 +5,20 @@ This step runs in parallel for each miner after GFS data is ready.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import query_miner_for_weather
-from gaia.tasks.defined_tasks.weather.schemas.weather_outputs import WeatherTaskStatus
-from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
-from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_failure, log_success
-
+from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import \
+    query_miner_for_weather
+from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import (
+    log_failure, log_success)
+from gaia.tasks.defined_tasks.weather.schemas.weather_outputs import \
+    WeatherTaskStatus
 from gaia.utils.custom_logger import get_logger
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
+from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
+
 logger = get_logger(__name__)
 
 

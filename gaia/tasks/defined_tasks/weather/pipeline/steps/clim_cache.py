@@ -4,16 +4,17 @@ import os
 import pickle
 from datetime import timedelta
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional
 
 import sqlalchemy as sa
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import \
+    precompute_climatology_cache
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
-from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import (
-    precompute_climatology_cache,
-)
-from .step_logger import log_start, log_success, log_failure
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
+
+from .step_logger import log_failure, log_start, log_success
 
 
 def _cache_paths(task: WeatherTask, run_id: int) -> Dict[str, Path]:

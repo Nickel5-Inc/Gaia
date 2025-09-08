@@ -1,8 +1,10 @@
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import xarray as xr
 from pydantic import BaseModel, Field, validator
+
 from gaia.tasks.base.components.inputs import Inputs
 from gaia.tasks.base.decorators import handle_validation_error
 

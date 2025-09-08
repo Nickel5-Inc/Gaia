@@ -7,16 +7,16 @@ for better resource management and simpler debugging.
 
 import asyncio
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
 import traceback
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import xarray as xr
-from pathlib import Path
 
 try:
-    import dask.array as da
     import dask
+    import dask.array as da
 
     DASK_AVAILABLE = True
 except ImportError:
@@ -35,7 +35,8 @@ class AsyncProcessingConfig:
     def __init__(self):
         # Register for global memory cleanup coordination
         try:
-            from gaia.utils.global_memory_manager import register_thread_cleanup
+            from gaia.utils.global_memory_manager import \
+                register_thread_cleanup
 
             def cleanup_async_processing_caches():
                 # Clear dask caches that accumulate during weather processing

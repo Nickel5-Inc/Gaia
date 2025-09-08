@@ -7,8 +7,8 @@ from typing import Optional
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from new.validator.jobs.base import AsyncJobQueue, Job, JobType
 from new.validator.database.database_manager import DatabaseManager
+from new.validator.jobs.base import AsyncJobQueue, Job, JobType
 
 
 class DbJobQueue(AsyncJobQueue):

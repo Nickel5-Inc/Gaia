@@ -1,17 +1,18 @@
-from abc import ABC
 import asyncio
 import time
-from typing import Any, Dict, List, Optional, TypeVar, Callable
+from abc import ABC
+from contextlib import asynccontextmanager
 from functools import wraps
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from typing import Any, Callable, Dict, List, Optional, TypeVar
+
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
-from contextlib import asynccontextmanager
+from sqlalchemy.ext.asyncio import (AsyncSession, async_sessionmaker,
+                                    create_async_engine)
+
 from gaia.utils.custom_logger import get_logger
-from gaia.utils.global_memory_manager import (
-    create_thread_cleanup_helper,
-    register_thread_cleanup,
-)
+from gaia.utils.global_memory_manager import (create_thread_cleanup_helper,
+                                              register_thread_cleanup)
 
 try:
     import psutil
@@ -19,10 +20,10 @@ try:
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
+import concurrent.futures
+import os  # Ensure os is imported
 import traceback
 from datetime import datetime, timezone  # Added import
-import os  # Ensure os is imported
-import concurrent.futures
 
 logger = get_logger(__name__)
 

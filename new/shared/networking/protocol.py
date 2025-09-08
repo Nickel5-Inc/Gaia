@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional
-
 
 PROTO_VERSION = "1.0"
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-
 DEFAULTS = {
     "verify": {"base_minutes": 5, "cap_minutes": 60},
     "day1": {"base_minutes": 10, "cap_minutes": 90},

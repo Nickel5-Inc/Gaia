@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional, Any, Dict
+from typing import Any, Dict, Optional
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.database.validator_schema import weather_forecast_steps_table
 from gaia.utils.custom_logger import get_logger
+from gaia.validator.database.validator_database_manager import \
+    ValidatorDatabaseManager
 
 logger = get_logger(__name__)
 
