@@ -441,6 +441,18 @@ async def run_item(
                 avg_acc = None
                 avg_skill = None
 
+            # Also compute an overall_forecast_score consistent with ERA5 path (95/5 blend with completeness penalty)
+            try:
+                qc_threshold = float(task.config.get("day1_binary_threshold", 0.1))
+                day1_pass = 1.0 if (overall is not None and float(overall) >= qc_threshold) else 0.0
+                # Until ERA5 exists, treat completeness as zero leads; overall stays 0.05 max if day1 passes after normalization by full horizon
+                W_era5 = 0.95
+                W_day1 = 0.05
+                # With no ERA5 yet, era5_norm_avg is 0.0
+                overall_blended = W_era5 * 0.0 + W_day1 * day1_pass
+            except Exception:
+                overall_blended = None
+
             await stats.update_forecast_stats(
                 run_id=run_id,
                 miner_uid=miner_uid,
@@ -450,6 +462,7 @@ async def run_item(
                 avg_rmse=avg_rmse,
                 avg_acc=avg_acc,
                 avg_skill_score=avg_skill,
+                overall_forecast_score=overall_blended,
             )
             
             # PIPELINE TIMING: Record Day1 completion time

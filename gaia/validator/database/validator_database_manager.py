@@ -2055,3 +2055,253 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             logger.error(f"Error during emergency geomagnetic cleanup: {e}")
             logger.error(traceback.format_exc())
             return {"error": str(e)}
+
+    # ------------------------------
+    # Queue introspection and cleanup
+    # ------------------------------
+
+    @track_operation("read")
+    async def get_queue_summary(self) -> Dict[str, Any]:
+        """Return high-level stats for validator_jobs.
+
+        Includes counts by status, counts by (job_type,status), oldest pending age, and in-progress lease stats.
+        """
+        try:
+            by_status_rows = await self.fetch_all(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM validator_jobs
+                GROUP BY status
+                ORDER BY status
+                """
+            )
+            by_status = {row["status"]: row["count"] for row in by_status_rows}
+
+            by_type_rows = await self.fetch_all(
+                """
+                SELECT job_type, status, COUNT(*) AS count
+                FROM validator_jobs
+                GROUP BY job_type, status
+                ORDER BY job_type, status
+                """
+            )
+            by_type: Dict[str, Dict[str, int]] = {}
+            for r in by_type_rows:
+                jt = r["job_type"]
+                st = r["status"]
+                ct = r["count"]
+                if jt not in by_type:
+                    by_type[jt] = {}
+                by_type[jt][st] = ct
+
+            oldest_pending_row = await self.fetch_one(
+                """
+                SELECT MIN(created_at) AS oldest
+                FROM validator_jobs
+                WHERE status IN ('pending','retry_scheduled')
+                  AND (scheduled_at IS NULL OR scheduled_at <= NOW())
+                  AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                """
+            )
+            oldest_pending = oldest_pending_row["oldest"] if oldest_pending_row else None
+
+            in_progress = await self.fetch_one(
+                """
+                SELECT 
+                  COUNT(*) FILTER (WHERE status = 'in_progress')                AS in_progress,
+                  COUNT(*) FILTER (WHERE lease_expires_at > NOW())              AS leased_active,
+                  COUNT(*) FILTER (WHERE lease_expires_at IS NOT NULL AND lease_expires_at <= NOW()) AS lease_expired
+                FROM validator_jobs
+                """
+            )
+
+            summary: Dict[str, Any] = {
+                "by_status": by_status,
+                "by_type": by_type,
+                "oldest_pending_created_at": oldest_pending,
+                "in_progress": in_progress["in_progress"] if in_progress else 0,
+                "leased_active": in_progress["leased_active"] if in_progress else 0,
+                "lease_expired": in_progress["lease_expired"] if in_progress else 0,
+            }
+            return summary
+        except Exception as e:
+            logger.error(f"get_queue_summary error: {e}")
+            return {"error": str(e)}
+
+    @track_operation("read")
+    async def get_step_summary(self) -> Dict[str, Any]:
+        """Return high-level stats for weather_forecast_steps."""
+        try:
+            rows = await self.fetch_all(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM weather_forecast_steps
+                GROUP BY status
+                ORDER BY status
+                """
+            )
+            by_status = {row["status"]: row["count"] for row in rows}
+
+            pending_rows = await self.fetch_one(
+                """
+                SELECT MIN(started_at) AS oldest_started,
+                       MIN(completed_at) AS oldest_completed
+                FROM weather_forecast_steps
+                WHERE status IN ('pending','queued','retry_scheduled','in_progress')
+                """
+            )
+
+            return {
+                "by_status": by_status,
+                "oldest_started": pending_rows.get("oldest_started") if pending_rows else None,
+                "oldest_completed": pending_rows.get("oldest_completed") if pending_rows else None,
+            }
+        except Exception as e:
+            logger.error(f"get_step_summary error: {e}")
+            return {"error": str(e)}
+
+    @track_operation("read")
+    async def find_active_job_duplicates(self) -> Dict[str, Any]:
+        """Detect likely duplicate active jobs for common keys.
+
+        Heuristics:
+          - Multiple active jobs for the same step_id
+          - Multiple active poll jobs per response_id
+          - Multiple active seed/initiate_fetch per run_id
+        """
+        try:
+            active_clause = "status IN ('pending','in_progress','retry_scheduled')"
+
+            dup_by_step = await self.fetch_all(
+                f"""
+                SELECT step_id, COUNT(*) AS count
+                FROM validator_jobs
+                WHERE step_id IS NOT NULL AND {active_clause}
+                GROUP BY step_id
+                HAVING COUNT(*) > 1
+                ORDER BY count DESC
+                LIMIT 200
+                """
+            )
+
+            dup_poll = await self.fetch_all(
+                f"""
+                SELECT response_id, COUNT(*) AS count
+                FROM validator_jobs
+                WHERE job_type = 'miners.poll_inference_status'
+                  AND response_id IS NOT NULL
+                  AND {active_clause}
+                GROUP BY response_id
+                HAVING COUNT(*) > 1
+                ORDER BY count DESC
+                LIMIT 200
+                """
+            )
+
+            dup_seed = await self.fetch_all(
+                f"""
+                SELECT run_id, COUNT(*) AS count
+                FROM validator_jobs
+                WHERE job_type = 'weather.seed' AND run_id IS NOT NULL AND {active_clause}
+                GROUP BY run_id
+                HAVING COUNT(*) > 1
+                ORDER BY count DESC
+                LIMIT 200
+                """
+            )
+
+            dup_initiate = await self.fetch_all(
+                f"""
+                SELECT run_id, COUNT(*) AS count
+                FROM validator_jobs
+                WHERE job_type = 'weather.initiate_fetch' AND run_id IS NOT NULL AND {active_clause}
+                GROUP BY run_id
+                HAVING COUNT(*) > 1
+                ORDER BY count DESC
+                LIMIT 200
+                """
+            )
+
+            return {
+                "active_duplicates_by_step_id": [dict(r) for r in dup_by_step],
+                "active_duplicates_poll_by_response_id": [dict(r) for r in dup_poll],
+                "active_duplicates_seed_by_run_id": [dict(r) for r in dup_seed],
+                "active_duplicates_initiate_by_run_id": [dict(r) for r in dup_initiate],
+            }
+        except Exception as e:
+            logger.error(f"find_active_job_duplicates error: {e}")
+            return {"error": str(e)}
+
+    @track_operation("write")
+    async def cleanup_old_validator_jobs(self, days_after_completion: int = 7, batch_size: int = 1000) -> int:
+        """Delete finished jobs older than the retention window.
+
+        Removes jobs with status in (completed, failed, cancelled) where completed_at < NOW() - days_after_completion.
+        Cascades will remove logs via FK.
+        """
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days_after_completion)
+
+            total_deleted = 0
+            while True:
+                result = await self.execute(
+                    """
+                    DELETE FROM validator_jobs
+                    WHERE id IN (
+                        SELECT id FROM validator_jobs
+                        WHERE status IN ('completed','failed','cancelled')
+                          AND completed_at IS NOT NULL
+                          AND completed_at < :cutoff
+                        ORDER BY completed_at ASC
+                        LIMIT :batch
+                    )
+                    """,
+                    {"cutoff": cutoff, "batch": batch_size},
+                )
+                deleted = getattr(result, "rowcount", 0)
+                total_deleted += deleted
+                if deleted < batch_size:
+                    break
+                await asyncio.sleep(0)
+            if total_deleted:
+                logger.info(f"Deleted {total_deleted} old validator_jobs older than {days_after_completion} days")
+            return total_deleted
+        except Exception as e:
+            logger.error(f"cleanup_old_validator_jobs error: {e}")
+            return 0
+
+    @track_operation("write")
+    async def cleanup_old_weather_steps(self, days_to_keep: int = 30, batch_size: int = 2000) -> int:
+        """Delete old, non-active weather_forecast_steps beyond retention window.
+
+        Keeps active statuses: pending, in_progress, retry_scheduled, waiting_for_truth.
+        """
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days_to_keep)
+
+            total_deleted = 0
+            while True:
+                result = await self.execute(
+                    """
+                    DELETE FROM weather_forecast_steps
+                    WHERE id IN (
+                        SELECT id FROM weather_forecast_steps
+                        WHERE COALESCE(completed_at, started_at, NOW() - INTERVAL '365 days') < :cutoff
+                          AND status NOT IN ('pending','in_progress','retry_scheduled','waiting_for_truth')
+                        ORDER BY COALESCE(completed_at, started_at, NOW()) ASC
+                        LIMIT :batch
+                    )
+                    """,
+                    {"cutoff": cutoff, "batch": batch_size},
+                )
+                deleted = getattr(result, "rowcount", 0)
+                total_deleted += deleted
+                if deleted < batch_size:
+                    break
+                await asyncio.sleep(0)
+            if total_deleted:
+                logger.info(f"Deleted {total_deleted} old weather_forecast_steps older than {days_to_keep} days")
+            return total_deleted
+        except Exception as e:
+            logger.error(f"cleanup_old_weather_steps error: {e}")
+            return 0

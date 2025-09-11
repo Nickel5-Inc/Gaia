@@ -2411,8 +2411,9 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 )
                 return
 
-        latest_day1_scores_array = np.full(256, 0.0)
-        latest_era5_composite_scores_array = np.full(256, 0.0)
+        # Pull directly from weather_forecast_stats per UID: use overall_forecast_score when available,
+        # else fallback to binary Day1 pass (0.05) until ERA5 completes. This aligns score_table with stats.
+        latest_overall_scores_array = np.full(256, 0.0)
 
         active_uids = set()
         async with self.db_manager.session(
@@ -2423,114 +2424,43 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             active_miner_uids_records = result.fetchall()
             active_uids = {rec.uid for rec in active_miner_uids_records}
 
-        day1_qc_score_type = "day1_qc_score"
-        query_day1_miner_scores = """
-            SELECT score, calculation_time FROM weather_miner_scores 
-            WHERE miner_uid = :miner_uid AND score_type = :score_type
-            ORDER BY calculation_time DESC LIMIT 1
-        """
-        latest_day1_timestamp = None
-
-        for uid in active_uids:
-            async with self.db_manager.session(
-                operation_name="fetch_latest_day1_score_for_uid"
-            ) as session:
-                result = await session.execute(
-                    text(query_day1_miner_scores),
-                    {"miner_uid": uid, "score_type": day1_qc_score_type},
-                )
-                res_day1 = result.fetchone()
-                if (
-                    res_day1
-                    and res_day1.score is not None
-                    and np.isfinite(res_day1.score)
-                ):
-                    latest_day1_scores_array[uid] = float(res_day1.score)
-                    if (
-                        latest_day1_timestamp is None
-                        or res_day1.calculation_time > latest_day1_timestamp
-                    ):
-                        latest_day1_timestamp = res_day1.calculation_time
-
-        if latest_day1_timestamp:
-            logger.info(
-                f"[CombinedWeatherScore] Fetched latest Day-1 QC scores for {len(active_uids)} active UIDs, latest timestamp: {latest_day1_timestamp}."
-            )
-        else:
-            logger.warning(
-                "[CombinedWeatherScore] No Day-1 QC scores found in weather_miner_scores for active UIDs."
-            )
-            latest_day1_timestamp = datetime.now(timezone.utc)
-
-        # Progressive scoring: ERA5 scores may come from multiple partial scoring runs
-        # This query will get the latest composite score regardless of progressive timing
-        era5_composite_score_type = "era5_final_composite_score"
-        query_era5_composite = """
-            SELECT score FROM weather_miner_scores WHERE miner_uid = :miner_uid AND score_type = :score_type
-            ORDER BY calculation_time DESC LIMIT 1
-        """
-        for uid in active_uids:
-            async with self.db_manager.session(
-                operation_name="fetch_latest_era5_composite_score_for_uid"
-            ) as session:
-                result = await session.execute(
-                    text(query_era5_composite),
-                    {"miner_uid": uid, "score_type": era5_composite_score_type},
-                )
-                res_era5 = result.fetchone()
-                if (
-                    res_era5
-                    and res_era5.score is not None
-                    and np.isfinite(res_era5.score)
-                ):
-                    latest_era5_composite_scores_array[uid] = float(res_era5.score)
-        logger.info(
-            f"[CombinedWeatherScore] Fetched ERA5 composite scores for {len(active_uids)} active UIDs."
-        )
-
-        W_day1 = self.config.get("weather_score_day1_weight", 0.2)
-        W_era5 = self.config.get("weather_score_era5_weight", 0.8)
-
-        # Tiering: scale day1 for miners without ERA5 and cap effective day1 contribution
-        tier_enabled = bool(self.config.get("tier_no_era5_enabled", True))
-        tier_factor = float(self.config.get("tier_no_era5_factor", 0.2) or 0.2)
-        day1_cap = float(self.config.get("tier_no_era5_day1_cap", 0.08) or 0.08)
-
-        # Determine miners with ERA5
-        has_era5_flags = np.zeros(256, dtype=bool)
-        for uid in active_uids:
-            has_era5_flags[uid] = latest_era5_composite_scores_array[uid] > 0
-
-        # Effective day1 weights per UID
-        W_day1_eff = np.full(256, W_day1, dtype=float)
-        if tier_enabled:
-            no_era5_mask = ~has_era5_flags
-            # Apply multiplicative factor and cap the day1 weight
-            W_day1_eff[no_era5_mask] = np.minimum(W_day1 * tier_factor, day1_cap)
-
-        # Binary Day1 QC pass vector using configured threshold
+        # Pull latest per-UID overall_forecast_score from weather_forecast_stats; if NULL, fallback to Day1 pass @ 0.05 until ERA5 exists
         qc_threshold = float(self.config.get("day1_binary_threshold", 0.1))
-        day1_pass_vec = (latest_day1_scores_array >= qc_threshold).astype(float)
-        proportional_weather_scores = (day1_pass_vec * W_day1_eff) + (
-            latest_era5_composite_scores_array * W_era5
-        )
-        logger.info(f"[CombinedWeatherScore] Calculated proportional scores.")
+        for uid in active_uids:
+            # Ensure we only use stats belonging to the CURRENT hotkey occupying this UID
+            hk_row = await self.db_manager.fetch_one(
+                text("SELECT hotkey FROM node_table WHERE uid = :uid"), {"uid": uid}
+            )
+            current_hk = hk_row and hk_row.get("hotkey")
+            if not current_hk:
+                continue
+            rec = await self.db_manager.fetch_one(
+                text(
+                    """
+                    SELECT overall_forecast_score, forecast_score_initial
+                    FROM weather_forecast_stats
+                    WHERE miner_uid = :uid AND miner_hotkey = :hk
+                    ORDER BY updated_at DESC NULLS LAST
+                    LIMIT 1
+                    """
+                ),
+                {"uid": uid, "hk": current_hk},
+            )
+            if rec and rec.get("overall_forecast_score") is not None:
+                try:
+                    latest_overall_scores_array[uid] = float(rec["overall_forecast_score"])
+                except Exception:
+                    latest_overall_scores_array[uid] = 0.0
+            else:
+                # Fallback: binary Day1 contributes 0.05 until ERA5 fills in
+                d1 = rec and rec.get("forecast_score_initial")
+                day1_pass = 1.0 if (d1 is not None and float(d1) >= qc_threshold) else 0.0
+                latest_overall_scores_array[uid] = 0.05 * day1_pass
 
-        # Calculate availability flags before clearing arrays
-        has_era5_scores = np.any(latest_era5_composite_scores_array > 0)
-        has_day1_scores = np.any(
-            proportional_weather_scores > 0
-        )  # This includes day1 component
+        # Availability flags
+        has_overall_scores = np.any(latest_overall_scores_array > 0)
 
-        # MEMORY LEAK FIX: Clear large score arrays immediately after use
-        try:
-            del latest_day1_scores_array, latest_era5_composite_scores_array
-            import gc
-
-            gc.collect()
-            logger.debug("Weather score calculation: cleared intermediate score arrays")
-        except Exception:
-            pass
+        # MEMORY LEAK NOTE: Keep latest_overall_scores_array for subsequent writes in this function
 
         # Apply excellence bonuses (unchanged)
         miner_bonuses_applied = np.zeros(256)
@@ -2564,7 +2494,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             candidate_scores_for_category = []
             if score_field == "weather":
                 for uid in active_uids:
-                    score = proportional_weather_scores[uid]
+                    score = latest_overall_scores_array[uid]
                     if np.isfinite(score) and score >= min_threshold:
                         candidate_scores_for_category.append((score, uid))
 
@@ -2597,7 +2527,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 )
 
         final_weather_scores_for_table = np.clip(
-            proportional_weather_scores + miner_bonuses_applied, 0.0, 1.1
+            latest_overall_scores_array + miner_bonuses_applied, 0.0, 1.1
         )
         nz_mask_cw = final_weather_scores_for_table > 0
         if np.any(nz_mask_cw):
@@ -2655,15 +2585,16 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 gfs_str = "unknown"
 
             id_for_combined_row = f"weather_scores_{run_id_trigger}_{gfs_str}"
+            # Stage reflects presence of nonzero overall scores (often initial after Day1)
             combined_status = (
-                "final_scores_compiled" if has_era5_scores else "initial_scores_compiled"
+                "final_scores_compiled" if has_overall_scores else "initial_scores_compiled"
             )
             logger.info(
                 f"[CombinedWeatherScore] Writing {combined_status} for run {run_id_trigger} (single-row per run): {id_for_combined_row}"
             )
         else:
-            # Periodic/manual call - use generic naming for overall system state
-            if has_era5_scores:
+            # Periodic/manual call - use generic naming; use presence of overall scores as signal
+            if has_overall_scores:
                 id_for_combined_row = "final_weather_scores"
                 combined_status = "final_scores_compiled"
             else:
@@ -2673,7 +2604,14 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 f"[CombinedWeatherScore] Creating combined weather scores (periodic): {id_for_combined_row}"
             )
 
-        timestamp_for_combined_score_row = datetime.now(timezone.utc)
+        # Anchor created_at to the run's GFS init time when run_id is provided
+        timestamp_for_combined_score_row = (
+            await self.db_manager.fetch_one(
+                text("SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :rid"),
+                {"rid": run_id_trigger},
+            )
+            or {}
+        ).get("gfs_init_time_utc", datetime.now(timezone.utc))
 
         # Override status to reflect stage
         await self.build_score_row(

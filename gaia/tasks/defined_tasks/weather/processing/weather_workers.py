@@ -2492,6 +2492,18 @@ async def cleanup_worker(task_instance: "WeatherTask"):
                             f"[CleanupWorker] Executed old run deletion query (actual rowcount might not be available from driver)."
                         )
 
+                    # Validator job retention
+                    job_retention_days = int(task_instance.config.get("validator_job_retention_days", 7))
+                    deleted_jobs = await task_instance.db_manager.cleanup_old_validator_jobs(days_after_completion=job_retention_days, batch_size=2000)
+                    if deleted_jobs:
+                        logger.info(f"[CleanupWorker] Deleted {deleted_jobs} old validator_jobs (> {job_retention_days} days).")
+
+                    # Step retention (30 days default)
+                    step_retention_days = int(task_instance.config.get("weather_step_retention_days", 30))
+                    deleted_steps = await task_instance.db_manager.cleanup_old_weather_steps(days_to_keep=step_retention_days, batch_size=5000)
+                    if deleted_steps:
+                        logger.info(f"[CleanupWorker] Deleted {deleted_steps} old weather_forecast_steps (> {step_retention_days} days) not in active statuses.")
+
                 except Exception as e_db:
                     logger.error(
                         f"[CleanupWorker] Error during database cleanup: {e_db}",

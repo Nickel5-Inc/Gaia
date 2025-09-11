@@ -847,16 +847,25 @@ class GaiaValidator:
             utilization = 0.85
 
         usable_gb = max(0.0, avail_gb * utilization - reserve_gb)
-        mem_cap = max(1, int(usable_gb // max(0.1, per_worker_gb)))
+        heavy_mem_cap = max(0, int(usable_gb // max(0.1, per_worker_gb)))
 
-        procs = max(1, min(core_cap, mem_cap))
+        # Exclude the utility worker from memory-based budgeting.
+        # We reserve worker-1/N as utility-only (low memory). Size heavy workers from heavy_mem_cap, then add utility (+1) if cores allow.
+        if core_cap <= 1:
+            # Single core: spawn one general worker (no dedicated utility)
+            total_procs = 1
+            heavy_procs = 1
+        else:
+            heavy_procs = max(1, min(heavy_mem_cap, core_cap - 1))
+            total_procs = min(core_cap, heavy_procs + 1)  # +1 utility worker
+
         try:
             logger.info(
-                f"[WorkerSizing] cores={cores}, core_cap={core_cap}, total_gb={total_gb:.2f}, avail_gb={avail_gb:.2f}, usable_gb={usable_gb:.2f}, per_worker_gb={per_worker_gb:.2f}, reserve_gb={reserve_gb:.2f}, mem_cap={mem_cap}, selected={procs}"
+                f"[WorkerSizing] cores={cores}, core_cap={core_cap}, total_gb={total_gb:.2f}, avail_gb={avail_gb:.2f}, usable_gb={usable_gb:.2f}, per_worker_gb={per_worker_gb:.2f}, reserve_gb={reserve_gb:.2f}, heavy_mem_cap={heavy_mem_cap}, heavy_procs={heavy_procs}, total_selected={total_procs}"
             )
         except Exception:
             pass
-        return procs
+        return total_procs
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -3896,6 +3905,9 @@ class GaiaValidator:
                     import datetime as _dt
                     
                     logger.info("🚀 Job enqueuer starting after database stability wait")
+
+                    # Track last enqueued dates to avoid relying on exact clock minutes
+                    last_reconcile_date = None
                     
                     # CRITICAL: Enqueue essential jobs after stability wait
                     startup_now = _dt.datetime.now(_dt.timezone.utc)
@@ -4012,6 +4024,15 @@ class GaiaValidator:
                                     priority=170,
                                     scheduled_at=now,
                                 )
+                                # Recompute overall scores and rebuild score_table from stats once or twice daily
+                                if now.hour in (0, 12):
+                                    await db.enqueue_singleton_job(
+                                        singleton_key=f"recompute_scores_and_weights_{now.strftime('%Y%m%d%H')}",
+                                        job_type="ops.recompute_scores_and_weights",
+                                        payload={},
+                                        priority=175,
+                                        scheduled_at=now,
+                                    )
                             # Global ERA5 truth guard every 3 hours (time-gates leads and enqueues per-lead steps)
                             # Run global ERA5 truth guard hourly to discover new lead times promptly
                             if now.minute == 0:
@@ -4022,20 +4043,22 @@ class GaiaValidator:
                                     priority=95,
                                     scheduled_at=now,
                                 )
-                            # Daily reconciliation of missing ERA5 steps at ~00:10 UTC
-                            if now.hour == 0 and now.minute == 10:
+                            # Daily reconciliation of missing ERA5 steps (idempotent, date-stamped singleton)
+                            if last_reconcile_date != now.date():
                                 try:
-                                    # Use a date-stamped singleton to ensure at most one per day
                                     daily_key = f"weather_reconcile_era5_steps_{now.strftime('%Y%m%d')}"
-                                    await db.enqueue_singleton_job(
+                                    jid = await db.enqueue_singleton_job(
                                         singleton_key=daily_key,
                                         job_type="weather.reconcile_era5_steps",
                                         payload={"ts": now.isoformat()},
                                         priority=110,
                                         scheduled_at=now,
                                     )
-                                except Exception:
-                                    pass
+                                    if jid:
+                                        logger.info(f"[JobEnqueuer] Enqueued daily reconciliation job {jid} for {now.date()}")
+                                    last_reconcile_date = now.date()
+                                except Exception as _recon_err:
+                                    logger.warning(f"[JobEnqueuer] Failed to enqueue daily reconciliation job: {_recon_err}")
 
                             # Ops status and DB monitor every 15 minutes
                             if now.minute % 15 == 0:

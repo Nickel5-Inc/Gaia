@@ -90,7 +90,21 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
         _pname = _mp.current_process().name if _mp.current_process() else "weather-w/1"
     except Exception:
         _pname = "weather-w/1"
-    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="weather.")
+    # Hardcode: reserve worker-1 (when total workers > 1) for utility queues only
+    skip_weather = False
+    try:
+        if "worker-" in _pname and "/" in _pname:
+            _part = _pname.split("worker-")[1]
+            _idx_str, _total_str = _part.split("/", 1)
+            _idx = int(_idx_str)
+            _total = int(_total_str) if _total_str.isdigit() else None
+            if _total is not None and _total > 1 and _idx == 1:
+                skip_weather = True
+    except Exception:
+        skip_weather = False
+    job = None
+    if not skip_weather:
+        job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="weather.")
     if job:
         try:
             # Log concise claim
@@ -146,6 +160,11 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     except Exception:
                         # Continue to next run on error
                         continue
+                # Enqueue steps that became due now as part of reconciliation
+                try:
+                    await db.enqueue_weather_step_jobs(limit=1000)
+                except Exception:
+                    pass
                 await db.complete_validator_job(job["id"], result={"ok": True, "reconciled": total})
                 return True
             elif jtype == "weather.initiate_fetch":
@@ -175,6 +194,33 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 retry_count = payload.get("retry_count", 0)
                 
                 if rid and muid is not None:
+                    # Guard: ensure uid-hotkey pair still exists (deregistration/hotkey change)
+                    try:
+                        exists_row = await db.fetch_one(
+                            "SELECT 1 FROM node_table WHERE uid = :uid AND hotkey = :hk",
+                            {"uid": int(muid), "hk": str(mhk)},
+                        )
+                    except Exception:
+                        exists_row = None
+                    if not exists_row:
+                        logger.warning(
+                            f"[weather.query_miner] Miner not found in node_table (uid={muid}, hk={str(mhk)[:8]}), cancelling query job {job.get('id')}"
+                        )
+                        try:
+                            await db.execute(
+                                """
+                                UPDATE weather_forecast_stats
+                                SET current_forecast_status = 'error',
+                                    last_error_message = 'miner not found in node_table',
+                                    updated_at = NOW()
+                                WHERE run_id = :rid AND miner_uid = :uid
+                                """,
+                                {"rid": rid, "uid": muid},
+                            )
+                        except Exception:
+                            pass
+                        await db.complete_validator_job(job["id"], result={"cancelled": "miner_not_found"})
+                        return True
                     ok = await run_query_miner_job(db, int(rid), int(muid), mhk, vhk, validator)
                     if ok:
                         # Query succeeded, reset retry tracking
@@ -402,6 +448,20 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                             {"rid": payload["response_id"]},
                         )
                         miner_hotkey = row and row.get("miner_hotkey")
+                    # Guard: ensure uid-hotkey pair still valid
+                    try:
+                        exists_row = await db.fetch_one(
+                            "SELECT 1 FROM node_table WHERE uid = :uid AND hotkey = :hk",
+                            {"uid": int(payload["miner_uid"]), "hk": str(miner_hotkey or "")},
+                        )
+                    except Exception:
+                        exists_row = None
+                    if not exists_row:
+                        logger.warning(
+                            f"[weather.day1] Miner not found in node_table (uid={payload['miner_uid']}, hk={str(miner_hotkey)[:8]}), cancelling job {job.get('id')}"
+                        )
+                        await db.complete_validator_job(job["id"], result={"cancelled": "miner_not_found"})
+                        return True
                     ok = await day1_step.run_item(
                         db,
                         run_id=payload["run_id"],
@@ -454,6 +514,20 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                             {"rid": payload["response_id"]},
                         )
                         miner_hotkey = row and row.get("miner_hotkey")
+                    # Guard: ensure uid-hotkey pair still valid
+                    try:
+                        exists_row = await db.fetch_one(
+                            "SELECT 1 FROM node_table WHERE uid = :uid AND hotkey = :hk",
+                            {"uid": int(payload["miner_uid"]), "hk": str(miner_hotkey or "")},
+                        )
+                    except Exception:
+                        exists_row = None
+                    if not exists_row:
+                        logger.warning(
+                            f"[weather.era5] Miner not found in node_table (uid={payload['miner_uid']}, hk={str(miner_hotkey)[:8]}), cancelling job {job.get('id')}"
+                        )
+                        await db.complete_validator_job(job["id"], result={"cancelled": "miner_not_found"})
+                        return True
                     try:
                         ok = await era5_step.run_item(
                             db,
@@ -733,6 +807,58 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                                     await db.execute("DELETE FROM weather_historical_weights WHERE miner_hotkey = :hk", {"hk": old_hk})
                                 except Exception:
                                     pass
+                                # Also remove step rows that were logged under the old hotkey to avoid collisions with new occupant at same UID
+                                try:
+                                    await db.execute(
+                                        "DELETE FROM weather_forecast_steps WHERE miner_hotkey = :hk",
+                                        {"hk": old_hk},
+                                    )
+                                except Exception:
+                                    pass
+                                # Cancel active validator jobs tied to the old hotkey without touching jobs for the new hotkey at same UID
+                                try:
+                                    await db.execute(
+                                        """
+                                        UPDATE validator_jobs
+                                        SET status = 'completed', completed_at = NOW(), lease_expires_at = NULL,
+                                            result = '{"cancelled":"deregistered"}'::jsonb
+                                        WHERE status IN ('pending','in_progress','retry_scheduled')
+                                          AND (
+                                            (payload ->> 'miner_hotkey') = :hk
+                                            OR (response_id IS NOT NULL AND response_id IN (
+                                                  SELECT id FROM weather_miner_responses WHERE miner_hotkey = :hk
+                                              ))
+                                            OR (step_id IS NOT NULL AND step_id IN (
+                                                  SELECT id FROM weather_forecast_steps WHERE miner_hotkey = :hk
+                                              ))
+                                          )
+                                        """,
+                                        {"hk": old_hk},
+                                    )
+                                except Exception as e_cancel:
+                                    logger.warning(f"[miners.handle_deregistrations] Failed cancelling active jobs for old hotkey {old_hk}: {e_cancel}")
+                                # Zero out old entries in score_table for this hotkey across all weather task rows
+                                try:
+                                    # Find UID(s) historically associated with this hotkey to target correct columns
+                                    uid_row = await db.fetch_one("SELECT uid FROM node_table WHERE hotkey = :hk", {"hk": old_hk})
+                                    # If the hotkey is fully removed, we may not find it in node_table; try stats as fallback
+                                    if not uid_row:
+                                        uid_row = await db.fetch_one(
+                                            "SELECT miner_uid AS uid FROM weather_forecast_stats WHERE miner_hotkey = :hk ORDER BY updated_at DESC LIMIT 1",
+                                            {"hk": old_hk},
+                                        )
+                                    if uid_row and uid_row.get("uid") is not None:
+                                        uid = int(uid_row["uid"])
+                                        if 0 <= uid < 256:
+                                            await db.execute(
+                                                f"""
+                                                UPDATE score_table
+                                                SET uid_{uid}_score = 0.0
+                                                WHERE task_name = 'weather'
+                                                """
+                                            )
+                                except Exception as e_zero:
+                                    logger.warning(f"[miners.handle_deregistrations] Failed zeroing score_table for hotkey {old_hk}: {e_zero}")
                             except Exception as e:
                                 logger.warning(f"[miners.handle_deregistrations] Cleanup failed for old hotkey {old_hk}: {e}")
                         try:
@@ -1049,9 +1175,38 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 )
             except Exception:
                 pass
-            # Placeholder ops (status snapshot, db monitor, plots)
-            await db.complete_validator_job(job["id"], result={"ok": True})
-            return True
+            j = job.get("job_type")
+            if j == "ops.recompute_scores_and_weights":
+                try:
+                    # Run the recompute pipeline inline using Python APIs
+                    from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+                    task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+                    # Rebuild combined rows based on stats for recent runs
+                    # Find recent run ids
+                    runs = await db.fetch_all("SELECT id FROM weather_forecast_runs ORDER BY id DESC LIMIT 32")
+                    count = 0
+                    for r in runs:
+                        rid = int(r["id"]) if r and r.get("id") is not None else None
+                        if rid is None:
+                            continue
+                        # Recompute overall for the run using the same helper as script
+                        try:
+                            from scripts.recompute_scores_and_weights import recompute_overall_for_run
+                        except Exception:
+                            recompute_overall_for_run = None
+                        if recompute_overall_for_run is not None:
+                            await recompute_overall_for_run(db, rid)
+                        await task.update_combined_weather_scores(run_id_trigger=rid, force_phase="final")
+                        count += 1
+                    await db.complete_validator_job(job["id"], result={"recomputed_runs": count})
+                    return True
+                except Exception as e:
+                    await db.fail_validator_job(job["id"], f"recompute exception: {e}", schedule_retry_in_seconds=3600)
+                    return False
+            else:
+                # Placeholder ops (status snapshot, db monitor, plots)
+                await db.complete_validator_job(job["id"], result={"ok": True})
+                return True
         except Exception as e:
             await db.fail_validator_job(job["id"], f"exception: {e}")
             return False
