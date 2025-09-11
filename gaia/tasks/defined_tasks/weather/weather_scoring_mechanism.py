@@ -1958,6 +1958,20 @@ async def _process_single_variable_parallel_preloaded(
                 result["qc_failure_reason"] = "Missing pressure dimensions"
                 return result
 
+            # Ensure pressure coordinates are monotonic along each array before nearest selection
+            try:
+                miner_var_da_unaligned = miner_var_da_unaligned.sortby(miner_pressure_dim)
+            except Exception:
+                pass
+            try:
+                truth_var_da_unaligned = truth_var_da_unaligned.sortby(truth_pressure_dim)
+            except Exception:
+                pass
+            try:
+                ref_var_da_unaligned = ref_var_da_unaligned.sortby(ref_pressure_dim)
+            except Exception:
+                pass
+
             if var_level == "all":
                 miner_var_da_selected = miner_var_da_unaligned
                 truth_var_da_selected = truth_var_da_unaligned  

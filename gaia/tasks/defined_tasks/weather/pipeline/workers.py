@@ -888,6 +888,38 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     except Exception:
                         pass
 
+                    # FINALIZATION: Ensure node_table is fully synchronized with current metagraph as the last step
+                    try:
+                        try:
+                            nodes_final = get_nodes_for_netuid(substrate=substrate, netuid=netuid)
+                        except Exception:
+                            nodes_final = nodes  # Fallback to earlier snapshot
+                        final_miners_data = []
+                        for n in nodes_final or []:
+                            try:
+                                index_val = int(getattr(n, "node_id", None) or getattr(n, "uid", 0))
+                                row = {
+                                    "index": index_val,
+                                    "hotkey": getattr(n, "hotkey", None),
+                                    "coldkey": getattr(n, "coldkey", None),
+                                    "ip": getattr(n, "ip", None),
+                                    "ip_type": getattr(n, "ip_type", None),
+                                    "port": getattr(n, "port", None),
+                                    "incentive": getattr(n, "incentive", None),
+                                    "stake": getattr(n, "stake", None),
+                                    "trust": getattr(n, "trust", None),
+                                    "vtrust": getattr(n, "validator_trust", None),
+                                    "protocol": getattr(n, "protocol", None),
+                                }
+                                final_miners_data.append(row)
+                            except Exception:
+                                continue
+                        if final_miners_data:
+                            await db.batch_update_miners(final_miners_data)
+                            logger.info("[miners.handle_deregistrations] Finalized node_table synchronization with current metagraph")
+                    except Exception as e_final:
+                        logger.warning(f"[miners.handle_deregistrations] Final node_table sync skipped due to error: {e_final}")
+
                     await db.complete_validator_job(job["id"], result={"updated": len(miners_data)})
                     return True
                 except Exception as e:

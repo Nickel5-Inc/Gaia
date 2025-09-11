@@ -2411,8 +2411,9 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 )
                 return
 
-        # Pull directly from weather_forecast_stats per UID: use overall_forecast_score when available,
-        # else fallback to binary Day1 pass (0.05) until ERA5 completes. This aligns score_table with stats.
+        # Pull directly from weather_forecast_stats per UID/run with strict rules:
+        # - If run_id_trigger is provided, only use stats for that run; else use latest for current (uid,hotkey)
+        # - If no overall is available, fallback to Day1 pass at 0.05
         latest_overall_scores_array = np.full(256, 0.0)
 
         active_uids = set()
@@ -2424,8 +2425,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             active_miner_uids_records = result.fetchall()
             active_uids = {rec.uid for rec in active_miner_uids_records}
 
-        # Pull latest per-UID overall_forecast_score from weather_forecast_stats; if NULL, fallback to Day1 pass @ 0.05 until ERA5 exists
         qc_threshold = float(self.config.get("day1_binary_threshold", 0.1))
+        had_era5_any = False
         for uid in active_uids:
             # Ensure we only use stats belonging to the CURRENT hotkey occupying this UID
             hk_row = await self.db_manager.fetch_one(
@@ -2434,23 +2435,42 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             current_hk = hk_row and hk_row.get("hotkey")
             if not current_hk:
                 continue
-            rec = await self.db_manager.fetch_one(
-                text(
-                    """
-                    SELECT overall_forecast_score, forecast_score_initial
-                    FROM weather_forecast_stats
-                    WHERE miner_uid = :uid AND miner_hotkey = :hk
-                    ORDER BY updated_at DESC NULLS LAST
-                    LIMIT 1
-                    """
-                ),
-                {"uid": uid, "hk": current_hk},
-            )
+            if run_id_trigger:
+                rec = await self.db_manager.fetch_one(
+                    text(
+                        """
+                        SELECT overall_forecast_score, forecast_score_initial
+                        FROM weather_forecast_stats
+                        WHERE run_id = :rid AND miner_uid = :uid AND miner_hotkey = :hk
+                        ORDER BY updated_at DESC NULLS LAST
+                        LIMIT 1
+                        """
+                    ),
+                    {"rid": run_id_trigger, "uid": uid, "hk": current_hk},
+                )
+            else:
+                rec = await self.db_manager.fetch_one(
+                    text(
+                        """
+                        SELECT overall_forecast_score, forecast_score_initial
+                        FROM weather_forecast_stats
+                        WHERE miner_uid = :uid AND miner_hotkey = :hk
+                        ORDER BY updated_at DESC NULLS LAST
+                        LIMIT 1
+                        """
+                    ),
+                    {"uid": uid, "hk": current_hk},
+                )
+            overall_val: Optional[float] = None
             if rec and rec.get("overall_forecast_score") is not None:
                 try:
-                    latest_overall_scores_array[uid] = float(rec["overall_forecast_score"])
+                    overall_val = float(rec["overall_forecast_score"])
                 except Exception:
-                    latest_overall_scores_array[uid] = 0.0
+                    overall_val = None
+            if overall_val is not None:
+                latest_overall_scores_array[uid] = min(1.1, max(0.0, overall_val))
+                if overall_val > 0.05:
+                    had_era5_any = True
             else:
                 # Fallback: binary Day1 contributes 0.05 until ERA5 fills in
                 d1 = rec and rec.get("forecast_score_initial")
@@ -2462,7 +2482,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
         # MEMORY LEAK NOTE: Keep latest_overall_scores_array for subsequent writes in this function
 
-        # Apply excellence bonuses (unchanged)
+        # Apply excellence bonuses only when ERA5 exists for this run/context
         miner_bonuses_applied = np.zeros(256)
         bonus_categories = [
             {
@@ -2486,45 +2506,45 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         ]
         bonus_value_add = 0.05  # Small bonus for excellence
 
-        for category in bonus_categories:
-            score_field = category["score_field"]
-            min_threshold = category["min_threshold"]
-            higher_is_better = category["higher_is_better"]
+        if not run_id_trigger or had_era5_any:
+            for category in bonus_categories:
+                score_field = category["score_field"]
+                min_threshold = category["min_threshold"]
+                higher_is_better = category["higher_is_better"]
 
-            candidate_scores_for_category = []
-            if score_field == "weather":
-                for uid in active_uids:
-                    score = latest_overall_scores_array[uid]
-                    if np.isfinite(score) and score >= min_threshold:
-                        candidate_scores_for_category.append((score, uid))
+                candidate_scores_for_category = []
+                if score_field == "weather":
+                    for uid in active_uids:
+                        score = latest_overall_scores_array[uid]
+                        if np.isfinite(score) and score >= min_threshold:
+                            candidate_scores_for_category.append((score, uid))
 
-            if not candidate_scores_for_category:
-                logger.info(
-                    f"[CombinedWeatherScore] No eligible miners for bonus: {category['id']}"
-                )
-                continue
-
-            candidate_scores_for_category.sort(
-                key=lambda x: x[0], reverse=higher_is_better
-            )
-            best_score = candidate_scores_for_category[0][0]
-            winners = [
-                uid
-                for score, uid in candidate_scores_for_category
-                if score == best_score
-            ]
-
-            if 1 <= len(winners) <= 2:
-                bonus_per_winner = bonus_value_add / len(winners)
-                for winner_uid in winners:
-                    miner_bonuses_applied[winner_uid] += bonus_per_winner
+                if not candidate_scores_for_category:
                     logger.info(
-                        f"[CombinedWeatherScore] Bonus for {category['id']} awarded to UID {winner_uid} (value: {bonus_per_winner:.3f}). Winning score: {best_score:.4f}"
+                        f"[CombinedWeatherScore] No eligible miners for bonus: {category['id']}"
                     )
-            elif len(winners) > 2:
-                logger.info(
-                    f"[CombinedWeatherScore] Bonus for {category['id']} skipped: too many winners ({len(winners)}) with score {best_score:.4f}."
-                )
+                else:
+                    candidate_scores_for_category.sort(
+                        key=lambda x: x[0], reverse=higher_is_better
+                    )
+                    best_score = candidate_scores_for_category[0][0]
+                    winners = [
+                        uid
+                        for score, uid in candidate_scores_for_category
+                        if score == best_score
+                    ]
+
+                    if 1 <= len(winners) <= 2:
+                        bonus_per_winner = bonus_value_add / len(winners)
+                        for winner_uid in winners:
+                            miner_bonuses_applied[winner_uid] += bonus_per_winner
+                            logger.info(
+                                f"[CombinedWeatherScore] Bonus for {category['id']} awarded to UID {winner_uid} (value: {bonus_per_winner:.3f}). Winning score: {best_score:.4f}"
+                            )
+                    elif len(winners) > 2:
+                        logger.info(
+                            f"[CombinedWeatherScore] Bonus for {category['id']} skipped: too many winners ({len(winners)}) with score {best_score:.4f}."
+                        )
 
         final_weather_scores_for_table = np.clip(
             latest_overall_scores_array + miner_bonuses_applied, 0.0, 1.1

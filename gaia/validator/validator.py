@@ -857,7 +857,8 @@ class GaiaValidator:
             heavy_procs = 1
         else:
             heavy_procs = max(1, min(heavy_mem_cap, core_cap - 1))
-            total_procs = min(core_cap, heavy_procs + 1)  # +1 utility worker
+            # Exclude utility worker from core cap: allow +1 up to reserve_cap (cores - 1)
+            total_procs = min(reserve_cap, heavy_procs + 1)  # +1 utility worker
 
         try:
             logger.info(
