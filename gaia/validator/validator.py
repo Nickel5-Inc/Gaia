@@ -5025,44 +5025,62 @@ class GaiaValidator:
             # Soil moisture task disabled
 
             if weather_results:
-                latest_result = weather_results[0]
-                scores = latest_result.get("score", [np.nan] * 256)
-                if not isinstance(scores, list) or len(scores) != 256:
-                    scores = [np.nan] * 256  # Defensive
-                score_age_days = (now - latest_result["created_at"]).total_seconds() / (
-                    24 * 3600
-                )
-                logger.info(
-                    f"Using latest weather score from {latest_result['created_at']} ({score_age_days:.1f} days ago)"
-                )
-                for uid in range(256):
-                    if isinstance(scores[uid], str) or np.isnan(scores[uid]):
-                        weather_scores[uid] = 0.0
-                    else:
-                        weather_scores[uid] = scores[uid]
-                        weather_counts[uid] += scores[uid] != 0.0
-                zeros_count = int(np.sum(weather_scores == 0.0))
-                nonzero_mask_ws = weather_scores > 0
-                nonzero_count_ws = int(np.sum(nonzero_mask_ws))
-                if nonzero_count_ws > 0:
-                    nz_vals_ws = weather_scores[nonzero_mask_ws]
-                    logger.info(
-                        f"Weather score summary: nonzero={nonzero_count_ws}, min>0={np.min(nz_vals_ws):.6f}, max>0={np.max(nz_vals_ws):.6f}, mean>0={np.mean(nz_vals_ws):.6f}, zeros={zeros_count}"
-                    )
-                    # Top-10 UIDs by weather score
+                # Aggregate scores across the full 15-day lookback window instead of using only the latest row
+                rows_list = []
+                for result in weather_results:
+                    raw_scores = result.get("score", [np.nan] * 256)
+                    if not isinstance(raw_scores, list) or len(raw_scores) != 256:
+                        raw_scores = [np.nan] * 256
+                    # Coerce values to float; strings/None -> NaN, numeric stays numeric (including 0.0)
+                    coerced = []
+                    for v in raw_scores:
+                        try:
+                            # Fast path for common numeric types
+                            if isinstance(v, (int, float)):
+                                coerced.append(float(v))
+                            else:
+                                coerced.append(float(v))
+                        except Exception:
+                            coerced.append(np.nan)
+                    rows_list.append(np.array(coerced, dtype=float))
+
+                if rows_list:
+                    scores_matrix = np.vstack(rows_list)
+                    # Count of positive entries per UID (ignores NaN automatically)
                     try:
-                        top_indices_ws = np.argsort(-weather_scores)[:10]
-                        top_pairs_ws = [(int(i), float(weather_scores[i])) for i in top_indices_ws if weather_scores[i] > 0]
-                        logger.info(f"Top weather scores (uid,score): {top_pairs_ws}")
+                        weather_counts = np.sum(scores_matrix > 0.0, axis=0)
                     except Exception:
-                        pass
-                else:
-                    logger.warning(
-                        f"All weather scores are zero for latest row (zeros={zeros_count})."
+                        # Fallback if shapes mismatch unexpectedly
+                        weather_counts = np.zeros(256, dtype=int)
+
+                    # Aggregate by simple mean over the 15-day window; include zeros and treat NaNs as 0
+                    filled = np.nan_to_num(scores_matrix, nan=0.0)
+                    aggregated = np.mean(filled, axis=0)
+                    weather_scores = aggregated
+
+                    zeros_count = int(np.sum(weather_scores == 0.0))
+                    nonzero_mask_ws = weather_scores > 0
+                    nonzero_count_ws = int(np.sum(nonzero_mask_ws))
+                    if nonzero_count_ws > 0:
+                        nz_vals_ws = weather_scores[nonzero_mask_ws]
+                        logger.info(
+                            f"Weather 15-day aggregate summary: nonzero={nonzero_count_ws}, min>0={np.min(nz_vals_ws):.6f}, max>0={np.max(nz_vals_ws):.6f}, mean>0={np.mean(nz_vals_ws):.6f}, zeros={zeros_count}"
+                        )
+                        try:
+                            top_indices_ws = np.argsort(-weather_scores)[:10]
+                            top_pairs_ws = [(int(i), float(weather_scores[i])) for i in top_indices_ws if weather_scores[i] > 0]
+                            logger.info(f"Top aggregated weather scores (uid,score): {top_pairs_ws}")
+                        except Exception:
+                            pass
+                    else:
+                        logger.warning(
+                            f"All aggregated weather scores are zero across lookback (zeros={zeros_count})."
+                        )
+                    logger.debug(
+                        f"Weather aggregated scores array: {np.array2string(weather_scores, precision=6, separator=',')}"
                     )
-                logger.debug(
-                    f"Weather scores array: {np.array2string(weather_scores, precision=6, separator=',')}"
-                )
+                else:
+                    logger.warning("No weather rows available for aggregation in lookback window")
 
             # Geomagnetic task disabled
 
@@ -5337,19 +5355,11 @@ class GaiaValidator:
                 # Continue to rank-based if needed or return None
 
             if len(trans_nz) > 1 and np.std(trans_nz) < 0.01:
+                # Keep equal shares among positive weights to avoid UID-biased rank artifacts
                 logger.warning(
-                    f"Transformed weights too uniform (std={np.std(trans_nz):.4f}), switching to rank-based."
+                    f"Transformed weights too uniform (std={np.std(trans_nz):.4f}), keeping equal-share distribution among positives."
                 )
-                sorted_indices = np.argsort(-weights_final)
-                transformed_w = np.zeros_like(weights_final)
-                pos_count = np.sum(weights_final > 0)
-                for i, idx_val in enumerate(sorted_indices[:pos_count]):
-                    transformed_w[idx_val] = 1.0 / ((i + 1) ** 1.2)
-                rank_nz = transformed_w[transformed_w > 0]
-                if rank_nz.any():
-                    logger.info(
-                        f"Rank-based: Min={np.min(rank_nz):.4f}, Max={np.max(rank_nz):.4f}, Mean={np.mean(rank_nz):.4f}"
-                    )
+                transformed_w = np.copy(weights_final)
 
             final_sum = np.sum(transformed_w)
             final_weights_list = None
@@ -5458,7 +5468,6 @@ class GaiaValidator:
                     ELSE 1 
                 END,
                 created_at DESC 
-            LIMIT 100
             """
             # Query node table for validator nodes with chunking to manage memory
             validator_nodes_query = """
