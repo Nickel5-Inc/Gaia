@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import json
 import os
 import time
 from datetime import datetime, timezone, timedelta
@@ -2725,6 +2726,60 @@ async def calculate_era5_miner_score(
                                     f"[FinalScore] Weights broadcast test failed: {broadcast_test_err}"
                                 )
 
+                    # DEBUGGING: Add checksums and statistics to detect aliasing
+                    import hashlib
+                    
+                    # Convert to numpy arrays for analysis
+                    pred_values = miner_var_da_aligned.values
+                    truth_values = truth_var_da_final.values
+                    
+                    # Print shape, dtype, min/max/mean/std for pred and truth
+                    logger.debug(f"[DEBUG] ERA5 Scoring Debug for {var_key} at {lead_hours}h:")
+                    logger.debug(f"  Pred shape: {pred_values.shape}, dtype: {pred_values.dtype}")
+                    logger.debug(f"  Pred min: {np.min(pred_values):.6f}, max: {np.max(pred_values):.6f}, mean: {np.mean(pred_values):.6f}, std: {np.std(pred_values):.6f}")
+                    logger.debug(f"  Truth shape: {truth_values.shape}, dtype: {truth_values.dtype}")
+                    logger.debug(f"  Truth min: {np.min(truth_values):.6f}, max: {np.max(truth_values):.6f}, mean: {np.mean(truth_values):.6f}, std: {np.std(truth_values):.6f}")
+                    
+                    # Compute and log quick checksums
+                    pred_checksum = hashlib.sha256(pred_values.tobytes()).hexdigest()
+                    truth_checksum = hashlib.sha256(truth_values.tobytes()).hexdigest()
+                    logger.debug(f"  Pred SHA256: {pred_checksum[:16]}...")
+                    logger.debug(f"  Truth SHA256: {truth_checksum[:16]}...")
+                    
+                    # Check if digests match (aliasing detection)
+                    if pred_checksum == truth_checksum:
+                        logger.error(f"[ALIASING DETECTED] Miner {miner_hotkey}: Pred and truth checksums match! This indicates potential data aliasing.")
+                        current_metrics["aliasing_detected"] = True
+                        current_metrics["aliasing_checksum"] = pred_checksum
+                    else:
+                        current_metrics["aliasing_detected"] = False
+                    
+                    # Log absolute mean difference and fraction of exactly equal elements
+                    abs_mean_diff = np.mean(np.abs(pred_values - truth_values))
+                    exact_equal_fraction = np.mean(pred_values == truth_values)
+                    logger.debug(f"  Absolute mean difference: {abs_mean_diff:.6f}")
+                    logger.debug(f"  Fraction of exactly equal elements: {exact_equal_fraction:.6f}")
+                    
+                    # Store debugging info in metrics
+                    current_metrics["debug_stats"] = {
+                        "pred_shape": pred_values.shape,
+                        "pred_dtype": str(pred_values.dtype),
+                        "pred_min": float(np.min(pred_values)),
+                        "pred_max": float(np.max(pred_values)),
+                        "pred_mean": float(np.mean(pred_values)),
+                        "pred_std": float(np.std(pred_values)),
+                        "truth_shape": truth_values.shape,
+                        "truth_dtype": str(truth_values.dtype),
+                        "truth_min": float(np.min(truth_values)),
+                        "truth_max": float(np.max(truth_values)),
+                        "truth_mean": float(np.mean(truth_values)),
+                        "truth_std": float(np.std(truth_values)),
+                        "pred_checksum": pred_checksum,
+                        "truth_checksum": truth_checksum,
+                        "abs_mean_diff": float(abs_mean_diff),
+                        "exact_equal_fraction": float(exact_equal_fraction)
+                    }
+
                     # Calculate MSE over spatial dimensions first
                     raw_mse_result = await asyncio.to_thread(
                         calculate_raw_mse_preserve_dims,
@@ -2786,6 +2841,23 @@ async def calculate_era5_miner_score(
                         raw_mse_val = raw_mse_result
                         current_metrics["mse"] = raw_mse_val
                         current_metrics["rmse"] = np.sqrt(raw_mse_val)
+
+                    # QUARANTINE CHECK: Detect suspicious RMSE scores
+                    rmse_val = current_metrics["rmse"]
+                    is_suspicious_rmse = False
+                    quarantine_reason = None
+                    
+                    if lead_hours >= 24 and rmse_val < 1e-6:
+                        is_suspicious_rmse = True
+                        quarantine_reason = f"RMSE {rmse_val:.2e} < 1e-6 for lead {lead_hours}h"
+                        logger.warning(
+                            f"[QUARANTINE] Miner {miner_hotkey}: Suspicious RMSE detected - {quarantine_reason}"
+                        )
+                    
+                    # Add quarantine flag to metrics
+                    current_metrics["quarantine_flag"] = is_suspicious_rmse
+                    if quarantine_reason:
+                        current_metrics["quarantine_reason"] = quarantine_reason
 
                     rmse_metric_row = {
                         **db_metric_row_base,
@@ -2955,6 +3027,19 @@ async def calculate_era5_miner_score(
                         for component_score in component_scores_for_this_var:
                             component_score['acc'] = acc_val
                     
+                    # QUARANTINE CHECK: Detect suspicious ACC scores
+                    is_suspicious_acc = False
+                    if lead_hours >= 24 and acc_val > 0.9999:
+                        is_suspicious_acc = True
+                        quarantine_reason = f"ACC {acc_val:.6f} > 0.9999 for lead {lead_hours}h"
+                        logger.warning(
+                            f"[QUARANTINE] Miner {miner_hotkey}: Suspicious ACC detected - {quarantine_reason}"
+                        )
+                        # Update quarantine flag in metrics
+                        current_metrics["quarantine_flag"] = current_metrics.get("quarantine_flag", False) or is_suspicious_acc
+                        if quarantine_reason:
+                            current_metrics["quarantine_reason"] = current_metrics.get("quarantine_reason", "") + f"; {quarantine_reason}"
+
                     # Create aggregate ACC metric row for backward compatibility
                     acc_metric_row = {
                         **db_metric_row_base,
@@ -3381,6 +3466,16 @@ async def calculate_era5_miner_score(
             f"[FinalScore] Miner {miner_hotkey}: Stored/Updated {successful_inserts}/{len(all_metrics_for_db)} ERA5 metric records to DB."
         )
         
+        # QUARANTINE ACTION: Check if any scores were flagged as suspicious and set base weight to near-zero
+        suspicious_scores = [record for record in all_metrics_for_db 
+                           if record.get("metrics", {}).get("quarantine_flag", False)]
+        
+        if suspicious_scores:
+            logger.warning(
+                f"[QUARANTINE] Miner {miner_hotkey}: {len(suspicious_scores)} suspicious scores detected. Setting base weight to near-zero for run {run_id}"
+            )
+            await _set_miner_quarantine_weight(task_instance, miner_hotkey, run_id, suspicious_scores)
+        
         # NEW: Batch insert component scores for full transparency
         if all_component_scores:
             logger.info(f"[FinalScore] Inserting {len(all_component_scores)} component scores for {miner_hotkey}")
@@ -3699,6 +3794,29 @@ async def _calculate_and_store_aggregated_era5_score(
         f"[AggFinalScore] UID {miner_uid}, Run {run_id}: ProgressiveSkill/Error={avg_skill_error_score:.4f}, ProgressiveACC={avg_acc_score:.4f} => Composite Score: {final_score_val:.4f}"
     )
 
+    # QUARANTINE CHECK: Detect suspicious aggregated_final vs completion_ratio pattern
+    completion_ratio_skill_error = (
+        len(skill_error_component_scores) / total_expected_components_per_type
+        if total_expected_components_per_type > 0
+        else 0.0
+    )
+    completion_ratio_acc = (
+        len(acc_component_scores) / total_expected_components_per_type
+        if total_expected_components_per_type > 0
+        else 0.0
+    )
+    
+    is_suspicious_aggregated = False
+    quarantine_reason_agg = None
+    
+    # Check if aggregated_final is suspiciously close to completion_ratio (within 1e-6)
+    if abs(final_score_val - completion_ratio_skill_error) < 1e-6:
+        is_suspicious_aggregated = True
+        quarantine_reason_agg = f"aggregated_final {final_score_val:.6f} ≈ completion_ratio {completion_ratio_skill_error:.6f} (diff: {abs(final_score_val - completion_ratio_skill_error):.2e})"
+        logger.warning(
+            f"[QUARANTINE] Miner {miner_hotkey}: Suspicious aggregated pattern detected - {quarantine_reason_agg}"
+        )
+
     agg_score_type = "era5_final_composite_score"
     metrics_for_agg_score = {
         "avg_normalized_skill_error_component": avg_skill_error_score,
@@ -3706,18 +3824,14 @@ async def _calculate_and_store_aggregated_era5_score(
         "num_skill_error_components_available": len(skill_error_component_scores),
         "num_acc_components_available": len(acc_component_scores),
         "total_expected_components_per_type": total_expected_components_per_type,
-        "completion_ratio_skill_error": (
-            len(skill_error_component_scores) / total_expected_components_per_type
-            if total_expected_components_per_type > 0
-            else 0.0
-        ),
-        "completion_ratio_acc": (
-            len(acc_component_scores) / total_expected_components_per_type
-            if total_expected_components_per_type > 0
-            else 0.0
-        ),
+        "completion_ratio_skill_error": completion_ratio_skill_error,
+        "completion_ratio_acc": completion_ratio_acc,
         "progressive_scoring_method": "zeros_for_missing_lead_times",
+        "quarantine_flag": is_suspicious_aggregated,
     }
+    
+    if quarantine_reason_agg:
+        metrics_for_agg_score["quarantine_reason"] = quarantine_reason_agg
 
     calc_time = datetime.now(timezone.utc)
     db_params = {
@@ -3756,6 +3870,85 @@ async def _calculate_and_store_aggregated_era5_score(
             exc_info=True,
         )
         return None
+
+
+async def _set_miner_quarantine_weight(
+    task_instance: "WeatherTask",
+    miner_hotkey: str,
+    run_id: int,
+    suspicious_scores: List[Dict],
+) -> None:
+    """
+    Set miner's base weight to near-zero when suspicious behavior is detected.
+    This implements the quarantine system for malicious miners.
+    """
+    try:
+        # Set base weight to near-zero (0.001) for this run
+        quarantine_weight = 0.001
+        
+        # Update the score table with quarantined weight
+        await task_instance.db_manager.execute(
+            """
+            UPDATE score_table 
+            SET uid_{miner_uid}_score = :quarantine_weight,
+                status = 'quarantined'
+            WHERE task_name = 'weather' 
+              AND task_id = :run_id
+            """.format(miner_uid=task_instance.db_manager.get_miner_uid(miner_hotkey)),
+            {
+                "quarantine_weight": quarantine_weight,
+                "run_id": str(run_id)
+            }
+        )
+        
+        # Log quarantine details
+        quarantine_reasons = []
+        for score in suspicious_scores:
+            reason = score.get("metrics", {}).get("quarantine_reason", "Unknown")
+            quarantine_reasons.append(reason)
+        
+        logger.warning(
+            f"[QUARANTINE] Set miner {miner_hotkey} weight to {quarantine_weight} for run {run_id}. "
+            f"Reasons: {'; '.join(quarantine_reasons)}"
+        )
+        
+        # Store quarantine record for audit trail
+        await task_instance.db_manager.execute(
+            """
+            INSERT INTO weather_miner_scores 
+            (response_id, run_id, miner_uid, miner_hotkey, score_type, score, metrics, calculation_time, error_message, lead_hours, variable_level, valid_time_utc)
+            VALUES (
+                (SELECT id FROM weather_miner_responses WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey LIMIT 1),
+                :run_id,
+                (SELECT uid FROM node_table WHERE hotkey = :miner_hotkey LIMIT 1),
+                :miner_hotkey,
+                'quarantine_action',
+                :quarantine_weight,
+                :quarantine_metrics,
+                NOW(),
+                'Miner quarantined due to suspicious ERA5 scores',
+                -1,
+                'quarantine',
+                NOW()
+            )
+            """,
+            {
+                "run_id": run_id,
+                "miner_hotkey": miner_hotkey,
+                "quarantine_weight": quarantine_weight,
+                "quarantine_metrics": json.dumps({
+                    "quarantine_reasons": quarantine_reasons,
+                    "suspicious_score_count": len(suspicious_scores),
+                    "quarantine_timestamp": datetime.now(timezone.utc).isoformat()
+                })
+            }
+        )
+        
+    except Exception as e:
+        logger.error(
+            f"[QUARANTINE] Failed to set quarantine weight for miner {miner_hotkey}: {e}",
+            exc_info=True
+        )
 
 
 async def reconcile_job_id_for_validator(
