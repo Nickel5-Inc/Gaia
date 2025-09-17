@@ -2305,3 +2305,22 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         except Exception as e:
             logger.error(f"cleanup_old_weather_steps error: {e}")
             return 0
+
+    @track_operation("read")
+    async def get_miner_uid(self, miner_hotkey: str) -> Optional[int]:
+        """
+        Get the UID for a miner given their hotkey.
+        
+        Args:
+            miner_hotkey: The hotkey of the miner
+            
+        Returns:
+            The UID of the miner if found, None otherwise
+        """
+        try:
+            query = "SELECT uid FROM node_table WHERE hotkey = :hotkey"
+            result = await self.fetch_one(query, {"hotkey": miner_hotkey})
+            return result["uid"] if result else None
+        except Exception as e:
+            logger.error(f"Error getting miner UID for hotkey {miner_hotkey}: {e}")
+            return None

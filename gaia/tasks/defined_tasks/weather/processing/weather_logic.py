@@ -3887,6 +3887,12 @@ async def _set_miner_quarantine_weight(
         quarantine_weight = 0.001
         
         # Update the score table with quarantined weight
+        # Get miner UID from hotkey
+        miner_uid = await task_instance.db_manager.get_miner_uid(miner_hotkey)
+        if miner_uid is None:
+            logger.warning(f"Could not find UID for miner hotkey {miner_hotkey}, skipping quarantine")
+            return
+        
         await task_instance.db_manager.execute(
             """
             UPDATE score_table 
@@ -3894,7 +3900,7 @@ async def _set_miner_quarantine_weight(
                 status = 'quarantined'
             WHERE task_name = 'weather' 
               AND task_id = :run_id
-            """.format(miner_uid=task_instance.db_manager.get_miner_uid(miner_hotkey)),
+            """.format(miner_uid=miner_uid),
             {
                 "quarantine_weight": quarantine_weight,
                 "run_id": str(run_id)
