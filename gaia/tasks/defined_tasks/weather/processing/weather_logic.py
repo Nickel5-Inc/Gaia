@@ -3441,6 +3441,21 @@ async def calculate_era5_miner_score(
     """
 
     successful_inserts = 0
+    # Check quarantine once per miner/run to avoid repetitive queries
+    is_quarantined = False
+    try:
+        row_quarantine = await task_instance.db_manager.fetch_one(
+            """
+            SELECT 1 FROM score_table
+            WHERE task_name = 'weather' AND task_id = :run_id AND status = 'quarantined'
+            LIMIT 1
+            """,
+            {"run_id": str(run_id)},
+        )
+        is_quarantined = row_quarantine is not None
+    except Exception:
+        is_quarantined = False
+
     for metric_record in all_metrics_for_db:
         params = metric_record.copy()
         params.setdefault("score", None)
@@ -3451,6 +3466,11 @@ async def calculate_era5_miner_score(
         from ..utils.json_sanitizer import safe_json_dumps_for_db
 
         params["metrics_json"] = safe_json_dumps_for_db(params.pop("metrics"))
+
+        # Force near-zero score if quarantined (for all ERA5 score types)
+        if is_quarantined and params.get("score_type", "").startswith("era5"):
+            params["score"] = 0.001
+            params["metrics"]["quarantine_override"] = True
 
         try:
             await task_instance.db_manager.execute(insert_query, params)
@@ -3772,6 +3792,22 @@ async def _calculate_and_store_aggregated_era5_score(
         overall_forecast_score = W_era5 * era5_norm_avg + W_day1 * day1_pass
         overall_forecast_score = clamp(float(overall_forecast_score), 0.0, 1.0)
 
+        # Check if miner is quarantined for this run and force overall_forecast_score to 0.001
+        try:
+            quarantined_check = await task_instance.db_manager.fetch_one(
+                """
+                SELECT 1 FROM score_table
+                WHERE task_name = 'weather' AND task_id = :run_id AND status = 'quarantined'
+                LIMIT 1
+                """,
+                {"run_id": str(run_id)},
+            )
+            if quarantined_check is not None:
+                overall_forecast_score = 0.001
+                logger.warning(f"[QUARANTINE] Forcing overall_forecast_score to 0.001 for quarantined run {run_id}")
+        except Exception:
+            pass
+
         await stats_mgr.update_forecast_stats(
             run_id=run_id,
             miner_uid=miner_uid,
@@ -3858,6 +3894,28 @@ async def _calculate_and_store_aggregated_era5_score(
         run_id = EXCLUDED.run_id, miner_uid = EXCLUDED.miner_uid, miner_hotkey = EXCLUDED.miner_hotkey
     """
 
+    # Force near-zero aggregated ERA5 score if quarantined for this run
+    try:
+        quarantined_row = await task_instance.db_manager.fetch_one(
+            """
+            SELECT 1 FROM score_table
+            WHERE task_name = 'weather' AND task_id = :run_id AND status = 'quarantined'
+            LIMIT 1
+            """,
+            {"run_id": str(run_id)},
+        )
+        if quarantined_row is not None:
+            db_params["score"] = 0.001
+            # Append quarantine flag to metrics JSON
+            try:
+                metrics_obj = json.loads(metrics_for_agg_score and safe_json_dumps_for_db(metrics_for_agg_score) or "{}")
+            except Exception:
+                metrics_obj = {}
+            metrics_obj["quarantine_override"] = True
+            db_params["metrics_json"] = safe_json_dumps_for_db(metrics_obj)
+    except Exception:
+        pass
+
     try:
         await task_instance.db_manager.execute(insert_agg_query, db_params)
         logger.info(
@@ -3907,7 +3965,7 @@ async def _set_miner_quarantine_weight(
             }
         )
 
-        # Force ERA5 final composite score to near-zero for this run/miner
+        # Force ALL ERA5 scores to near-zero for this run/miner
         try:
             await task_instance.db_manager.execute(
                 """
@@ -3916,12 +3974,12 @@ async def _set_miner_quarantine_weight(
                     metrics = COALESCE(metrics, '{}'::jsonb) || jsonb_build_object('quarantine_override', true)
                 WHERE run_id = :run_id
                   AND miner_uid = :miner_uid
-                  AND score_type = 'era5_final_composite_score'
+                  AND score_type LIKE 'era5%'
                 """,
                 {"near_zero": quarantine_weight, "run_id": run_id, "miner_uid": miner_uid}
             )
         except Exception as _q1:
-            logger.debug(f"[QUARANTINE] Could not zero era5_final_composite_score for UID {miner_uid}, run {run_id}: {_q1}")
+            logger.debug(f"[QUARANTINE] Could not zero ERA5 scores for UID {miner_uid}, run {run_id}: {_q1}")
 
         # Also dampen per-lead normalized ERA5 writes if any were stored
         try:
@@ -3948,7 +4006,7 @@ async def _set_miner_quarantine_weight(
                 """
                 UPDATE weather_forecast_stats
                 SET era5_combined_score = 0.0,
-                    overall_forecast_score = COALESCE(overall_forecast_score, 0)::float * 0.0,
+                    overall_forecast_score = 0.001,
                     forecast_status = CASE WHEN forecast_status = 'completed' THEN 'quarantined' ELSE forecast_status END,
                     last_error_message = COALESCE(last_error_message, '') || '\n[quarantine] ERA5 scores zeroed for this run.'
                 WHERE run_id = :run_id
