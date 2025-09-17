@@ -4028,37 +4028,7 @@ async def _set_miner_quarantine_weight(
             f"Reasons: {'; '.join(quarantine_reasons)}"
         )
         
-        # Store quarantine record for audit trail
-        await task_instance.db_manager.execute(
-            """
-            INSERT INTO weather_miner_scores 
-            (response_id, run_id, miner_uid, miner_hotkey, score_type, score, metrics, calculation_time, error_message, lead_hours, variable_level, valid_time_utc)
-            VALUES (
-                (SELECT id FROM weather_miner_responses WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey LIMIT 1),
-                :run_id,
-                (SELECT uid FROM node_table WHERE hotkey = :miner_hotkey LIMIT 1),
-                :miner_hotkey,
-                'quarantine_action',
-                :quarantine_weight,
-                :quarantine_metrics,
-                NOW(),
-                'Miner quarantined due to suspicious ERA5 scores',
-                -1,
-                'quarantine',
-                NOW()
-            )
-            """,
-            {
-                "run_id": run_id,
-                "miner_hotkey": miner_hotkey,
-                "quarantine_weight": quarantine_weight,
-                "quarantine_metrics": json.dumps({
-                    "quarantine_reasons": quarantine_reasons,
-                    "suspicious_score_count": len(suspicious_scores),
-                    "quarantine_timestamp": datetime.now(timezone.utc).isoformat()
-                })
-            }
-        )
+        # Note: Quarantine action is logged above, no need for separate score record
         
     except Exception as e:
         logger.error(

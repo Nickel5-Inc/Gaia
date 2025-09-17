@@ -261,6 +261,21 @@ class WeatherStatsManager:
                 except Exception:
                     overall_val = None
                 if overall_val is not None:
+                    # Check if miner is quarantined for this run and force score to 0.001
+                    try:
+                        quarantine_check = await self.db.fetch_one(
+                            """
+                            SELECT 1 FROM score_table
+                            WHERE task_name = 'weather' AND task_id = :run_id AND status = 'quarantined'
+                            LIMIT 1
+                            """,
+                            {"run_id": str(run_id)},
+                        )
+                        if quarantine_check is not None:
+                            overall_val = 0.001
+                            logger.warning(f"[QUARANTINE] Forcing overall_forecast_score to 0.001 for quarantined run {run_id}")
+                    except Exception:
+                        pass
                     stats_data["overall_forecast_score"] = max(0.0, min(1.0, overall_val))
             
             # Upsert the record
