@@ -3906,6 +3906,58 @@ async def _set_miner_quarantine_weight(
                 "run_id": str(run_id)
             }
         )
+
+        # Force ERA5 final composite score to near-zero for this run/miner
+        try:
+            await task_instance.db_manager.execute(
+                """
+                UPDATE weather_miner_scores
+                SET score = :near_zero,
+                    metrics = COALESCE(metrics, '{}'::jsonb) || jsonb_build_object('quarantine_override', true)
+                WHERE run_id = :run_id
+                  AND miner_uid = :miner_uid
+                  AND score_type = 'era5_final_composite_score'
+                """,
+                {"near_zero": quarantine_weight, "run_id": run_id, "miner_uid": miner_uid}
+            )
+        except Exception as _q1:
+            logger.debug(f"[QUARANTINE] Could not zero era5_final_composite_score for UID {miner_uid}, run {run_id}: {_q1}")
+
+        # Also dampen per-lead normalized ERA5 writes if any were stored
+        try:
+            await task_instance.db_manager.execute(
+                """
+                UPDATE weather_forecast_component_scores
+                SET rmse = NULL,
+                    acc = NULL,
+                    skill_score = NULL,
+                    skill_score_gfs = NULL,
+                    skill_score_climatology = NULL
+                WHERE run_id = :run_id
+                  AND miner_uid = :miner_uid
+                  AND score_type = 'era5'
+                """,
+                {"run_id": run_id, "miner_uid": miner_uid}
+            )
+        except Exception as _q2:
+            logger.debug(f"[QUARANTINE] Could not nullify component ERA5 metrics for UID {miner_uid}, run {run_id}: {_q2}")
+
+        # Ensure overall stats reflect near-zero ERA5 impact
+        try:
+            await task_instance.db_manager.execute(
+                """
+                UPDATE weather_forecast_stats
+                SET era5_combined_score = 0.0,
+                    overall_forecast_score = COALESCE(overall_forecast_score, 0)::float * 0.0,
+                    forecast_status = CASE WHEN forecast_status = 'completed' THEN 'quarantined' ELSE forecast_status END,
+                    last_error_message = COALESCE(last_error_message, '') || '\n[quarantine] ERA5 scores zeroed for this run.'
+                WHERE run_id = :run_id
+                  AND miner_uid = :miner_uid
+                """,
+                {"run_id": run_id, "miner_uid": miner_uid}
+            )
+        except Exception as _q3:
+            logger.debug(f"[QUARANTINE] Could not update forecast stats for UID {miner_uid}, run {run_id}: {_q3}")
         
         # Log quarantine details
         quarantine_reasons = []
