@@ -1624,9 +1624,19 @@ async def calculate_era5_miner_score(
             return False
 
         stored_manifest_hash = stored_response_data["verification_hash_claimed"]
-        token_data_tuple = await _request_fresh_token(
-            task_instance, miner_hotkey, job_id
-        )
+
+        max_attempts = task_instance.config.get("era5_token_attempts", 3)
+        for attempt in range(1, max_attempts + 1):
+            token_data_tuple = await _request_fresh_token(
+                task_instance, miner_hotkey, job_id
+            )
+            if token_data_tuple is not None:
+                break
+            
+            delay = attempt * 10
+            logger.info(f"[FinalScore] Miner {miner_hotkey}: Attempt {attempt}/{max_attempts + 1} failed to get token_data_tuple, waiting for {delay}s.")
+            await asyncio.sleep(delay)
+
         if token_data_tuple is None:
             # Check if miner is still registered before treating this as a critical error
             is_registered = await _is_miner_registered(task_instance, miner_hotkey)

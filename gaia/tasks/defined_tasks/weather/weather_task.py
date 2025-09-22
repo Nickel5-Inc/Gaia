@@ -197,6 +197,9 @@ def _load_config(self):
     config["verification_timeout_seconds"] = int(
         os.getenv("WEATHER_VERIFICATION_TIMEOUT_SECONDS", "3600")
     )
+    config["era5_token_attempts"] = int(
+        os.getenv("ERA5_TOKEN_ATTEMPTS", "3")
+    )
     # More frequent checking for progressive scoring (check every 30 minutes instead of 1 hour)
     config["final_scoring_check_interval_seconds"] = int(
         os.getenv("WEATHER_FINAL_SCORING_INTERVAL_S", "1800")
