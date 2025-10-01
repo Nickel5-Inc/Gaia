@@ -196,8 +196,9 @@ def _format_log_record(record: Dict[str, Any]) -> str:
     timestamp_colored = f"{dim_color}{timestamp}{RESET}"
     caller_colored = f"{dim_color}{caller_info}{RESET}"
     
-    # Clean message (only escape loguru-specific characters)
-    message = str(record['message']).replace('{', '{{').replace('}', '}}')
+    # Clean message (escape loguru-specific characters and angle brackets)
+    # Angle brackets < > are interpreted as markup tags by loguru and must be escaped
+    message = str(record['message']).replace('{', '{{').replace('}', '}}').replace('<', '\\<').replace('>', '\\>')
     
     # Build colorful log line
     log_line = f"{worker_prefix} {timestamp_colored} | {level_colored} | {caller_colored} - {message}\n"
@@ -334,6 +335,7 @@ class CustomLogger:
                     log_file_with_timestamp,
                     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} - {message}",
                     level="DEBUG",  # File logging captures more detail
+                    colorize=False,  # Disable tag parsing to prevent angle bracket issues
                     rotation="100 MB",
                     retention="7 days",
                     compression="gz",

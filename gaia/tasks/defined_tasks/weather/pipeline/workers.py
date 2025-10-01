@@ -612,16 +612,22 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             elif j == "stats.subnet_snapshot":
                 from gaia.tasks.defined_tasks.weather.pipeline.steps.aggregate_step import compute_subnet_stats
 
-                _ = await compute_subnet_stats(db)
-                ok = True
+                try:
+                    result = await compute_subnet_stats(db)
+                    logger.info(f"compute_subnet_stats completed successfully: active_miners={result.get('active_miners', 'N/A')}")
+                    ok = True
+                except Exception as compute_error:
+                    logger.error(f"compute_subnet_stats failed with error: {compute_error}", exc_info=True)
+                    ok = False
             else:
                 ok = False
             if ok:
                 await db.complete_validator_job(job["id"], result={"ok": True})
             else:
-                await db.fail_validator_job(job["id"], "unknown stats job")
+                await db.fail_validator_job(job["id"], "unknown stats job" if j not in ["stats.aggregate", "stats.subnet_snapshot"] else "stats computation failed")
             return ok
         except Exception as e:
+            logger.error(f"Stats job handler failed for job_id={job.get('id')}, type={job.get('job_type')}: {e}", exc_info=True)
             await db.fail_validator_job(job["id"], f"exception: {e}")
             return False
 
