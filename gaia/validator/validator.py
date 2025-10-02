@@ -4160,6 +4160,27 @@ class GaiaValidator:
                                                 )
                                             except Exception:
                                                 pass
+                                            # Clean up old validator jobs (24 hours retention)
+                                            try:
+                                                cleaned_count = await self.database_manager.cleanup_old_validator_jobs(hours_after_completion=24)
+                                                if cleaned_count > 0:
+                                                    logger.info(f"[cleanup] Deleted {cleaned_count} old validator jobs (24h retention)")
+                                            except Exception as cleanup_err:
+                                                logger.debug(f"Validator jobs cleanup error: {cleanup_err}")
+                                            # Clean up old weather miner responses (20 days retention)
+                                            try:
+                                                cleaned_responses = await self.database_manager.cleanup_old_weather_miner_responses(days_to_keep=20)
+                                                if cleaned_responses > 0:
+                                                    logger.info(f"[cleanup] Deleted {cleaned_responses} old weather miner responses (20d retention)")
+                                            except Exception as cleanup_err:
+                                                logger.debug(f"Weather miner responses cleanup error: {cleanup_err}")
+                                            # Clean up old weather forecast stats (30 days retention)
+                                            try:
+                                                cleaned_stats = await self.database_manager.cleanup_old_weather_forecast_stats(days_to_keep=30)
+                                                if cleaned_stats > 0:
+                                                    logger.info(f"[cleanup] Deleted {cleaned_stats} old weather forecast stats (30d retention)")
+                                            except Exception as cleanup_err:
+                                                logger.debug(f"Weather forecast stats cleanup error: {cleanup_err}")
                                         except Exception as agg_err:
                                             logger.debug(f"Stats aggregation error: {agg_err}")
                                         await asyncio.sleep(interval_sec)

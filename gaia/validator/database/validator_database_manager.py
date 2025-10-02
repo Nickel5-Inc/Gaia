@@ -1198,7 +1198,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
     @track_operation("write")
     async def cleanup_old_baseline_predictions(
-        self, days_to_keep: int = 30, batch_size: int = 1000
+        self, days_to_keep: int = 15, batch_size: int = 1000
     ) -> int:
         """
         Clean up old baseline predictions to prevent table bloat.
@@ -1827,8 +1827,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             unused_indexes = await self.fetch_all(unused_indexes_query)
             results["unused_indexes"] = unused_indexes
 
-            # Clean up old predictions (keep last 30 days)
-            cleaned_count = await self.cleanup_old_baseline_predictions(days_to_keep=30)
+            # Clean up old predictions (keep last 15 days)
+            cleaned_count = await self.cleanup_old_baseline_predictions(days_to_keep=15)
             results["cleaned_old_records"] = cleaned_count
 
             logger.info(f"Baseline predictions table optimization completed: {results}")
@@ -2233,14 +2233,14 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             return {"error": str(e)}
 
     @track_operation("write")
-    async def cleanup_old_validator_jobs(self, days_after_completion: int = 7, batch_size: int = 1000) -> int:
+    async def cleanup_old_validator_jobs(self, hours_after_completion: int = 24, batch_size: int = 1000) -> int:
         """Delete finished jobs older than the retention window.
 
-        Removes jobs with status in (completed, failed, cancelled) where completed_at < NOW() - days_after_completion.
+        Removes jobs with status in (completed, failed, cancelled) where completed_at < NOW() - hours_after_completion.
         Cascades will remove logs via FK.
         """
         try:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=days_after_completion)
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_after_completion)
 
             total_deleted = 0
             while True:
@@ -2264,14 +2264,14 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     break
                 await asyncio.sleep(0)
             if total_deleted:
-                logger.info(f"Deleted {total_deleted} old validator_jobs older than {days_after_completion} days")
+                logger.info(f"Deleted {total_deleted} old validator_jobs older than {hours_after_completion} hours")
             return total_deleted
         except Exception as e:
             logger.error(f"cleanup_old_validator_jobs error: {e}")
             return 0
 
     @track_operation("write")
-    async def cleanup_old_weather_steps(self, days_to_keep: int = 30, batch_size: int = 2000) -> int:
+    async def cleanup_old_weather_steps(self, days_to_keep: int = 15, batch_size: int = 2000) -> int:
         """Delete old, non-active weather_forecast_steps beyond retention window.
 
         Keeps active statuses: pending, in_progress, retry_scheduled, waiting_for_truth.
@@ -2304,4 +2304,92 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             return total_deleted
         except Exception as e:
             logger.error(f"cleanup_old_weather_steps error: {e}")
+            return 0
+
+    @track_operation("write")
+    async def cleanup_old_weather_miner_responses(self, days_to_keep: int = 20, batch_size: int = 2000) -> int:
+        """Delete old weather_miner_responses beyond retention window.
+        
+        Uses 20-day retention to ensure ERA5 scoring (10-day delay) is complete
+        before cleanup, preserving the 15-day scoring window.
+        
+        Args:
+            days_to_keep: Number of days of responses to keep (default: 20)
+            batch_size: Number of records to delete per batch (default: 2000)
+            
+        Returns:
+            Number of records deleted
+        """
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days_to_keep)
+            
+            total_deleted = 0
+            while True:
+                result = await self.execute(
+                    """
+                    DELETE FROM weather_miner_responses
+                    WHERE id IN (
+                        SELECT id FROM weather_miner_responses
+                        WHERE response_time < :cutoff
+                        ORDER BY response_time ASC
+                        LIMIT :batch
+                    )
+                    """,
+                    {"cutoff": cutoff, "batch": batch_size},
+                )
+                deleted = getattr(result, "rowcount", 0)
+                total_deleted += deleted
+                if deleted < batch_size:
+                    break
+                await asyncio.sleep(0)
+            
+            if total_deleted:
+                logger.info(f"Deleted {total_deleted} old weather_miner_responses older than {days_to_keep} days")
+            return total_deleted
+        except Exception as e:
+            logger.error(f"cleanup_old_weather_miner_responses error: {e}")
+            return 0
+
+    @track_operation("write")
+    async def cleanup_old_weather_forecast_stats(self, days_to_keep: int = 30, batch_size: int = 2000) -> int:
+        """Delete old weather_forecast_stats beyond retention window.
+        
+        Uses 30-day retention to ensure ERA5 scoring (10-day delay) is complete
+        before cleanup, preserving the 15-day scoring window with safety margin.
+        
+        Args:
+            days_to_keep: Number of days of forecast stats to keep (default: 30)
+            batch_size: Number of records to delete per batch (default: 2000)
+            
+        Returns:
+            Number of records deleted
+        """
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days_to_keep)
+            
+            total_deleted = 0
+            while True:
+                result = await self.execute(
+                    """
+                    DELETE FROM weather_forecast_stats
+                    WHERE id IN (
+                        SELECT id FROM weather_forecast_stats
+                        WHERE created_at < :cutoff
+                        ORDER BY created_at ASC
+                        LIMIT :batch
+                    )
+                    """,
+                    {"cutoff": cutoff, "batch": batch_size},
+                )
+                deleted = getattr(result, "rowcount", 0)
+                total_deleted += deleted
+                if deleted < batch_size:
+                    break
+                await asyncio.sleep(0)
+            
+            if total_deleted:
+                logger.info(f"Deleted {total_deleted} old weather_forecast_stats older than {days_to_keep} days")
+            return total_deleted
+        except Exception as e:
+            logger.error(f"cleanup_old_weather_forecast_stats error: {e}")
             return 0
