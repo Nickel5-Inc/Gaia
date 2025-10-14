@@ -67,7 +67,7 @@ async def orchestrate_run(
                 FROM validator_jobs 
                 WHERE run_id = :run_id 
                 AND job_type = 'weather.seed'
-                AND status IN ('pending', 'claimed', 'retry_scheduled')
+                AND status IN ('pending', 'in_progress', 'retry_scheduled')
                 ORDER BY id DESC
                 LIMIT 1
                 """,
@@ -84,6 +84,10 @@ async def orchestrate_run(
             
             # First check if node_table is populated
             node_count = await db.fetch_one("SELECT COUNT(*) as count FROM node_table")
+            try:
+                logger.info(f"[Run {run_id}] node_table miners: {node_count.get('count') if node_count else 'unknown'}")
+            except Exception:
+                pass
             if not node_count or node_count["count"] == 0:
                 logger.warning(f"[Run {run_id}] Node table is empty, waiting for metagraph sync...")
                 # Return False to let the orchestration job retry later
@@ -91,7 +95,12 @@ async def orchestrate_run(
             
             logger.info(f"[Run {run_id}] Seeding per-miner data...")
             seeded = await seed_forecast_run(db, run_id, validator_hotkey)
-            logger.info(f"[Run {run_id}] Seeded {seeded} miners")
+            try:
+                logger.info(f"[Run {run_id}] seed_forecast_run returned seeded={seeded}")
+                if (node_count or {}).get('count') and seeded == 0:
+                    logger.warning(f"[Run {run_id}] Seed returned 0 despite node_table count={(node_count or {}).get('count')}")
+            except Exception:
+                pass
             
             if seeded == 0:
                 logger.warning(f"[Run {run_id}] No miners seeded despite node_table having entries")
@@ -103,9 +112,38 @@ async def orchestrate_run(
                 {"run_id": run_id}
             )
             
-            # The seed_forecast_run function already creates the seed step and enqueues jobs
-            # So we just need to wait for the seed job to complete
-            logger.info(f"[Run {run_id}] Seed job enqueued, GFS download will be handled by worker")
+            # Ensure a seed job exists even if a prior step existed without job
+            ensure_job = await db.fetch_one(
+                """
+                SELECT id FROM validator_jobs
+                WHERE run_id = :rid AND job_type = 'weather.seed'
+                  AND status IN ('pending','in_progress','retry_scheduled')
+                LIMIT 1
+                """,
+                {"rid": run_id},
+            )
+            if not ensure_job:
+                # Try to let the generic enqueuer create it from steps if a step exists
+                try:
+                    await db.enqueue_weather_step_jobs(limit=1000)
+                except Exception:
+                    pass
+                ensure_job = await db.fetch_one(
+                    """
+                    SELECT id FROM validator_jobs
+                    WHERE run_id = :rid AND job_type = 'weather.seed'
+                      AND status IN ('pending','in_progress','retry_scheduled')
+                    LIMIT 1
+                    """,
+                    {"rid": run_id},
+                )
+            if ensure_job:
+                logger.info(f"[Run {run_id}] Seed job confirmed present (id={ensure_job['id']})")
+            else:
+                logger.warning(f"[Run {run_id}] Seed job not found after seeding; will rely on next orchestrate to retry")
+            
+            # The seed job will transition the run to gfs_ready when successful
+            logger.info(f"[Run {run_id}] Seed job handling delegated to worker")
             
         elif current_status == "gfs_ready":
             # GFS is ready, we can proceed with miner queries
@@ -269,17 +307,28 @@ async def handle_initiate_fetch_job(
         if len(miners) > 1:
             ip_port_map = {}
             for miner in miners:
-                ip_port = f"{miner.get('ip', 'N/A')}:{miner.get('port', 'N/A')}"
-                if ip_port in ip_port_map:
-                    logger.error(
-                        f"[DATABASE CORRUPTION] Multiple UIDs point to same miner instance {ip_port}:"
-                        f"\n  UID {ip_port_map[ip_port]['uid']}: hotkey {ip_port_map[ip_port]['hotkey'][:8]}...{ip_port_map[ip_port]['hotkey'][-8:]}"
-                        f"\n  UID {miner['uid']}: hotkey {miner['hotkey'][:8]}...{miner['hotkey'][-8:]}"
-                        f"\n  This explains why both miners return the same job_id!"
-                    )
+                raw_ip = miner.get('ip')
+                raw_port = miner.get('port')
+                ip_str = str(raw_ip).strip() if raw_ip is not None else ""
+                port_str = str(raw_port).strip() if raw_port is not None else ""
+                # Treat unposted/placeholder values as "unposted" and skip conflict detection
+                is_unposted_ip = ip_str in ("", "0", "0.0.0.0", "::", "N/A")
+                is_unposted_port = port_str in ("", "0", "N/A")
+                if is_unposted_ip or is_unposted_port:
+                    ip_port = "unposted"
+                    # Do not add to conflict map; miner has not registered a reachable endpoint yet
                 else:
-                    ip_port_map[ip_port] = miner
-                    
+                    ip_port = f"{ip_str}:{port_str}"
+                    if ip_port in ip_port_map:
+                        logger.error(
+                            f"[DATABASE CORRUPTION] Multiple UIDs point to same miner instance {ip_port}:"
+                            f"\n  UID {ip_port_map[ip_port]['uid']}: hotkey {ip_port_map[ip_port]['hotkey'][:8]}...{ip_port_map[ip_port]['hotkey'][-8:]}"
+                            f"\n  UID {miner['uid']}: hotkey {miner['hotkey'][:8]}...{miner['hotkey'][-8:]}"
+                            f"\n  This explains why both miners return the same job_id!"
+                        )
+                    else:
+                        ip_port_map[ip_port] = miner
+
                 logger.info(
                     f"[Run {run_id}] Miner UID {miner['uid']}: {miner['hotkey'][:8]}...{miner['hotkey'][-8:]} "
                     f"at {ip_port}"

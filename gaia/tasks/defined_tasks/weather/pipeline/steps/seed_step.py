@@ -60,6 +60,10 @@ async def seed_forecast_run(
         ORDER BY uid ASC
         """
     )
+    try:
+        logger.info(f"[Run {run_id}] seed_forecast_run: node_table miners pulled: {len(miners)}")
+    except Exception:
+        pass
     if not miners:
         return 0
 
@@ -147,7 +151,7 @@ async def seed_forecast_run(
                 logger.info(f"Created seed step for run {run_id}")
                 
                 # CRITICAL: Create the actual seed job in validator_jobs queue
-                await db.enqueue_validator_job(
+                jid = await db.enqueue_validator_job(
                     job_type="weather.seed",
                     payload={
                         "step": "seed",
@@ -162,7 +166,7 @@ async def seed_forecast_run(
                     run_id=run_id,
                     miner_uid=int(first_node["uid"]),
                 )
-                logger.info(f"Created seed job for run {run_id}")
+                logger.info(f"Created seed job for run {run_id}: id={jid}")
         else:
             logger.debug(f"Seed step already exists for run {run_id}")
             

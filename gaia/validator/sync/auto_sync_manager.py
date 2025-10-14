@@ -61,6 +61,7 @@ class AutoSyncManager:
         self.test_mode = test_mode
         # Advisory lock used to pause app DB operations during maintenance/backups
         self.DB_PAUSE_LOCK_KEY = 746227728439
+        self._autosync_lock_file = "/tmp/gaia_autosync_lock"
 
         # Get current system user
         import getpass
@@ -621,6 +622,18 @@ class AutoSyncManager:
         Handles existing installations, network transitions, and misconfigurations automatically.
         """
         try:
+            # Create a simple lock file to signal workers to wait during setup
+            try:
+                import aiofiles  # type: ignore
+                async with aiofiles.open(self._autosync_lock_file, "w") as f:
+                    await f.write("running")
+            except Exception:
+                try:
+                    with open(self._autosync_lock_file, "w") as f:
+                        f.write("running")
+                except Exception:
+                    pass
+            logger.info(f"Created AutoSync lock file at {self._autosync_lock_file}")
             logger.info(f"🚀 Setting up database sync - {self.config['stanza_name']} ({'PRIMARY' if self.is_primary else 'REPLICA'})")
 
             # 1. Install dependencies with timeout
@@ -719,6 +732,15 @@ class AutoSyncManager:
             logger.error(f"❌ Database sync setup failed: {e}", exc_info=True)
             logger.error("Will attempt fallback configuration...")
             return False
+        finally:
+            # Always remove the lock at the end
+            try:
+                import os as _os
+                if _os.path.exists(self._autosync_lock_file):
+                    _os.remove(self._autosync_lock_file)
+                    logger.info("Removed AutoSync lock file")
+            except Exception:
+                pass
 
     async def _install_dependencies(self) -> bool:
         """Install pgBackRest and required dependencies adaptively based on system detection."""
@@ -1232,6 +1254,19 @@ class AutoSyncManager:
 
     async def _restart_postgresql_service(self, service_name: str) -> bool:
         """Restart PostgreSQL service using appropriate method with robust service detection."""
+        # Create global app-level lock file so workers can idle without touching DB during restart
+        try:
+            try:
+                import aiofiles  # type: ignore
+                async with aiofiles.open(self._autosync_lock_file, "w") as f:
+                    await f.write("restarting")
+            except Exception:
+                with open(self._autosync_lock_file, "w") as f:
+                    f.write("restarting")
+            logger.info(f"Created AutoSync restart lock file at {self._autosync_lock_file}")
+        except Exception:
+            pass
+
         # Acquire exclusive advisory lock to pause app DB usage during restart
         try:
             await self._acquire_pause_lock()
@@ -1322,6 +1357,14 @@ class AutoSyncManager:
             # Release advisory lock after restart completes
             try:
                 await self._release_pause_lock()
+            except Exception:
+                pass
+            # Remove lock file
+            try:
+                import os as _os
+                if _os.path.exists(self._autosync_lock_file):
+                    _os.remove(self._autosync_lock_file)
+                    logger.info("Removed AutoSync restart lock file")
             except Exception:
                 pass
 

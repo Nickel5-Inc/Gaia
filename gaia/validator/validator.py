@@ -327,6 +327,22 @@ def _weather_worker_entrypoint() -> None:
         sys.exit(0)
 
 
+def _utility_worker_entrypoint() -> None:
+    # Entry for the utility-only worker (worker-1)
+    import asyncio
+    import sys
+    # Use dedicated utility main
+    from gaia.tasks.defined_tasks.weather.pipeline.worker_main import utility_main as worker_main
+    try:
+        asyncio.run(worker_main())
+    except KeyboardInterrupt:
+        try:
+            logger.info("[UtilityWorker] KeyboardInterrupt received - exiting cleanly")
+        except Exception:
+            pass
+        sys.exit(0)
+
+
 class GaiaValidator:
     def _check_and_fix_asyncio_compatibility(self):
         """
@@ -3350,7 +3366,6 @@ class GaiaValidator:
                     # Restart dead workers
                     if dead_workers:
                         logger.info(f"Restarting {len(dead_workers)} dead worker(s)")
-                        
                         for i, dead_process in dead_workers:
                             try:
                                 # Clean up the dead process
@@ -3358,8 +3373,9 @@ class GaiaValidator:
                                 
                                 # Create a new worker with the same name format
                                 worker_num = i + 1
-                                name = f"worker-{worker_num}/{total_workers}"
-                                new_process = mp.Process(name=name, target=_weather_worker_entrypoint, daemon=True)
+                                name = "UTILITY WORKER" if (total_workers > 1 and worker_num == 1) else f"worker-{worker_num}/{total_workers}"
+                                target = _utility_worker_entrypoint if (total_workers > 1 and worker_num == 1) else _weather_worker_entrypoint
+                                new_process = mp.Process(name=name, target=target, daemon=True)
                                 new_process.start()
                                 
                                 # Replace the dead process in the list
@@ -4121,12 +4137,33 @@ class GaiaValidator:
                             if self._per_miner_exec_enabled and not self._weather_worker_processes:
                                 procs = self._weather_worker_num
                                 logger.info(f"Starting weather worker pool with {procs} processes (80% of cores, floored)")
+                                processes: list[mp.Process] = []
                                 for i in range(procs):
-                                    name = f"worker-{i+1}/{procs}"
-                                    p = mp.Process(name=name, target=_weather_worker_entrypoint, daemon=True)
+                                    if procs > 1 and i == 0:
+                                        name = "UTILITY WORKER"
+                                        target = _utility_worker_entrypoint
+                                    else:
+                                        if procs > 1:
+                                            heavy_total = procs - 1
+                                            heavy_index = i  # first heavy is i==1 -> 1/heavy_total
+                                        else:
+                                            heavy_total = procs
+                                            heavy_index = i + 1
+                                        name = f"worker-{heavy_index}/{heavy_total}"
+                                        target = _weather_worker_entrypoint
+                                    p = mp.Process(name=name, target=target, daemon=True)
+                                    processes.append(p)
+                                # Launch all at once to avoid first-worker head starts
+                                for p in processes:
                                     p.start()
-                                    self._weather_worker_processes.append(p)
-                                
+                                self._weather_worker_processes.extend(processes)
+
+                                # Extra barrier: wait a short moment for DB pause lock release and worker module reloads
+                                try:
+                                    await asyncio.sleep(0.5)
+                                except Exception:
+                                    pass
+
                                 # NOW start job enqueuer after workers are ready and database is stable
                                 logger.info("🚀 Starting job enqueuer after AutoSyncManager setup and worker pool initialization")
                                 self.create_tracked_task(_enqueue_recurring_jobs(), "job_enqueuer")

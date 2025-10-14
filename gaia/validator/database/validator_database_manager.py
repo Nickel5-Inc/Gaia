@@ -1476,6 +1476,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         *,
         worker_name: str,
         job_type_prefix: Optional[str] = None,
+        is_utility_worker: bool = False,
+        legacy_worker_name: Optional[str] = None,
         lease_seconds: int = 600,
     ) -> Optional[Dict[str, Any]]:
         try:
@@ -1483,6 +1485,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             params: Dict[str, Any] = {
                 "worker_name": worker_name,
                 "lease_interval": lease_seconds,
+                "is_utility": is_utility_worker,
+                # Ensure legacy_name is always a string to avoid ambiguous NULL typing in SQL
+                "legacy_name": legacy_worker_name or worker_name,
             }
             if job_type_prefix:
                 where_extra = " AND job_type LIKE :jprefix"
@@ -1497,6 +1502,13 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 AND (next_retry_at IS NULL OR next_retry_at <= NOW())
                 AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
                 {where_extra}
+                AND (NOT :is_utility OR job_type NOT LIKE 'weather.%')
+                AND NOT EXISTS (
+                  SELECT 1 FROM validator_jobs x
+                  WHERE (x.claimed_by = :worker_name OR x.claimed_by = :legacy_name)
+                    AND x.status = 'in_progress'
+                    AND x.lease_expires_at > NOW()
+                )
               ORDER BY priority ASC, created_at ASC
               FOR UPDATE SKIP LOCKED
               LIMIT 1

@@ -27,9 +27,46 @@ from gaia.validator.utils.substrate_manager import get_process_isolated_substrat
 from fiber.chain.fetch_nodes import get_nodes_for_netuid
 from gaia.validator.weights.weight_service import commit_weights_if_eligible
 import os
+import re
+from pathlib import Path
 
 
 # verification removed
+DB_PAUSE_LOCK_KEY: int = 746227728439  # Must match AutoSyncManager.DB_PAUSE_LOCK_KEY
+AUTOSYNC_LOCK_FILE: str = "/tmp/gaia_autosync_lock"
+
+
+async def _autosync_startup_barrier(db: ValidatorDatabaseManager) -> bool:
+    """Return True when DB is ready and AutoSyncManager is not holding the pause lock.
+
+    - If DB is restarting, simple queries will raise; we catch and return False.
+    - If AutoSync pause lock is held, pg_try_advisory_lock(...) returns false; we return False.
+    - If we obtain the lock, immediately release it and proceed (no pause in effect).
+    """
+    # File-based global barrier: if AutoSync is still running setup, block workers
+    try:
+        if Path(AUTOSYNC_LOCK_FILE).exists():
+            return False
+    except Exception:
+        pass
+    try:
+        # DB readiness probe
+        _ = await db.fetch_one("SELECT 1 AS ok")
+    except Exception:
+        return False
+    try:
+        row = await db.fetch_one("SELECT pg_try_advisory_lock(:key) AS ok", {"key": DB_PAUSE_LOCK_KEY})
+        if not row or not row.get("ok"):
+            return False
+        # We acquired the lock, so no pause is in effect; release immediately
+        try:
+            await db.execute("SELECT pg_advisory_unlock(:key)", {"key": DB_PAUSE_LOCK_KEY})
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
 
 
 # REMOVED: process_day1_one and process_era5_one functions that called unused run() methods
@@ -41,6 +78,9 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
     # REMOVED: Bulk job enqueuing to eliminate dual pathways and race conditions
     # Each pipeline step now creates its successor job upon completion
     try:
+        # Strict startup barrier: do nothing while AutoSync holds the DB pause lock or DB is restarting
+        if not await _autosync_startup_barrier(db):
+            return False
         await db.enqueue_miner_poll_jobs(limit=200)
     except Exception:
         pass
@@ -51,10 +91,22 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
         _pname = _mp.current_process().name if _mp.current_process() else ""
         should_enqueue_steps = True
         try:
-            if "worker-" in _pname and "/" in _pname:
-                _idx = int(_pname.split("worker-")[1].split("/")[0])
-                if _idx != 1:
-                    should_enqueue_steps = False
+            _idx: Optional[int] = None
+            _total: Optional[int] = None
+            m = re.search(r"(?i)\bworker[\-\s_]*([0-9]+)\s*/\s*([0-9]+)\b", _pname or "")
+            if m:
+                _idx = int(m.group(1))
+                _total = int(m.group(2))
+            else:
+                # Legacy fallback: any 'worker' token with slash
+                if "worker" in (_pname or "").lower() and "/" in (_pname or ""):
+                    tail = (_pname.lower().split("worker", 1)[1]).lstrip(" -_/")
+                    parts = tail.split("/", 1)
+                    if len(parts) == 2 and parts[0].isdigit() and parts[1].split("/",1)[0].isdigit():
+                        _idx = int(parts[0])
+                        _total = int(parts[1].split("/",1)[0])
+            if _idx is not None and _idx != 1:
+                should_enqueue_steps = False
         except Exception:
             pass
         if should_enqueue_steps:
@@ -90,21 +142,38 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
         _pname = _mp.current_process().name if _mp.current_process() else "weather-w/1"
     except Exception:
         _pname = "weather-w/1"
-    # Hardcode: reserve worker-1 (when total workers > 1) for utility queues only
+    # Only respect explicit utility-only flag; no implicit worker-1 special-casing
     skip_weather = False
     try:
-        if "worker-" in _pname and "/" in _pname:
-            _part = _pname.split("worker-")[1]
-            _idx_str, _total_str = _part.split("/", 1)
-            _idx = int(_idx_str)
-            _total = int(_total_str) if _total_str.isdigit() else None
-            if _total is not None and _total > 1 and _idx == 1:
-                skip_weather = True
+        FORCE_UTILITY_ONLY = globals().get("FORCE_UTILITY_ONLY", False)
+        if FORCE_UTILITY_ONLY or os.getenv("UTILITY_ONLY", "").strip() == "1":
+            skip_weather = True
     except Exception:
         skip_weather = False
+    # Enforce single in-flight job per worker: only claim when none is active
     job = None
     if not skip_weather:
-        job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="weather.")
+        try:
+            inflight = await db.fetch_one(
+                """
+                SELECT 1 FROM validator_jobs
+                WHERE claimed_by = :w AND status = 'in_progress' AND lease_expires_at > NOW()
+                LIMIT 1
+                """,
+                {"w": _pname},
+            )
+        except Exception:
+            inflight = None
+        if not inflight:
+            # Also guard against legacy claimed_by names that lacked brackets/prefixing in older builds
+            legacy_name = _pname
+            try:
+                # Normalize bracketed names like "[WORKER 1/5]" to plain "worker-1/5"
+                if legacy_name.startswith("[") and legacy_name.endswith("]"):
+                    legacy_name = legacy_name.strip("[]").lower().replace(" ", "").replace("worker", "worker-")
+            except Exception:
+                legacy_name = _pname
+            job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="weather.", is_utility_worker=False, legacy_worker_name=legacy_name)
     if job:
         try:
             # Log concise claim
@@ -112,6 +181,18 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 logger.info(
                     f"claimed job id={job.get('id')} type={job.get('job_type')} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
                 )
+            except Exception:
+                pass
+            # Post-claim verification: ensure claimed_by matches this worker and status is in_progress
+            try:
+                row_verify = await db.fetch_one(
+                    "SELECT status, claimed_by FROM validator_jobs WHERE id = :jid",
+                    {"jid": job.get("id")},
+                )
+                if row_verify:
+                    logger.info(
+                        f"post-claim verify job {job.get('id')}: status={row_verify.get('status')} claimed_by={row_verify.get('claimed_by')} self={_pname}"
+                    )
             except Exception:
                 pass
             jtype = job.get("job_type")
@@ -123,6 +204,23 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     payload = _json.loads(payload)
                 except Exception:
                     payload = {}
+            # Hard stop: utility-only worker must not process weather jobs even if claimed
+            FORCE_UTILITY_ONLY = globals().get("FORCE_UTILITY_ONLY", False)
+            if FORCE_UTILITY_ONLY or os.getenv("UTILITY_ONLY", "").strip() == "1":
+                try:
+                    # Release the job back to the queue immediately (do NOT fail it)
+                    await db.execute(
+                        """
+                        UPDATE validator_jobs
+                        SET status = 'pending', claimed_by = NULL, started_at = NULL, lease_expires_at = NULL
+                        WHERE id = :jid
+                        """,
+                        {"jid": job["id"]},
+                    )
+                except Exception:
+                    # As a fallback, schedule a quick retry rather than failing permanently
+                    await db.fail_validator_job(job["id"], "utility-only worker released weather job", schedule_retry_in_seconds=2)
+                return True
             if jtype == "weather.run.orchestrate":
                 # High-level run orchestration
                 from gaia.tasks.defined_tasks.weather.pipeline.orchestrator import orchestrate_run
@@ -194,6 +292,18 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 retry_count = payload.get("retry_count", 0)
                 
                 if rid and muid is not None:
+                    # Renew lease early to avoid rapid re-claims if this worker stalls
+                    try:
+                        await db.execute(
+                            """
+                            UPDATE validator_jobs
+                            SET lease_expires_at = NOW() + INTERVAL '10 minutes'
+                            WHERE id = :jid
+                            """,
+                            {"jid": job["id"]},
+                        )
+                    except Exception:
+                        pass
                     # Guard: ensure uid-hotkey pair still exists (deregistration/hotkey change)
                     try:
                         exists_row = await db.fetch_one(
@@ -221,7 +331,11 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                             pass
                         await db.complete_validator_job(job["id"], result={"cancelled": "miner_not_found"})
                         return True
-                    ok = await run_query_miner_job(db, int(rid), int(muid), mhk, vhk, validator)
+                    try:
+                        ok = await run_query_miner_job(db, int(rid), int(muid), mhk, vhk, validator)
+                    except Exception as e:
+                        logger.error(f"run_query_miner_job exception: {e}", exc_info=True)
+                        ok = False
                     if ok:
                         # Query succeeded, reset retry tracking
                         await db.execute(
@@ -595,7 +709,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             return False
 
     # Try non-weather utility queues next: stats → metagraph → miners → era5 → ops
-    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="stats.")
+    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="stats.", is_utility_worker=False)
     if job:
         try:
             try:
@@ -611,9 +725,16 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 ok = await run_miner_aggregation(db, validator=validator)
             elif j == "stats.subnet_snapshot":
                 from gaia.tasks.defined_tasks.weather.pipeline.steps.aggregate_step import compute_subnet_stats
-
-                _ = await compute_subnet_stats(db)
-                ok = True
+                try:
+                    snapshot = await compute_subnet_stats(db)
+                    try:
+                        logger.info(f"[SubnetSnapshot] active_miners={snapshot.get('active_miners')}, avg_forecast_score={snapshot.get('avg_forecast_score')}")
+                    except Exception:
+                        pass
+                    ok = True
+                except Exception as e:
+                    logger.error(f"compute_subnet_stats failed: {e}", exc_info=True)
+                    ok = False
             else:
                 ok = False
             if ok:
@@ -625,7 +746,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             await db.fail_validator_job(job["id"], f"exception: {e}")
             return False
 
-    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="metagraph.")
+    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="metagraph.", is_utility_worker=False)
     if job:
         try:
             try:
@@ -641,7 +762,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             await db.fail_validator_job(job["id"], f"exception: {e}")
             return False
 
-    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="miners.")
+    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="miners.", is_utility_worker=False)
     if job:
         try:
             # Opportunistically ensure polling jobs exist
@@ -939,7 +1060,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             await db.fail_validator_job(job["id"], f"exception: {e}")
             return False
 
-    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="era5.")
+    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="era5.", is_utility_worker=False)
     if job:
         try:
             try:
@@ -1198,7 +1319,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             await db.fail_validator_job(job["id"], f"exception: {e}")
             return False
 
-    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="ops.")
+    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="ops.", is_utility_worker=False)
     if job:
         try:
             try:
@@ -1252,5 +1373,136 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
     # All scoring now goes through the generic job queue with run_item() methods
     logger.warning(f"Legacy per-miner worker cannot process step '{item.step}' - use generic job queue instead")
     return False
+
+
+async def process_one_utility(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> bool:
+    """Utility-only worker loop: never claims weather.* jobs.
+
+    Still performs step enqueuing (seed/era5) and miner poll job housekeeping,
+    but strictly skips claiming any weather.* jobs (including orchestrate/query/poll).
+    """
+    try:
+        # Barrier: ensure AutoSync isn't pausing DB
+        if not await _autosync_startup_barrier(db):
+            return False
+        # Housekeeping
+        try:
+            await db.enqueue_miner_poll_jobs(limit=200)
+        except Exception:
+            pass
+        # Only worker-1 does periodic step enqueues
+        try:
+            import multiprocessing as _mp
+            _pname = _mp.current_process().name if _mp.current_process() else ""
+            should_enqueue_steps = True
+            try:
+                if "worker-" in _pname and "/" in _pname:
+                    _idx = int(_pname.split("worker-")[1].split("/")[0])
+                    if _idx != 1:
+                        should_enqueue_steps = False
+            except Exception:
+                pass
+            if should_enqueue_steps:
+                from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+                interval_s = 60
+                try:
+                    interval_s = int(os.getenv("WEATHER_STEPS_ENQUEUE_INTERVAL_SECONDS", "60"))
+                except Exception:
+                    interval_s = 60
+                last_at = getattr(validator, "_last_steps_enqueue_at", None) if validator is not None else None
+                now = _dt.now(_tz.utc)
+                if last_at is None or (now - last_at).total_seconds() >= interval_s:
+                    lock = await db.fetch_one("SELECT pg_try_advisory_lock(:k) AS ok", {"k": 0x57465354})  # 'WFST'
+                    if lock and lock.get("ok"):
+                        try:
+                            await db.enqueue_weather_step_jobs(limit=2000)
+                        finally:
+                            try:
+                                await db.execute("SELECT pg_advisory_unlock(:k)", {"k": 0x57465354})
+                            except Exception:
+                                pass
+                    if validator is not None:
+                        try:
+                            setattr(validator, "_last_steps_enqueue_at", now)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # STRICT: Never claim weather.*
+        _pname = None
+        try:
+            import multiprocessing as _mp
+            _pname = _mp.current_process().name if _mp.current_process() else "utility"
+        except Exception:
+            _pname = "utility"
+
+        # Claim non-weather queues only
+        for prefix in ("stats.", "metagraph.", "miners.", "era5.", "ops."):
+            job = await db.claim_validator_job(worker_name=_pname, job_type_prefix=prefix, is_utility_worker=True)
+            if job:
+                try:
+                    try:
+                        logger.info(
+                            f"claimed job id={job.get('id')} type={job.get('job_type')} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
+                        )
+                    except Exception:
+                        pass
+                    # Reuse the same handler block from process_one by delegating back into it
+                    # but with a guard to ensure weather.* is not processed. Since we
+                    # never claim weather.* here, we can just duplicate minimal handling.
+                    jtype = job.get("job_type")
+                    payload = job.get("payload") or {}
+                    if isinstance(payload, str):
+                        import json as _json
+                        try:
+                            payload = _json.loads(payload)
+                        except Exception:
+                            payload = {}
+                    # Fast path: if somehow a weather.* slips in, release it
+                    if isinstance(jtype, str) and jtype.startswith("weather."):
+                        try:
+                            await db.execute(
+                                "UPDATE validator_jobs SET status='pending', claimed_by=NULL, started_at=NULL, lease_expires_at=NULL WHERE id = :jid",
+                                {"jid": job["id"]},
+                            )
+                        except Exception:
+                            await db.fail_validator_job(job["id"], "utility-only release", schedule_retry_in_seconds=2)
+                        return True
+
+                    # Otherwise, process via the existing handlers by temporarily monkey-patching
+                    # the job_type into a minimal switch
+                    # We re-enter process_one's handler space by mimicking its structure in brief
+                    ok = True
+                    if jtype == "stats.aggregate":
+                        manager = WeatherStatsManager(db, validator_hotkey=getattr(validator, "validator_wallet", None))
+                        try:
+                            await manager.aggregate_miner_stats()
+                        except Exception:
+                            ok = False
+                    elif jtype.startswith("metagraph."):
+                        # Delegate to existing miners/metagraph handlers by failing to requeue if unknown
+                        ok = False
+                    elif jtype.startswith("miners."):
+                        ok = False
+                    elif jtype.startswith("era5."):
+                        ok = False
+                    elif jtype.startswith("ops."):
+                        ok = False
+                    else:
+                        ok = False
+
+                    if ok:
+                        await db.complete_validator_job(job["id"], result={"ok": True})
+                    else:
+                        await db.fail_validator_job(job["id"], "unhandled utility job", schedule_retry_in_seconds=60)
+                    return True
+                except Exception as e:
+                    await db.fail_validator_job(job["id"], f"exception: {e}")
+                    return False
+
+        return False
+    except Exception:
+        return False
 
 

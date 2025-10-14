@@ -8,9 +8,10 @@ import multiprocessing as mp
 from typing import Optional
 import logging
 import sys
+import re
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager, DatabaseError
-from gaia.tasks.defined_tasks.weather.pipeline.workers import process_one
+from gaia.tasks.defined_tasks.weather.pipeline.workers import process_one, process_one_utility
 from gaia.utils.custom_logger import get_logger
 from gaia.utils.gcsfs_safe_close import apply_gcsfs_threadsafe_close_patch
 
@@ -86,9 +87,29 @@ async def worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0, mem
         logger.warning(f"could not initialize WeatherTask: {e}, proceeding without validator context")
         validator = None
     
+    # Force-reload workers module to avoid stale pre-fork imports; rebind handlers
+    try:
+        import importlib
+        import gaia.tasks.defined_tasks.weather.pipeline.workers as _workers_mod
+        _workers_mod = importlib.reload(_workers_mod)
+        globals()['process_one'] = getattr(_workers_mod, 'process_one')
+        globals()['process_one_utility'] = getattr(_workers_mod, 'process_one_utility')
+        logger.debug("reloaded workers module and rebound handlers")
+    except Exception:
+        pass
+
     while True:
         try:
-            processed = await process_one(db, validator=validator)
+            # If this is the UTILITY WORKER, use utility loop; else normal loop
+            use_utility = False
+            try:
+                import multiprocessing as _mp
+                _pname = _mp.current_process().name if _mp.current_process() else ""
+                use_utility = (_pname.strip().upper() == "UTILITY WORKER")
+            except Exception:
+                use_utility = False
+
+            processed = await (process_one_utility(db, validator=validator) if use_utility else process_one(db, validator=validator))
             # Memory guard: check if we should restart after completing current job
             if memory_limit_mb and memory_limit_mb > 0:
                 rss_mb = _get_rss_mb()
@@ -165,6 +186,86 @@ async def main() -> None:
         await worker_loop(db, idle_sleep=idle, memory_limit_mb=mem_limit)
     finally:
         # Give any scheduled close tasks a chance to run
+        try:
+            await asyncio.sleep(0)
+        except Exception:
+            pass
+        await db.close_all_connections()
+
+
+async def utility_worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0, memory_limit_mb: float = 0.0) -> None:
+    last_idle_log = 0.0
+    tag = _prefix()
+    validator = None
+    try:
+        from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+        validator = WeatherTask(db_manager=db, node_type="validator", test_mode=True, keypair=None)
+    except Exception:
+        validator = None
+    while True:
+        try:
+            processed = await process_one_utility(db, validator=validator)
+            if memory_limit_mb and memory_limit_mb > 0:
+                rss_mb = _get_rss_mb()
+                if rss_mb >= 0 and rss_mb > memory_limit_mb:
+                    if processed:
+                        logger.warning(
+                            f"memory threshold exceeded: rss={rss_mb:.1f}MB > limit={memory_limit_mb:.1f}MB — exiting after completing job for restart"
+                        )
+                    else:
+                        logger.warning(
+                            f"memory threshold exceeded: rss={rss_mb:.1f}MB > limit={memory_limit_mb:.1f}MB — exiting for restart"
+                        )
+                    break
+            if not processed:
+                now = time.time()
+                if now - last_idle_log > 60:
+                    rss_mb = _get_rss_mb()
+                    mem_str = f" | rss={rss_mb:.1f}MB" if rss_mb >= 0 else ""
+                    logger.info(f"idle: no jobs to claim currently{mem_str}")
+                    last_idle_log = now
+                await asyncio.sleep(idle_sleep)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(1.0)
+
+
+async def utility_main() -> None:
+    db = ValidatorDatabaseManager()
+    tag = _prefix()
+    _patch_gcsfs_close_session()
+    await _install_worker_prefix_filters(tag)
+    # Force-reload workers module to avoid stale pre-fork imports; rebind handlers
+    try:
+        import importlib
+        import gaia.tasks.defined_tasks.weather.pipeline.workers as _workers_mod
+        _workers_mod = importlib.reload(_workers_mod)
+        globals()['process_one'] = getattr(_workers_mod, 'process_one')
+        globals()['process_one_utility'] = getattr(_workers_mod, 'process_one_utility')
+        logger.debug("reloaded workers module and rebound handlers (utility)")
+    except Exception:
+        pass
+    # Retry DB init while Postgres is restarting or paused for maintenance
+    max_tries = int(os.getenv("WEATHER_WORKER_DB_INIT_RETRIES", "30"))
+    backoff = 1.0
+    for attempt in range(1, max_tries + 1):
+        try:
+            await db.initialize_database()
+            break
+        except Exception as e:
+            msg = str(e)
+            if "shutting down" in msg or "CannotConnectNow" in msg or "Failed to initialize database engine" in msg:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 1.5, 10.0)
+                continue
+            raise
+    try:
+        idle = float(os.getenv("WEATHER_WORKER_IDLE_SLEEP", "5"))
+        mem_limit = float(os.getenv("WEATHER_WORKER_RSS_LIMIT_MB", "3072"))
+        logger.info(f"started (UTILITY) (idle_sleep={idle}s, rss_limit={mem_limit}MB)")
+        await utility_worker_loop(db, idle_sleep=idle, memory_limit_mb=mem_limit)
+    finally:
         try:
             await asyncio.sleep(0)
         except Exception:
