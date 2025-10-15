@@ -50,7 +50,7 @@ from ..weather_scoring.scoring import VARIABLE_WEIGHTS
 import sqlalchemy as sa
 
 
-def detect_cheating_conservative(miner_data, truth_data, rmse_score, acc_score, lead_hours, variable_name):
+def detect_cheating_conservative(miner_data, truth_data, rmse_score, acc_score, lead_hours, variable_name, all_lead_scores=None):
     """Conservative cheating detection that protects good models."""
     
     detection_signals = []
@@ -91,6 +91,42 @@ def detect_cheating_conservative(miner_data, truth_data, rmse_score, acc_score, 
         if np.mean(diff_data[diff_data > 0]) < noise_threshold:
             detection_signals.append("Data appears to be ERA5 with minimal noise")
             confidence += 0.7
+    
+    # Signal 7: Lead-time degradation validation (NEW - catch ERA5 across all leads)
+    if all_lead_scores is not None and len(all_lead_scores) >= 2:
+        # Check if ACC scores don't degrade properly with lead time
+        lead_hours_sorted = sorted(all_lead_scores.keys())
+        acc_scores_sorted = [all_lead_scores[h] for h in lead_hours_sorted]
+        
+        # Calculate expected degradation pattern
+        # Short leads (6-24h): ACC should be 0.85-0.95
+        # Medium leads (48-72h): ACC should be 0.70-0.85  
+        # Long leads (96-192h): ACC should be 0.50-0.70
+        
+        suspicious_degradation = False
+        degradation_signals = []
+        
+        for i, (lead_h, acc_val) in enumerate(zip(lead_hours_sorted, acc_scores_sorted)):
+            if lead_h <= 24 and acc_val > 0.98:
+                degradation_signals.append(f"Short lead {lead_h}h: ACC {acc_val:.3f} > 0.98 (suspiciously high)")
+                suspicious_degradation = True
+            elif 24 < lead_h <= 72 and acc_val > 0.90:
+                degradation_signals.append(f"Medium lead {lead_h}h: ACC {acc_val:.3f} > 0.90 (suspiciously high)")
+                suspicious_degradation = True
+            elif lead_h > 72 and acc_val > 0.80:
+                degradation_signals.append(f"Long lead {lead_h}h: ACC {acc_val:.3f} > 0.80 (suspiciously high)")
+                suspicious_degradation = True
+        
+        # Check for lack of degradation (all leads too similar)
+        if len(acc_scores_sorted) >= 3:
+            acc_range = max(acc_scores_sorted) - min(acc_scores_sorted)
+            if acc_range < 0.05 and min(acc_scores_sorted) > 0.90:
+                degradation_signals.append(f"All leads too similar: ACC range {acc_range:.3f} < 0.05, min {min(acc_scores_sorted):.3f} > 0.90")
+                suspicious_degradation = True
+        
+        if suspicious_degradation:
+            detection_signals.append(f"Lead-time degradation failure: {'; '.join(degradation_signals)}")
+            confidence += 0.8
     
     # Decision: Flag if high confidence or multiple signals
     if confidence >= 0.8 or len(detection_signals) >= 2:
@@ -2993,7 +3029,8 @@ async def calculate_era5_miner_score(
                             current_metrics["rmse"], 
                             acc_val, 
                             lead_hours, 
-                            var_name
+                            var_name,
+                            all_lead_scores=None  # TODO: Implement lead-time degradation validation
                         )
                         
                         if is_cheating:
@@ -3026,7 +3063,8 @@ async def calculate_era5_miner_score(
                             current_metrics["rmse"], 
                             acc_val, 
                             lead_hours, 
-                            var_name
+                            var_name,
+                            all_lead_scores=None  # TODO: Implement lead-time degradation validation
                         )
                         
                         if is_cheating:
