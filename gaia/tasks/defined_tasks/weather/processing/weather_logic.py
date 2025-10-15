@@ -48,6 +48,55 @@ from ..weather_scoring.metrics import (
 from gaia.utils.custom_logger import get_logger
 from ..weather_scoring.scoring import VARIABLE_WEIGHTS
 import sqlalchemy as sa
+
+
+def detect_cheating_conservative(miner_data, truth_data, rmse_score, acc_score, lead_hours, variable_name):
+    """Conservative cheating detection that protects good models."""
+    
+    detection_signals = []
+    confidence = 0.0
+    
+    # Signal 1: Near-perfect exact matches
+    exact_match_ratio = np.mean(miner_data == truth_data)
+    if exact_match_ratio > 0.99:
+        detection_signals.append(f"Near-perfect match: {exact_match_ratio:.3f} > 0.99")
+        confidence += 0.9
+    
+    # Signal 2: Impossibly good RMSE (FIXED - much more realistic)
+    if rmse_score < 0.1:  # This will catch obvious cheaters with 0.01, 0.05, etc.
+        detection_signals.append(f"RMSE impossibly low: {rmse_score:.3f} < 0.1 (Aurora baseline ~0.5-2.0)")
+        confidence += 0.8
+    
+    # Signal 3: Impossibly high ACC
+    if acc_score > 0.9995:
+        detection_signals.append(f"ACC impossibly high: {acc_score:.6f}")
+        confidence += 0.8
+    
+    # Signal 4: Suspiciously good performance (sophisticated cheating detection)
+    # Only flag if BOTH RMSE is impossibly low AND ACC is extremely high
+    if rmse_score < 0.2 and acc_score > 0.99:
+        detection_signals.append(f"Suspiciously good: RMSE {rmse_score:.3f} < 0.2 AND ACC {acc_score:.3f} > 0.99")
+        confidence += 0.6
+    
+    # Signal 5: Lead-time aware detection (longer leads should have worse scores)
+    if lead_hours > 72 and rmse_score < 0.2 and acc_score > 0.95:
+        detection_signals.append(f"Long lead ({lead_hours}h) suspiciously good: RMSE {rmse_score:.3f} < 0.2, ACC {acc_score:.3f} > 0.95")
+        confidence += 0.5
+    
+    # Signal 6: Statistical distribution analysis (catch ERA5 + noise)
+    if exact_match_ratio > 0.95 and exact_match_ratio < 0.99:
+        # Check if the non-matching points are just small noise
+        diff_data = np.abs(miner_data - truth_data)
+        noise_threshold = np.std(truth_data) * 0.02  # 2% of data variance
+        if np.mean(diff_data[diff_data > 0]) < noise_threshold:
+            detection_signals.append("Data appears to be ERA5 with minimal noise")
+            confidence += 0.7
+    
+    # Decision: Flag if high confidence or multiple signals
+    if confidence >= 0.8 or len(detection_signals) >= 2:
+        return True, f"Cheating detected: {'; '.join(detection_signals)} (confidence: {confidence:.2f})"
+    
+    return False, "Scores appear legitimate"
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
 
 logger = get_logger(__name__)
@@ -2937,6 +2986,25 @@ async def calculate_era5_miner_score(
                             raise ValueError("[FinalScore] No per-level ACC scores to aggregate")
                         current_metrics["acc"] = acc_val
                         
+                        # CHEATING DETECTION: Check for suspicious scores (pressure level variables)
+                        is_cheating, cheating_reason = detect_cheating_conservative(
+                            miner_var_da_aligned.values, 
+                            truth_var_da_final.values, 
+                            current_metrics["rmse"], 
+                            acc_val, 
+                            lead_hours, 
+                            var_name
+                        )
+                        
+                        if is_cheating:
+                            logger.error(f"[CHEATING DETECTED] Miner {miner_hotkey}: {cheating_reason}")
+                            logger.error(f"[CHEATING DETECTED] Original scores - RMSE: {current_metrics['rmse']:.6f}, ACC: {acc_val:.6f}")
+                            current_metrics["quarantine_flag"] = True
+                            current_metrics["quarantine_reason"] = cheating_reason
+                            # EXCLUDE cheater from scoring - return False to skip this miner entirely
+                            logger.error(f"[CHEATING DETECTED] EXCLUDING miner {miner_hotkey} from scoring")
+                            return False
+                        
                         # Update component scores with per-level ACC
                         for component_score in component_scores_for_this_var:
                             pressure_level = component_score['pressure_level']
@@ -2950,6 +3018,25 @@ async def calculate_era5_miner_score(
                             mse_weights,
                         )
                         current_metrics["acc"] = acc_val
+                        
+                        # CHEATING DETECTION: Check for suspicious scores (surface variables)
+                        is_cheating, cheating_reason = detect_cheating_conservative(
+                            miner_var_da_aligned.values, 
+                            truth_var_da_final.values, 
+                            current_metrics["rmse"], 
+                            acc_val, 
+                            lead_hours, 
+                            var_name
+                        )
+                        
+                        if is_cheating:
+                            logger.error(f"[CHEATING DETECTED] Miner {miner_hotkey}: {cheating_reason}")
+                            logger.error(f"[CHEATING DETECTED] Original scores - RMSE: {current_metrics['rmse']:.6f}, ACC: {acc_val:.6f}")
+                            current_metrics["quarantine_flag"] = True
+                            current_metrics["quarantine_reason"] = cheating_reason
+                            # EXCLUDE cheater from scoring - return False to skip this miner entirely
+                            logger.error(f"[CHEATING DETECTED] EXCLUDING miner {miner_hotkey} from scoring")
+                            return False
                         
                         # Update component score with ACC
                         for component_score in component_scores_for_this_var:
