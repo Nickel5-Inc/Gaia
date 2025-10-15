@@ -320,10 +320,9 @@ async def verify_minimal_chunks_and_reconstruct_manifest_hash(
     except Exception as diag_err:
         logger.debug(f"Job {job_id}: Manifest diagnostics failed: {diag_err}")
 
-    # Open only requested variables (this sets up an FSMap with verifying mapper; ok since manifest is trusted)
+    # Open verified dataset; this mapper will enforce per-chunk integrity on any reads
     ds_full = None
     try:
-        # Import here to avoid circular dependency
         from .remote_access import open_verified_remote_zarr_dataset
         ds_full = await open_verified_remote_zarr_dataset(
             zarr_store_url=zarr_store_url,
@@ -344,19 +343,75 @@ async def verify_minimal_chunks_and_reconstruct_manifest_hash(
         details["error"] = "subset_open_failed"
         details["duration_seconds"] = time.time() - start_time
         return False, details, None
-    # Filter to variables that actually exist in the dataset
+
+    # Determine variables to verify
     vars_present = [v for v in variables if v in list(ds_full.data_vars)]
     if not vars_present:
-        # If none of the requested variables exist, proceed with manifest-level check only
-        vars_present = list(ds_full.data_vars)[:1]  # minimal var to ensure mapper is wired
+        vars_present = list(ds_full.data_vars)[:1]
 
-    # IMPORTANT: Do not eagerly read any chunks here. We rely on on-read verification via
-    # VerifyingChunkMapper during scoring to validate chunks that are actually accessed.
-    # This avoids prefetching across many variables and drastically reduces remote requests.
-    details["verification_mode"] = "on_read_only"
+    # Build time coordinate selections
+    try:
+        time_coord = ds_full["time"] if "time" in ds_full.coords else None
+    except Exception:
+        time_coord = None
+    times_to_check = times
+    if time_coord is not None:
+        # keep the provided times; selection will snap to nearest
+        pass
 
-    # At this point, the verifying mapper has checked fetched chunks. Reconstruct manifest content hash
-    # using the original trusted manifest files (we rely on the verifying mapper for subset integrity).
+    # Actively read a minimal subset to force mapper verification
+    verified_count = 0
+    try:
+        for var_name in vars_present:
+            da = ds_full[var_name]
+            # select up to 2 provided times to limit IO
+            sel_times = times_to_check[:2] if isinstance(times_to_check, list) else times_to_check
+            try:
+                if sel_times:
+                    da_sel = da.sel(time=sel_times, method="nearest", drop=True)
+                else:
+                    da_sel = da.isel(time=slice(0, 1)) if "time" in da.dims else da
+            except Exception:
+                da_sel = da.isel(time=slice(0, 1)) if "time" in da.dims else da
+
+            # include a representative level if present
+            level_dim_candidates = [d for d in da_sel.dims if d.lower() in ("level", "pressure_level", "isobaricinhpa", "plev")]
+            if level_dim_candidates:
+                lev = level_dim_candidates[0]
+                if da_sel.sizes.get(lev, 0) > 0:
+                    da_sel = da_sel.isel({lev: 0})
+
+            # pick a couple of points to trigger chunk reads
+            try:
+                lat_dim = next((d for d in da_sel.dims if d.lower() in ("lat", "latitude", "y")), None)
+                lon_dim = next((d for d in da_sel.dims if d.lower() in ("lon", "longitude", "x")), None)
+                if lat_dim and lon_dim and da_sel.sizes.get(lat_dim, 0) > 0 and da_sel.sizes.get(lon_dim, 0) > 0:
+                    pts = [
+                        {lat_dim: 0, lon_dim: 0},
+                        {lat_dim: da_sel.sizes[lat_dim] // 2, lon_dim: da_sel.sizes[lon_dim] // 2},
+                    ]
+                    for pt in pts:
+                        _ = da_sel.isel(**pt).values  # forces read → hash check via mapper
+                        verified_count += 1
+                else:
+                    # fallback: load small slice
+                    _ = da_sel.isel(...).values
+                    verified_count += 1
+            except Exception as read_err:
+                details["error"] = f"subset_chunk_verification_failed: {read_err}"
+                details["verified_subset_files"] = verified_count
+                details["duration_seconds"] = time.time() - start_time
+                return False, details, None
+    except Exception as e_any:
+        details["error"] = f"subset_verification_error: {e_any}"
+        details["verified_subset_files"] = verified_count
+        details["duration_seconds"] = time.time() - start_time
+        return False, details, None
+
+    details["verification_mode"] = "subset_read_enforced"
+    details["verified_subset_files"] = verified_count
+
+    # Reconstruct manifest content hash from trusted manifest metadata
     manifest_to_hash = {
         "manifest_schema_version": manifest_schema_version,
         "profile_structure_version": profile_version,
@@ -367,8 +422,6 @@ async def verify_minimal_chunks_and_reconstruct_manifest_hash(
     manifest_json_bytes = json.dumps(manifest_to_hash, sort_keys=True, indent=4).encode("utf-8")
     recomputed_content_hash = hashlib.sha256(manifest_json_bytes).hexdigest()
     details["recomputed_content_hash"] = recomputed_content_hash
-    # No subset reads performed; verification happens on-read during scoring
-    details["verified_subset_files"] = 0
     details["duration_seconds"] = time.time() - start_time
     if recomputed_content_hash != claimed_manifest_content_hash:
         details["error"] = "content_hash_mismatch"

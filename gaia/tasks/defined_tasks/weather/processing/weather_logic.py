@@ -1261,16 +1261,48 @@ async def verify_miner_response(
                 f"Critical information missing after token request: {err_details}"
             )
 
+        # Freeze manifest hash and URL after first set. If a miner reports a different
+        # manifest hash or URL later, treat it as a verification error.
+        try:
+            existing_rec = await task_instance.db_manager.fetch_one(
+                "SELECT kerchunk_json_url, verification_hash_claimed FROM weather_miner_responses WHERE id = :id",
+                {"id": response_id},
+            )
+        except Exception:
+            existing_rec = None
+
+        if existing_rec:
+            existing_hash = existing_rec.get("verification_hash_claimed")
+            existing_url = existing_rec.get("kerchunk_json_url")
+            if existing_hash and existing_hash != claimed_manifest_content_hash:
+                logger.error(
+                    f"[VerifyLogic, Resp {response_id}] Manifest hash changed after submission. Stored={existing_hash[:10]}..., New={claimed_manifest_content_hash[:10]}..."
+                )
+                await task_instance.db_manager.execute(
+                    "UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Manifest hash changed after submission' WHERE id = :id",
+                    {"id": response_id},
+                )
+                return
+            if existing_url and existing_url != zarr_store_url:
+                logger.error(
+                    f"[VerifyLogic, Resp {response_id}] Zarr URL changed after submission. Stored={existing_url}, New={zarr_store_url}"
+                )
+                await task_instance.db_manager.execute(
+                    "UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Zarr URL changed after submission' WHERE id = :id",
+                    {"id": response_id},
+                )
+                return
+
+        # Set URL if not set yet; do NOT overwrite stored manifest hash here
         await task_instance.db_manager.execute(
             """
             UPDATE weather_miner_responses
-            SET kerchunk_json_url = :url, verification_hash_claimed = :hash, status = 'verifying_manifest'
+            SET kerchunk_json_url = COALESCE(kerchunk_json_url, :url), status = 'verifying_manifest'
             WHERE id = :id
         """,
             {
                 "id": response_id,
                 "url": zarr_store_url,
-                "hash": claimed_manifest_content_hash,
             },
         )
 
