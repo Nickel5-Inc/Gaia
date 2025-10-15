@@ -222,10 +222,16 @@ class WeatherStatsManager:
                             stats_data[col_name] = s_val
                         completeness_count += 1
                         total_score += s_val
-                # Calculate combined score and completeness (complete horizon is 10 steps)
+                # FIXED: Calculate combined score and completeness properly
                 max_timesteps = 10
                 stats_data["era5_completeness"] = (completeness_count / max_timesteps) if max_timesteps else 0.0
-                stats_data["era5_combined_score"] = (total_score / max_timesteps) if max_timesteps else 0.0
+                
+                # FIXED: Only divide by actual scored lead times, not fixed 10.0
+                # This prevents incomplete miners from getting unfairly penalized
+                if completeness_count > 0:
+                    stats_data["era5_combined_score"] = (total_score / completeness_count)
+                else:
+                    stats_data["era5_combined_score"] = 0.0
             
             # Add hosting metrics
             if hosting_status:
@@ -386,7 +392,34 @@ class WeatherStatsManager:
                          ELSE 0 END AS host_reliability_ratio,
                     AVG(wfs.hosting_latency_ms) AS avg_hosting_latency_ms,
                     AVG(wfs.forecast_score_initial) AS avg_day1_score,
-                    AVG((COALESCE(wfs.era5_score_24h,0)+COALESCE(wfs.era5_score_48h,0)+COALESCE(wfs.era5_score_72h,0)+COALESCE(wfs.era5_score_96h,0)+COALESCE(wfs.era5_score_120h,0)+COALESCE(wfs.era5_score_144h,0)+COALESCE(wfs.era5_score_168h,0)+COALESCE(wfs.era5_score_192h,0)+COALESCE(wfs.era5_score_216h,0)+COALESCE(wfs.era5_score_240h,0))/10.0) AS avg_era5_score,
+                    -- FIXED: Calculate ERA5 score properly - only divide by actual scored lead times
+                    -- This prevents incomplete miners from getting unfairly penalized in aggregation
+                    AVG(
+                        CASE 
+                            WHEN (CASE WHEN wfs.era5_score_24h IS NOT NULL THEN 1 ELSE 0 END + 
+                                  CASE WHEN wfs.era5_score_48h IS NOT NULL THEN 1 ELSE 0 END + 
+                                  CASE WHEN wfs.era5_score_72h IS NOT NULL THEN 1 ELSE 0 END + 
+                                  CASE WHEN wfs.era5_score_96h IS NOT NULL THEN 1 ELSE 0 END + 
+                                  CASE WHEN wfs.era5_score_120h IS NOT NULL THEN 1 ELSE 0 END + 
+                                  CASE WHEN wfs.era5_score_144h IS NOT NULL THEN 1 ELSE 0 END + 
+                                  CASE WHEN wfs.era5_score_168h IS NOT NULL THEN 1 ELSE 0 END + 
+                                  CASE WHEN wfs.era5_score_192h IS NOT NULL THEN 1 ELSE 0 END + 
+                                  CASE WHEN wfs.era5_score_216h IS NOT NULL THEN 1 ELSE 0 END + 
+                                  CASE WHEN wfs.era5_score_240h IS NOT NULL THEN 1 ELSE 0 END) > 0
+                            THEN (COALESCE(wfs.era5_score_24h,0)+COALESCE(wfs.era5_score_48h,0)+COALESCE(wfs.era5_score_72h,0)+COALESCE(wfs.era5_score_96h,0)+COALESCE(wfs.era5_score_120h,0)+COALESCE(wfs.era5_score_144h,0)+COALESCE(wfs.era5_score_168h,0)+COALESCE(wfs.era5_score_192h,0)+COALESCE(wfs.era5_score_216h,0)+COALESCE(wfs.era5_score_240h,0)) / 
+                                 NULLIF((CASE WHEN wfs.era5_score_24h IS NOT NULL THEN 1 ELSE 0 END + 
+                                        CASE WHEN wfs.era5_score_48h IS NOT NULL THEN 1 ELSE 0 END + 
+                                        CASE WHEN wfs.era5_score_72h IS NOT NULL THEN 1 ELSE 0 END + 
+                                        CASE WHEN wfs.era5_score_96h IS NOT NULL THEN 1 ELSE 0 END + 
+                                        CASE WHEN wfs.era5_score_120h IS NOT NULL THEN 1 ELSE 0 END + 
+                                        CASE WHEN wfs.era5_score_144h IS NOT NULL THEN 1 ELSE 0 END + 
+                                        CASE WHEN wfs.era5_score_168h IS NOT NULL THEN 1 ELSE 0 END + 
+                                        CASE WHEN wfs.era5_score_192h IS NOT NULL THEN 1 ELSE 0 END + 
+                                        CASE WHEN wfs.era5_score_216h IS NOT NULL THEN 1 ELSE 0 END + 
+                                        CASE WHEN wfs.era5_score_240h IS NOT NULL THEN 1 ELSE 0 END), 0)
+                            ELSE 0.0
+                        END
+                    ) AS avg_era5_score,
                     AVG((CASE WHEN wfs.era5_score_24h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_48h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_72h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_96h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_120h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_144h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_168h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_192h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_216h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_240h IS NOT NULL THEN 1 ELSE 0 END)/10.0) AS avg_era5_completeness,
                     MAX(wfs.era5_combined_score) AS best_forecast_score,
                     MIN(wfs.era5_combined_score) AS worst_forecast_score,

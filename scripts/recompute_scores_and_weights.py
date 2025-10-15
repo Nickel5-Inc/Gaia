@@ -43,7 +43,11 @@ async def recompute_overall_for_run(db: ValidatorDatabaseManager, run_id: int) -
             r.get("era5_score_216h"), r.get("era5_score_240h"),
         ]
         vals = [float(x) for x in leads if x is not None]
-        era5_norm_avg = (sum(vals) / 10.0) if vals else 0.0
+        # FIXED: Only divide by actual scored lead times, not fixed 10.0
+        # This prevents incomplete miners from getting unfairly penalized
+        actual_scored_leads = len(vals)
+        era5_norm_avg = (sum(vals) / actual_scored_leads) if actual_scored_leads > 0 else 0.0
+        
         day1_pass = 1.0 if (day1 is not None and float(day1) >= qc_threshold) else 0.0
         overall = We * era5_norm_avg + Wd * day1_pass
         await db.execute(

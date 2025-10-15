@@ -3650,12 +3650,17 @@ async def _calculate_and_store_aggregated_era5_score(
         era5_avg_acc = float(avg_comp["avg_acc"]) if avg_comp and avg_comp["avg_acc"] is not None else None
         era5_avg_skill = float(avg_comp["avg_skill"]) if avg_comp and avg_comp["avg_skill"] is not None else None
 
-        # Aggregate normalized ERA5 with completeness penalty: divide by full expected horizon
-        # This prevents partially-complete forecasts from appearing better due to fewer (shorter) leads
+        # FIXED: Aggregate normalized ERA5 with proper completeness handling
+        # Only divide by actual scored lead times, not fixed expected horizon
         expected_leads = task_instance.config.get("final_scoring_lead_hours", [24,48,72,96,120,144,168,192,216,240])
         available_leads = [h for h in expected_leads if h in normalized_by_lead]
         era5_norm_total = sum(normalized_by_lead[h] for h in available_leads)
-        era5_norm_avg = (era5_norm_total / float(len(expected_leads))) if expected_leads else 0.0
+        
+        # Calculate completeness ratio
+        completeness_ratio = len(available_leads) / float(len(expected_leads)) if expected_leads else 0.0
+        
+        # FIXED: Only divide by actual scored lead times, not expected total
+        era5_norm_avg = (era5_norm_total / len(available_leads)) if available_leads else 0.0
 
         # Binary Day1 QC: day1_pass = 1 if day1_overall >= threshold else 0
         qc_threshold = float(task_instance.config.get("day1_binary_threshold", 0.1))
