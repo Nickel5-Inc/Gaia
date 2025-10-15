@@ -48,6 +48,91 @@ from ..weather_scoring.metrics import (
 from gaia.utils.custom_logger import get_logger
 from ..weather_scoring.scoring import VARIABLE_WEIGHTS
 import sqlalchemy as sa
+
+
+def detect_cheating_conservative(miner_data, truth_data, rmse_score, acc_score, lead_hours, variable_name, all_lead_scores=None):
+    """Conservative cheating detection that protects good models."""
+    
+    detection_signals = []
+    confidence = 0.0
+    
+    # Signal 1: Near-perfect exact matches
+    exact_match_ratio = np.mean(miner_data == truth_data)
+    if exact_match_ratio > 0.99:
+        detection_signals.append(f"Near-perfect match: {exact_match_ratio:.3f} > 0.99")
+        confidence += 0.9
+    
+    # Signal 2: Impossibly good RMSE (FIXED - much more realistic)
+    if rmse_score < 0.1:  # This will catch obvious cheaters with 0.01, 0.05, etc.
+        detection_signals.append(f"RMSE impossibly low: {rmse_score:.3f} < 0.1 (Aurora baseline ~0.5-2.0)")
+        confidence += 0.8
+    
+    # Signal 3: Impossibly high ACC
+    if acc_score > 0.9995:
+        detection_signals.append(f"ACC impossibly high: {acc_score:.6f}")
+        confidence += 0.8
+    
+    # Signal 4: Suspiciously good performance (sophisticated cheating detection)
+    # Only flag if BOTH RMSE is impossibly low AND ACC is extremely high
+    if rmse_score < 0.2 and acc_score > 0.99:
+        detection_signals.append(f"Suspiciously good: RMSE {rmse_score:.3f} < 0.2 AND ACC {acc_score:.3f} > 0.99")
+        confidence += 0.6
+    
+    # Signal 5: Lead-time aware detection (longer leads should have worse scores)
+    if lead_hours > 72 and rmse_score < 0.2 and acc_score > 0.95:
+        detection_signals.append(f"Long lead ({lead_hours}h) suspiciously good: RMSE {rmse_score:.3f} < 0.2, ACC {acc_score:.3f} > 0.95")
+        confidence += 0.5
+    
+    # Signal 6: Statistical distribution analysis (catch ERA5 + noise)
+    if exact_match_ratio > 0.95 and exact_match_ratio < 0.99:
+        # Check if the non-matching points are just small noise
+        diff_data = np.abs(miner_data - truth_data)
+        noise_threshold = np.std(truth_data) * 0.02  # 2% of data variance
+        if np.mean(diff_data[diff_data > 0]) < noise_threshold:
+            detection_signals.append("Data appears to be ERA5 with minimal noise")
+            confidence += 0.7
+    
+    # Signal 7: Lead-time degradation validation (NEW - catch ERA5 across all leads)
+    if all_lead_scores is not None and len(all_lead_scores) >= 2:
+        # Check if ACC scores don't degrade properly with lead time
+        lead_hours_sorted = sorted(all_lead_scores.keys())
+        acc_scores_sorted = [all_lead_scores[h] for h in lead_hours_sorted]
+        
+        # Calculate expected degradation pattern
+        # Short leads (6-24h): ACC should be 0.85-0.95
+        # Medium leads (48-72h): ACC should be 0.70-0.85  
+        # Long leads (96-192h): ACC should be 0.50-0.70
+        
+        suspicious_degradation = False
+        degradation_signals = []
+        
+        for i, (lead_h, acc_val) in enumerate(zip(lead_hours_sorted, acc_scores_sorted)):
+            if lead_h <= 24 and acc_val > 0.98:
+                degradation_signals.append(f"Short lead {lead_h}h: ACC {acc_val:.3f} > 0.98 (suspiciously high)")
+                suspicious_degradation = True
+            elif 24 < lead_h <= 72 and acc_val > 0.90:
+                degradation_signals.append(f"Medium lead {lead_h}h: ACC {acc_val:.3f} > 0.90 (suspiciously high)")
+                suspicious_degradation = True
+            elif lead_h > 72 and acc_val > 0.80:
+                degradation_signals.append(f"Long lead {lead_h}h: ACC {acc_val:.3f} > 0.80 (suspiciously high)")
+                suspicious_degradation = True
+        
+        # Check for lack of degradation (all leads too similar)
+        if len(acc_scores_sorted) >= 3:
+            acc_range = max(acc_scores_sorted) - min(acc_scores_sorted)
+            if acc_range < 0.05 and min(acc_scores_sorted) > 0.90:
+                degradation_signals.append(f"All leads too similar: ACC range {acc_range:.3f} < 0.05, min {min(acc_scores_sorted):.3f} > 0.90")
+                suspicious_degradation = True
+        
+        if suspicious_degradation:
+            detection_signals.append(f"Lead-time degradation failure: {'; '.join(degradation_signals)}")
+            confidence += 0.8
+    
+    # Decision: Flag if high confidence or multiple signals
+    if confidence >= 0.8 or len(detection_signals) >= 2:
+        return True, f"Cheating detected: {'; '.join(detection_signals)} (confidence: {confidence:.2f})"
+    
+    return False, "Scores appear legitimate"
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
 
 logger = get_logger(__name__)
@@ -2937,6 +3022,26 @@ async def calculate_era5_miner_score(
                             raise ValueError("[FinalScore] No per-level ACC scores to aggregate")
                         current_metrics["acc"] = acc_val
                         
+                        # CHEATING DETECTION: Check for suspicious scores (pressure level variables)
+                        is_cheating, cheating_reason = detect_cheating_conservative(
+                            miner_var_da_aligned.values, 
+                            truth_var_da_final.values, 
+                            current_metrics["rmse"], 
+                            acc_val, 
+                            lead_hours, 
+                            var_name,
+                            all_lead_scores=None  # TODO: Implement lead-time degradation validation
+                        )
+                        
+                        if is_cheating:
+                            logger.error(f"[CHEATING DETECTED] Miner {miner_hotkey}: {cheating_reason}")
+                            logger.error(f"[CHEATING DETECTED] Original scores - RMSE: {current_metrics['rmse']:.6f}, ACC: {acc_val:.6f}")
+                            current_metrics["quarantine_flag"] = True
+                            current_metrics["quarantine_reason"] = cheating_reason
+                            # EXCLUDE cheater from scoring - return False to skip this miner entirely
+                            logger.error(f"[CHEATING DETECTED] EXCLUDING miner {miner_hotkey} from scoring")
+                            return False
+                        
                         # Update component scores with per-level ACC
                         for component_score in component_scores_for_this_var:
                             pressure_level = component_score['pressure_level']
@@ -2950,6 +3055,26 @@ async def calculate_era5_miner_score(
                             mse_weights,
                         )
                         current_metrics["acc"] = acc_val
+                        
+                        # CHEATING DETECTION: Check for suspicious scores (surface variables)
+                        is_cheating, cheating_reason = detect_cheating_conservative(
+                            miner_var_da_aligned.values, 
+                            truth_var_da_final.values, 
+                            current_metrics["rmse"], 
+                            acc_val, 
+                            lead_hours, 
+                            var_name,
+                            all_lead_scores=None  # TODO: Implement lead-time degradation validation
+                        )
+                        
+                        if is_cheating:
+                            logger.error(f"[CHEATING DETECTED] Miner {miner_hotkey}: {cheating_reason}")
+                            logger.error(f"[CHEATING DETECTED] Original scores - RMSE: {current_metrics['rmse']:.6f}, ACC: {acc_val:.6f}")
+                            current_metrics["quarantine_flag"] = True
+                            current_metrics["quarantine_reason"] = cheating_reason
+                            # EXCLUDE cheater from scoring - return False to skip this miner entirely
+                            logger.error(f"[CHEATING DETECTED] EXCLUDING miner {miner_hotkey} from scoring")
+                            return False
                         
                         # Update component score with ACC
                         for component_score in component_scores_for_this_var:
