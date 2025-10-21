@@ -152,7 +152,6 @@ import fiber.chain.chain_utils
 
 fiber.chain.chain_utils.query_substrate = patched_query_substrate
 from fiber.encrypted.validator import client as vali_client, handshake
-from fiber.encrypted.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
 from fiber.chain.interface import get_substrate
 from substrateinterface import SubstrateInterface
