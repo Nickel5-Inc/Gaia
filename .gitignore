@@ -67,3 +67,7 @@ weight_trace_runtime.log
 clim_cache/*
 ploints.md
 WEATHER_DRYS.md
+analyze_and_purge_cheaters.py
+enhanced_cheat_detection.py
+purge_specific_miners.py
+scripts/logs/*
