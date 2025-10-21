@@ -1640,6 +1640,15 @@ async def calculate_era5_miner_score(
     logger.info(
         f"[FinalScore] Starting ERA5 scoring for miner {miner_hotkey} (UID: {miner_uid}, Job: {job_id}, Run: {run_id}, RespID: {response_id})"
     )
+    # Log strict flags for transparency
+    try:
+        strict_time_hours = task_instance.config.get("era5_strict_time_tolerance_hours", 0)
+        strict_level_hpa = task_instance.config.get("era5_strict_level_tolerance_hpa", 0)
+        logger.info(
+            f"[FinalScore] Strict settings: time_tolerance_hours={strict_time_hours}, level_tolerance_hpa={strict_level_hpa}"
+        )
+    except Exception:
+        pass
 
     gfs_init_time_of_run = await get_run_gfs_init_time(task_instance, run_id)
     if gfs_init_time_of_run is None:
@@ -1846,8 +1855,8 @@ async def calculate_era5_miner_score(
                         await task_instance.db_manager.execute(
                             """
                             UPDATE weather_miner_responses
-                            SET kerchunk_json_retrieved = COALESCE(kerchunk_json_retrieved, :manifest::jsonb),
-                                frozen_manifest_files = COALESCE(frozen_manifest_files, :files::jsonb)
+                            SET kerchunk_json_retrieved = COALESCE(kerchunk_json_retrieved, CAST(:manifest AS jsonb)),
+                                frozen_manifest_files = COALESCE(frozen_manifest_files, CAST(:files AS jsonb))
                             WHERE id = :rid
                             """,
                             {
@@ -2092,18 +2101,30 @@ async def calculate_era5_miner_score(
                         else pd.Timestamp(era5_time_item).tz_convert("UTC")
                     )
 
+                # Strict time tolerance (seconds). Default 0 = exact required.
+                strict_time_tol_sec_cfg = task_instance.config.get(
+                    "era5_strict_time_tolerance_hours", 0
+                )
+                try:
+                    strict_time_tol_sec = int(float(strict_time_tol_sec_cfg) * 3600)
+                except Exception:
+                    strict_time_tol_sec = 0
                 time_check_failed = False
-                if abs((miner_time_actual_utc - valid_time_dt).total_seconds()) > 3600:
+                if abs((miner_time_actual_utc - valid_time_dt).total_seconds()) > strict_time_tol_sec:
                     logger.warning(
                         f"[FinalScore] Miner {miner_hotkey}: Selected miner forecast time {miner_time_actual_utc} "
-                        f"too far from target {valid_time_dt}. Skipping this valid_time."
+                        f"too far from target {valid_time_dt} (tolerance: {strict_time_tol_sec/3600:.1f}h). Skipping this valid_time."
                     )
                     time_check_failed = True
 
-                # Use more lenient tolerance for ERA5 in test mode where data availability may be limited
-                era5_time_tolerance = (
-                    21600  # 6 hours for ERA5 (more lenient for test mode)
+                # Strict ERA5 truth time tolerance (seconds). Default 0 = exact required.
+                era5_time_tol_cfg = task_instance.config.get(
+                    "era5_strict_time_tolerance_hours", 0
                 )
+                try:
+                    era5_time_tolerance = int(float(era5_time_tol_cfg) * 3600)
+                except Exception:
+                    era5_time_tolerance = 0
                 if (
                     not time_check_failed
                     and abs((era5_time_actual_utc - valid_time_dt).total_seconds())
@@ -2341,12 +2362,50 @@ async def calculate_era5_miner_score(
                                     return False
                                 break
                         else:
+                            # Missing-variable policy: zero contribution for this var/time
                             logger.error(
-                                f"[FinalScore] No suitable miner variable found for '{var_name}'. Available: {list(miner_forecast_lead_slice.data_vars)}"
+                                f"[FinalScore] No suitable miner variable found for '{var_name}'. Available: {list(miner_forecast_lead_slice.data_vars)}. Applying missing-variable policy (zero contribution)."
                             )
-                            raise KeyError(
-                                f"Variable {var_name} not available in miner dataset"
-                            )
+                            from ..weather_scoring.scoring import VARIABLE_WEIGHTS
+                            base_variable_weight = VARIABLE_WEIGHTS.get(var_name, 0.0)
+                            component_scores_for_this_var = []
+                            pl_list = [None] if (var_level is None or var_level != 'all') else [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
+                            for pl in pl_list:
+                                component_scores_for_this_var.append({
+                                    "run_id": run_id,
+                                    "response_id": response_id,
+                                    "miner_uid": miner_uid,
+                                    "miner_hotkey": miner_hotkey,
+                                    "score_type": f"era5_{var_key}_{int(lead_hours)}h",
+                                    "lead_hours": int(lead_hours),
+                                    "valid_time_utc": valid_time_dt,
+                                    "variable_name": var_name,
+                                    "pressure_level": pl,
+                                    "rmse": 0.0,
+                                    "mse": 0.0,
+                                    "acc": 0.0,
+                                    "skill_score": 0.0,
+                                    "bias": 0.0,
+                                    "mae": 0.0,
+                                    "climatology_check_passed": True,
+                                    "pattern_correlation": 0.0,
+                                    "pattern_correlation_passed": True,
+                                    "clone_penalty": 0.0,
+                                    "quality_penalty": 0.0,
+                                    "weighted_score": 0.0,
+                                    "variable_weight": base_variable_weight / (len(pl_list) if pl_list and pl_list[0] is not None else 1),
+                                    "calculation_duration_ms": 0,
+                                })
+                            all_component_scores.extend(component_scores_for_this_var)
+                            current_metrics = {"rmse": 0.0, "acc": 0.0, "skill": 0.0}
+                            db_metric_row = {
+                                **db_metric_row_base,
+                                "metrics": current_metrics,
+                                "score_type": f"era5_zero_missing_{var_key}_{int(lead_hours)}h",
+                                "score": 0.0,
+                            }
+                            all_metrics_for_db.append(db_metric_row)
+                            continue
                     
                     # CRITICAL FIX: Standardize dimension names across all datasets before processing
                     def standardize_pressure_dims(data_array, target_dim_name="pressure_level"):
@@ -2370,7 +2429,7 @@ async def calculate_era5_miner_score(
                     logger.info(f"  Selected miner variable: '{miner_var_name}'")
                     logger.info(f"  Selected ERA5 variable: '{era5_var_name}'")
                     
-                    # Check ERA5 variable attributes for unit/name verification
+                    # Check ERA5 variable attributes for identity verification
                     era5_var = era5_truth_lead_slice[era5_var_name]
                     logger.info(f"  ERA5 variable attributes: {dict(era5_var.attrs)}")
                     
@@ -2378,112 +2437,204 @@ async def calculate_era5_miner_score(
                     miner_var = miner_forecast_lead_slice[miner_var_name]
                     logger.info(f"  Miner variable attributes: {dict(miner_var.attrs)}")
 
-                    # Add detailed diagnostics for potential unit mismatches
+                    # Strict variable identity checks (paramId/standard_name) when available
+                    expected_param_id = {
+                        "2t": 167,
+                        "10u": 165,
+                        "10v": 166,
+                        "msl": 151,
+                        "z": 129,
+                        "t": 130,
+                        "u": 131,
+                        "v": 132,
+                        "q": 133,
+                    }.get(var_name)
+                    expected_standard_name = {
+                        "2t": "t2m",
+                        "msl": "msl",
+                    }.get(var_name)
+
+                    def _get_param_id(da):
+                        try:
+                            v = da.attrs.get("GRIB_paramId")
+                            return int(v) if v is not None else None
+                        except Exception:
+                            return None
+
+                    def _get_standard_name(da):
+                        try:
+                            return da.attrs.get("GRIB_cfVarName") or da.attrs.get("standard_name")
+                        except Exception:
+                            return None
+
+                    if expected_param_id is not None:
+                        miner_pid = _get_param_id(miner_var)
+                        era5_pid = _get_param_id(era5_var)
+                        if miner_pid is not None and miner_pid != expected_param_id:
+                            logger.error(f"[FinalScore] paramId mismatch for {var_key}: miner={miner_pid}, expected={expected_param_id}. Zeroing contribution.")
+                            # Zero contribution and continue
+                            from ..weather_scoring.scoring import VARIABLE_WEIGHTS
+                            base_variable_weight = VARIABLE_WEIGHTS.get(var_name, 0.0)
+                            component_scores_for_this_var = [{
+                                "run_id": run_id,
+                                "response_id": response_id,
+                                "miner_uid": miner_uid,
+                                "miner_hotkey": miner_hotkey,
+                                "score_type": f"era5_{var_key}_{int(lead_hours)}h",
+                                "lead_hours": int(lead_hours),
+                                "valid_time_utc": valid_time_dt,
+                                "variable_name": var_name,
+                                "pressure_level": None if var_level is None or var_level == 'all' else int(var_level),
+                                "rmse": 0.0,
+                                "mse": 0.0,
+                                "acc": 0.0,
+                                "skill_score": 0.0,
+                                "bias": 0.0,
+                                "mae": 0.0,
+                                "climatology_check_passed": True,
+                                "pattern_correlation": 0.0,
+                                "pattern_correlation_passed": True,
+                                "clone_penalty": 0.0,
+                                "quality_penalty": 0.0,
+                                "weighted_score": 0.0,
+                                "variable_weight": base_variable_weight,
+                                "calculation_duration_ms": 0,
+                            }]
+                            all_component_scores.extend(component_scores_for_this_var)
+                            db_metric_row = {**db_metric_row_base, "metrics": {"rmse": 0.0, "acc": 0.0, "skill": 0.0}, "score_type": f"era5_zero_paramid_{var_key}_{int(lead_hours)}h", "score": 0.0}
+                            all_metrics_for_db.append(db_metric_row)
+                            continue
+                        if era5_pid is not None and era5_pid != expected_param_id:
+                            logger.error(f"[FinalScore] ERA5 paramId mismatch for {var_key}: era5={era5_pid}, expected={expected_param_id}. Failing timestep.")
+                            return False
+
+                    if expected_standard_name is not None:
+                        miner_sname = _get_standard_name(miner_var)
+                        era5_sname = _get_standard_name(era5_var)
+                        if miner_sname and miner_sname.lower() != expected_standard_name.lower():
+                            logger.error(f"[FinalScore] standard_name mismatch for {var_key}: miner={miner_sname}, expected={expected_standard_name}. Zeroing contribution.")
+                            from ..weather_scoring.scoring import VARIABLE_WEIGHTS
+                            base_variable_weight = VARIABLE_WEIGHTS.get(var_name, 0.0)
+                            component_scores_for_this_var = [{
+                                "run_id": run_id,
+                                "response_id": response_id,
+                                "miner_uid": miner_uid,
+                                "miner_hotkey": miner_hotkey,
+                                "score_type": f"era5_{var_key}_{int(lead_hours)}h",
+                                "lead_hours": int(lead_hours),
+                                "valid_time_utc": valid_time_dt,
+                                "variable_name": var_name,
+                                "pressure_level": None if var_level is None or var_level == 'all' else int(var_level),
+                                "rmse": 0.0,
+                                "mse": 0.0,
+                                "acc": 0.0,
+                                "skill_score": 0.0,
+                                "bias": 0.0,
+                                "mae": 0.0,
+                                "climatology_check_passed": True,
+                                "pattern_correlation": 0.0,
+                                "pattern_correlation_passed": True,
+                                "clone_penalty": 0.0,
+                                "quality_penalty": 0.0,
+                                "weighted_score": 0.0,
+                                "variable_weight": base_variable_weight,
+                                "calculation_duration_ms": 0,
+                            }]
+                            all_component_scores.extend(component_scores_for_this_var)
+                            db_metric_row = {**db_metric_row_base, "metrics": {"rmse": 0.0, "acc": 0.0, "skill": 0.0}, "score_type": f"era5_zero_sname_{var_key}_{int(lead_hours)}h", "score": 0.0}
+                            all_metrics_for_db.append(db_metric_row)
+                            continue
+                        if era5_sname and era5_sname.lower() != expected_standard_name.lower():
+                            logger.error(f"[FinalScore] ERA5 standard_name mismatch for {var_key}: era5={era5_sname}, expected={expected_standard_name}. Failing timestep.")
+                            return False
+
+                    # Minimal raw diagnostics
                     logger.info(
-                        f"[FinalScore] RAW DATA DIAGNOSTICS for {var_key} at {valid_time_dt}:"
+                        f"[FinalScore] RAW DATA DIAGNOSTICS for {var_key} at {valid_time_dt} (units miner={miner_var_da_unaligned.attrs.get('units')}, truth={truth_var_da_unaligned.attrs.get('units')})"
                     )
 
-                    # Log data ranges before any processing
-                    miner_min, miner_max, miner_mean = (
-                        float(miner_var_da_unaligned.min()),
-                        float(miner_var_da_unaligned.max()),
-                        float(miner_var_da_unaligned.mean()),
-                    )
-                    truth_min, truth_max, truth_mean = (
-                        float(truth_var_da_unaligned.min()),
-                        float(truth_var_da_unaligned.max()),
-                        float(truth_var_da_unaligned.mean()),
-                    )
+                    # Strict unit validation (canonicalization, no conversions)
+                    expected_units = {
+                        "2t": "K",
+                        "10u": "m s-1",
+                        "10v": "m s-1",
+                        "msl": "Pa",
+                        "z": "m2 s-2",
+                        "t": "K",
+                        "u": "m s-1",
+                        "v": "m s-1",
+                        "q": None,
+                    }
+                    unit_expected = expected_units.get(var_name)
+                    miner_units_raw = miner_var_da_unaligned.attrs.get("units")
+                    truth_units_raw = truth_var_da_unaligned.attrs.get("units")
 
-                    logger.info(
-                        f"[FinalScore] Miner {var_key}: range=[{miner_min:.1f}, {miner_max:.1f}], mean={miner_mean:.1f}, units={miner_var_da_unaligned.attrs.get('units', 'unknown')}"
-                    )
-                    logger.info(
-                        f"[FinalScore] ERA5  {var_key}: range=[{truth_min:.1f}, {truth_max:.1f}], mean={truth_mean:.1f}, units={truth_var_da_unaligned.attrs.get('units', 'unknown')}"
-                    )
+                    def _canon(u):
+                        if not u:
+                            return None
+                        s = str(u).strip().lower()
+                        if s in ("k", "kelvin"):
+                            return "k"
+                        if s in ("pa", "pascal", "pascals"):
+                            return "pa"
+                        if s in ("m/s", "m s-1", "m s**-1", "m s^-1"):
+                            return "m s-1"
+                        if s in ("m2 s-2", "m**2 s**-2", "m^2 s^-2", "m^2 s-2"):
+                            return "m2 s-2"
+                        return s
 
-                    # Check for potential unit mismatch indicators
-                    if var_name == "z" and var_level == 500:
-                        # For z500, geopotential should be ~49000-58000 m²/s²
-                        # If it's geopotential height, it would be ~5000-6000 m
-                        miner_ratio = (
-                            miner_mean / 9.80665
-                        )  # If miner is geopotential, this ratio should be ~5000-6000
-                        truth_ratio = truth_mean / 9.80665
-                        logger.info(
-                            f"[FinalScore] z500 UNIT CHECK - If geopotential (m²/s²): miner_mean/g={miner_ratio:.1f}m, truth_mean/g={truth_ratio:.1f}m"
-                        )
+                    allow_missing_miner_units = bool(task_instance.config.get("units_allow_missing_miner_attr", True))
+                    canon_expected = _canon(unit_expected) if unit_expected else None
+                    canon_truth = _canon(truth_units_raw)
+                    canon_miner = _canon(miner_units_raw)
 
-                        if (
-                            miner_mean < 10000
-                        ):  # Much smaller than expected geopotential
-                            logger.warning(
-                                f"[FinalScore] POTENTIAL UNIT MISMATCH: Miner z500 mean ({miner_mean:.1f}) suggests geopotential height (m) rather than geopotential (m²/s²)"
+                    if canon_expected is not None:
+                        truth_ok = (canon_truth == canon_expected) or (canon_truth is None)
+                        miner_ok = (canon_miner == canon_expected) or (allow_missing_miner_units and canon_miner is None)
+                        if not (truth_ok and miner_ok):
+                            logger.error(
+                                f"[FinalScore] Unit validation failed for {var_key}: miner_units={miner_units_raw}, truth_units={truth_units_raw}, expected={unit_expected}. Zeroing contribution."
                             )
-                        elif truth_mean > 40000 and miner_mean > 40000:
-                            logger.info(
-                                f"[FinalScore] Unit check OK: Both miner and truth z500 appear to be geopotential (m²/s²)"
-                            )
-
-                    elif var_name == "2t":
-                        # Temperature should be ~200-320 K
-                        if miner_mean < 200 or miner_mean > 350:
-                            logger.warning(
-                                f"[FinalScore] POTENTIAL UNIT ISSUE: Miner 2t mean ({miner_mean:.1f}) outside expected range for Kelvin"
-                            )
-
-                    elif var_name == "msl":
-                        # Mean sea level pressure should be ~90000-110000 Pa
-                        if miner_mean < 50000 or miner_mean > 150000:
-                            logger.warning(
-                                f"[FinalScore] POTENTIAL UNIT ISSUE: Miner msl mean ({miner_mean:.1f}) outside expected range for Pa"
-                            )
-
-                    # AUTOMATIC UNIT CONVERSION: Convert geopotential height to geopotential if needed
-                    if var_name == "z" and miner_mean < 10000 and truth_mean > 40000:
-                        logger.warning(
-                            f"[FinalScore] AUTOMATIC UNIT CONVERSION: Converting miner z from geopotential height (m) to geopotential (m²/s²)"
-                        )
-                        miner_var_da_unaligned = miner_var_da_unaligned * 9.80665
-                        miner_var_da_unaligned.attrs["units"] = "m2 s-2"
-                        miner_var_da_unaligned.attrs["long_name"] = (
-                            "Geopotential (auto-converted from height)"
-                        )
-                        logger.info(
-                            f"[FinalScore] After conversion: miner z range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}"
-                        )
-
-                    # Check for temperature unit conversions (Celsius to Kelvin)
-                    elif (
-                        var_name in ["2t", "t"]
-                        and miner_mean < 100
-                        and truth_mean > 200
-                    ):
-                        logger.warning(
-                            f"[FinalScore] AUTOMATIC UNIT CONVERSION: Converting miner {var_name} from Celsius to Kelvin"
-                        )
-                        miner_var_da_unaligned = miner_var_da_unaligned + 273.15
-                        miner_var_da_unaligned.attrs["units"] = "K"
-                        miner_var_da_unaligned.attrs["long_name"] = (
-                            f'{miner_var_da_unaligned.attrs.get("long_name", var_name)} (auto-converted from Celsius)'
-                        )
-                        logger.info(
-                            f"[FinalScore] After conversion: miner {var_name} range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}"
-                        )
-
-                    # Check for pressure unit conversions (hPa to Pa)
-                    elif var_name == "msl" and miner_mean < 2000 and truth_mean > 50000:
-                        logger.warning(
-                            f"[FinalScore] AUTOMATIC UNIT CONVERSION: Converting miner msl from hPa to Pa"
-                        )
-                        miner_var_da_unaligned = miner_var_da_unaligned * 100.0
-                        miner_var_da_unaligned.attrs["units"] = "Pa"
-                        miner_var_da_unaligned.attrs["long_name"] = (
-                            "Mean sea level pressure (auto-converted from hPa)"
-                        )
-                        logger.info(
-                            f"[FinalScore] After conversion: miner msl range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}"
-                        )
+                            from ..weather_scoring.scoring import VARIABLE_WEIGHTS
+                            base_variable_weight = VARIABLE_WEIGHTS.get(var_name, 0.0)
+                            component_scores_for_this_var = []
+                            pl_list = [None] if (var_level is None or var_level != 'all') else [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
+                            for pl in pl_list:
+                                component_scores_for_this_var.append({
+                                    "run_id": run_id,
+                                    "response_id": response_id,
+                                    "miner_uid": miner_uid,
+                                    "miner_hotkey": miner_hotkey,
+                                    "score_type": f"era5_{var_key}_{int(lead_hours)}h",
+                                    "lead_hours": int(lead_hours),
+                                    "valid_time_utc": valid_time_dt,
+                                    "variable_name": var_name,
+                                    "pressure_level": pl,
+                                    "rmse": 0.0,
+                                    "mse": 0.0,
+                                    "acc": 0.0,
+                                    "skill_score": 0.0,
+                                    "bias": 0.0,
+                                    "mae": 0.0,
+                                    "climatology_check_passed": True,
+                                    "pattern_correlation": 0.0,
+                                    "pattern_correlation_passed": True,
+                                    "clone_penalty": 0.0,
+                                    "quality_penalty": 0.0,
+                                    "weighted_score": 0.0,
+                                    "variable_weight": base_variable_weight / (len(pl_list) if pl_list and pl_list[0] is not None else 1),
+                                    "calculation_duration_ms": 0,
+                                })
+                            all_component_scores.extend(component_scores_for_this_var)
+                            current_metrics = {"rmse": 0.0, "acc": 0.0, "skill": 0.0}
+                            db_metric_row = {
+                                **db_metric_row_base,
+                                "metrics": current_metrics,
+                                "score_type": f"era5_zero_units_{var_key}_{int(lead_hours)}h",
+                                "score": 0.0,
+                            }
+                            all_metrics_for_db.append(db_metric_row)
+                            continue
 
                     clim_dayofyear = pd.Timestamp(valid_time_dt).dayofyear
                     clim_hour_rounded = (valid_time_dt.hour // 6) * 6
@@ -2497,6 +2648,15 @@ async def calculate_era5_miner_score(
 
                     if var_level and var_level != "all":
                         # Handle different pressure level dimension names robustly
+                        # Strict pressure level selection with tolerance (hPa). Default 0 = exact required.
+                        strict_level_tol_hpa_cfg = task_instance.config.get(
+                            "era5_strict_level_tolerance_hpa", 0
+                        )
+                        try:
+                            strict_level_tol_hpa = float(strict_level_tol_hpa_cfg)
+                        except Exception:
+                            strict_level_tol_hpa = 0.0
+
                         def _select_pressure_level(data_array, target_level):
                             """Select pressure level handling multiple possible dimension names."""
                             possible_pressure_dims = [
@@ -2508,9 +2668,23 @@ async def calculate_era5_miner_score(
                             ]
                             for dim_name in possible_pressure_dims:
                                 if dim_name in data_array.dims:
-                                    return data_array.sel(
-                                        **{dim_name: target_level}, method="nearest"
-                                    ).squeeze(drop=True)
+                                    # Enforce strict/near-exact selection
+                                    if strict_level_tol_hpa == 0.0:
+                                        sel_da = data_array.sel(
+                                            **{dim_name: float(target_level)}, method=None
+                                        )
+                                        return sel_da.squeeze(drop=True)
+                                    else:
+                                        sel_da = data_array.sel(
+                                            **{dim_name: float(target_level)}, method="nearest"
+                                        )
+                                        # Validate nearest within tolerance
+                                        selected_level = float(sel_da.coords[dim_name].item())
+                                        if abs(selected_level - float(target_level)) > strict_level_tol_hpa:
+                                            raise ValueError(
+                                                f"Selected pressure level {selected_level} differs from target {target_level} by > {strict_level_tol_hpa} hPa"
+                                            )
+                                        return sel_da.squeeze(drop=True)
                             raise ValueError(
                                 f"No pressure level dimension found in {list(data_array.dims)}. Expected one of: {possible_pressure_dims}"
                             )
@@ -2575,6 +2749,21 @@ async def calculate_era5_miner_score(
                     truth_var_da_std = _standardize_spatial_dims_final(
                         truth_var_da_selected
                     )
+                    # Longitude wrap normalization: align miner lon convention to truth
+                    try:
+                        if "lon" in miner_var_da_std.coords and "lon" in truth_var_da_std.coords:
+                            miner_lon = miner_var_da_std["lon"]
+                            truth_lon = truth_var_da_std["lon"]
+                            miner_min, miner_max = float(miner_lon.min()), float(miner_lon.max())
+                            truth_min, truth_max = float(truth_lon.min()), float(truth_lon.max())
+                            # If one is 0..360 and the other -180..180, remap miner to truth convention
+                            if (miner_min >= 0 and miner_max > 180) and (truth_min < 0 <= truth_max):
+                                miner_var_da_std = miner_var_da_std.assign_coords(lon=((miner_var_da_std["lon"] + 180) % 360) - 180).sortby("lon")
+                            elif (truth_min >= 0 and truth_max > 180) and (miner_min < 0 <= miner_max):
+                                # Remap miner -180..180 to 0..360 if truth is 0..360
+                                miner_var_da_std = miner_var_da_std.assign_coords(lon=(miner_var_da_std["lon"] % 360)).sortby("lon")
+                    except Exception:
+                        pass
                     climatology_var_da_std = _standardize_spatial_dims_final(
                         climatology_var_da_selected
                     )
@@ -2596,6 +2785,7 @@ async def calculate_era5_miner_score(
                         method="linear",
                         kwargs={"fill_value": None},
                     )
+                    # Note: shape guard moved to after dimension-order normalization
                     truth_var_da_final = target_grid_for_interp
 
                     clim_var_to_interpolate = climatology_var_da_std
@@ -2634,6 +2824,64 @@ async def calculate_era5_miner_score(
                         method="linear",
                         kwargs={"fill_value": None},
                     )
+                    # Optional one-cell edge salvage
+                    try:
+                        if task_instance.config.get("era5_edge_salvage_enabled", False):
+                            def _edge_salvage(da: xr.DataArray) -> xr.DataArray:
+                                arr = da.values
+                                h, w = arr.shape[-2], arr.shape[-1]
+                                # only salvage 1-cell border
+                                border_mask = np.zeros_like(arr, dtype=bool)
+                                border_mask[..., 0, :] = True
+                                border_mask[..., -1, :] = True
+                                border_mask[..., :, 0] = True
+                                border_mask[..., :, -1] = True
+                                nan_border = border_mask & np.isnan(arr)
+                                if np.any(nan_border):
+                                    # nearest fill along normal directions (simple 4-neighbor)
+                                    filled = arr.copy()
+                                    # top row
+                                    top_idx = np.where(nan_border[..., 0, :])
+                                    filled[..., 0, :][top_idx] = arr[..., 1, :][top_idx]
+                                    # bottom row
+                                    bot_idx = np.where(nan_border[..., -1, :])
+                                    filled[..., -1, :][bot_idx] = arr[..., -2, :][bot_idx]
+                                    # left col
+                                    left_idx = np.where(nan_border[..., :, 0])
+                                    filled[..., :, 0][left_idx] = arr[..., :, 1][left_idx]
+                                    # right col
+                                    right_idx = np.where(nan_border[..., :, -1])
+                                    filled[..., :, -1][right_idx] = arr[..., :, -2][right_idx]
+                                    return xr.DataArray(filled, dims=da.dims, coords=da.coords, attrs=da.attrs)
+                                return da
+                            miner_var_da_aligned = _edge_salvage(miner_var_da_aligned)
+                    except Exception:
+                        pass
+                    # ERA5 finite coverage guard (NaN/mask doping mitigation) on overlap with truth
+                    try:
+                        min_cov = float(task_instance.config.get("era5_min_finite_coverage_ratio", 0.999))
+                    except Exception:
+                        min_cov = 0.999
+                    try:
+                        miner_vals_np = miner_var_da_aligned.values
+                        truth_vals_np = truth_var_da_final.values
+                        mask_overlap = np.isfinite(truth_vals_np)
+                        if mask_overlap.any():
+                            masked_miner = np.where(mask_overlap, miner_vals_np, np.nan)
+                            total_elems = int(np.sum(mask_overlap))
+                            finite_elems = int(np.isfinite(masked_miner).sum()) if total_elems else 0
+                        else:
+                            total_elems = miner_vals_np.size if hasattr(miner_vals_np, "size") else 0
+                            finite_elems = int(np.isfinite(miner_vals_np).sum()) if total_elems else 0
+                        coverage_ratio = (finite_elems / total_elems) if total_elems else 0.0
+                        if coverage_ratio < min_cov:
+                            logger.warning(
+                                f"[FinalScore] Low finite coverage for {var_key}: {coverage_ratio:.6f} < {min_cov:.6f}. Skipping with zero metrics."
+                            )
+                            current_metrics = {"rmse": 0.0, "skill": 0.0, "acc": 0.0}
+                            # Continue to component score creation with zeros
+                    except Exception as _cov_err:
+                        logger.debug(f"[FinalScore] Coverage ratio check failed for {var_key}: {_cov_err}")
 
                     logger.info(
                         f"[FinalScore info Metric Input] Var: {var_key}, Level: {var_level}"
@@ -2667,6 +2915,27 @@ async def calculate_era5_miner_score(
                         if "pressure_level" in climatology_da_aligned.dims and climatology_da_aligned.dims != target_dims:
                             logger.debug(f"[FinalScore] Transposing climatology data from {climatology_da_aligned.dims} to {target_dims}")
                             climatology_da_aligned = climatology_da_aligned.transpose(*target_dims)
+
+                    # Post-normalization shape guard (true mismatches only)
+                    try:
+                        if tuple(miner_var_da_aligned.shape) != tuple(truth_var_da_final.shape):
+                            logger.warning(
+                                f"[FinalScore] Shape mismatch after normalization for {var_key}: miner={miner_var_da_aligned.shape}, truth={truth_var_da_final.shape}. Skipping with zero metrics."
+                            )
+                            current_metrics = {"rmse": 0.0, "skill": 0.0, "acc": 0.0}
+                            # Continue to component score creation with zeros
+                            # Ensure climatology is aligned for component record completeness
+                            try:
+                                climatology_da_aligned = await asyncio.to_thread(
+                                    clim_var_to_interpolate.interp_like,
+                                    truth_var_da_final,
+                                    method="linear",
+                                    kwargs={"fill_value": None},
+                                )
+                            except Exception:
+                                pass
+                    except Exception as _shape_guard_err:
+                        logger.debug(f"[FinalScore] Shape guard skipped due to error: {_shape_guard_err}")
 
                     lat_weights = None
                     if "lat" in truth_var_da_final.dims:
@@ -3196,6 +3465,7 @@ async def calculate_era5_miner_score(
                                         truth_var_da_final,
                                         gfs_var_da_aligned,
                                         mse_weights,
+                                        variable_name=var_key,
                                     )
 
                                 if np.isfinite(skill_score_val):
@@ -3292,6 +3562,7 @@ async def calculate_era5_miner_score(
                                     truth_var_da_final,
                                     climatology_skill_input,  # Use standardized climatology when available
                                     mse_weights,
+                                    variable_name=var_key,
                                 )
 
                             if np.isfinite(skill_score_val):
@@ -3424,6 +3695,12 @@ async def calculate_era5_miner_score(
                             f"[FinalScore] Miner {miner_hotkey}: CRITICAL coordinate/dimension error for {var_key} - this indicates a fundamental data structure issue",
                         )
                         return False  # Fail the entire ERA5 scoring for this miner
+
+                    # Suspected file swap or verification failure messaging
+                    if "manifest verification failed" in error_msg.lower() or "chunk integrity fail" in error_msg.lower():
+                        logger.error(
+                            f"[FinalScore] Miner {miner_hotkey}: Manifest verification failed during scoring (suspected file swap/cheating)."
+                        )
                     
                     error_metric_row = {
                         **db_metric_row_base,
@@ -3840,6 +4117,26 @@ async def _calculate_and_store_aggregated_era5_score(
     logger.info(
         f"[AggFinalScore] UID {miner_uid}, Run {run_id}: ProgressiveSkill/Error={avg_skill_error_score:.4f}, ProgressiveACC={avg_acc_score:.4f} => Composite Score: {final_score_val:.4f}"
     )
+
+    # Extra summary: zeroed/failed components and warnings snapshot
+    try:
+        zero_rows = await task_instance.db_manager.fetch_all(
+            """
+            SELECT score_type, COUNT(*) AS cnt
+            FROM weather_miner_scores
+            WHERE run_id = :rid AND miner_uid = :uid AND score = 0
+              AND (score_type LIKE 'era5_zero_%' OR score_type LIKE 'era5_error_%')
+            GROUP BY score_type
+            ORDER BY score_type
+            """,
+            {"rid": run_id, "uid": miner_uid},
+        )
+        zero_summary = {r.get("score_type"): int(r.get("cnt") or 0) for r in zero_rows or []}
+        logger.info(
+            f"[AggFinalScore] UID {miner_uid}, Run {run_id}: Zeroed/failed components summary: {zero_summary}"
+        )
+    except Exception:
+        pass
 
     agg_score_type = "era5_final_composite_score"
     metrics_for_agg_score = {

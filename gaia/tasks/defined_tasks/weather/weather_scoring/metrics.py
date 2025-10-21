@@ -210,6 +210,7 @@ async def calculate_mse_skill_score(
     truth_da: xr.DataArray,
     reference_da: xr.DataArray,
     lat_weights: xr.DataArray,
+    variable_name: Optional[str] = None,
 ) -> float:
     """
     Calculates the MSE-based skill score: 1 - (MSE_forecast / MSE_reference).
@@ -305,7 +306,8 @@ async def calculate_mse_skill_score(
             mse_reference_val = float(mse_reference_result.item())
         
         # ENHANCED DIAGNOSTIC: Check for NaN/inf values in MSE calculations
-        logger.info(f"MSE Skill Score Diagnostics for '{variable_name}' - Forecast MSE: {mse_forecast_val}, Reference MSE: {mse_reference_val}")
+        var_label = variable_name if variable_name is not None else "unknown"
+        logger.info(f"MSE Skill Score Diagnostics for '{var_label}' - Forecast MSE: {mse_forecast_val}, Reference MSE: {mse_reference_val}")
         
         # Additional diagnostics for NaN investigation
         if not np.isfinite(mse_forecast_val) or not np.isfinite(mse_reference_val):

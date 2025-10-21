@@ -437,7 +437,7 @@ async def open_verified_remote_zarr_variable(
         )
 
     if trusted_manifest is None:
-        logger.error(f"Job {job_id}: Manifest verification failed for {zarr_store_url}")
+        logger.error(f"Job {job_id}: Manifest verification failed for {zarr_store_url} (suspected file swap/cheating)")
         return (None, None) if return_manifest else None
 
     try:
@@ -459,6 +459,7 @@ async def open_verified_remote_zarr_variable(
             fs=fs,
             trusted_manifest=trusted_manifest,
             job_id_for_logging=job_id,
+            strict_metadata=True,
         )
 
         is_consolidated = ".zmetadata" in trusted_manifest.get("files", {})
@@ -515,6 +516,14 @@ async def open_verified_remote_zarr_dataset(
         f"🔍 ZARR OPEN FULL [{process_name}:{thread_name}] Job {job_id}: "
         f"Attempting VERIFIED open for Zarr: {zarr_store_url}"
     )
+    # Log strict verification flags
+    try:
+        strict_meta_env = os.getenv("WEATHER_STRICT_ZARR_METADATA", "true")
+        logger.info(
+            f"Job {job_id}: Strict metadata verification flag WEATHER_STRICT_ZARR_METADATA={strict_meta_env}"
+        )
+    except Exception:
+        pass
     # removed code marker
 
     if get_trusted_manifest is None or VerifyingChunkMapper is None:
@@ -566,6 +575,7 @@ async def open_verified_remote_zarr_dataset(
             fs=fs,
             trusted_manifest=trusted_manifest,
             job_id_for_logging=job_id,
+            strict_metadata=True,
         )
         logger.info(
             f"Job {job_id}: VerifyingChunkMapper created for {zarr_store_url_cleaned}."

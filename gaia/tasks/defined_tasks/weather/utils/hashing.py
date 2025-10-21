@@ -1827,6 +1827,7 @@ class VerifyingChunkMapper(fsspec.mapping.FSMap):
         fs: fsspec.AbstractFileSystem,
         trusted_manifest: Dict[str, Any],
         job_id_for_logging: str = "unknown_job",
+        strict_metadata: Optional[bool] = None,
     ):
         super().__init__(root, fs)
         self.trusted_manifest_files = trusted_manifest.get("files", {})
@@ -1834,6 +1835,19 @@ class VerifyingChunkMapper(fsspec.mapping.FSMap):
             "chunk_hash_algorithm", "xxh64"
         )
         self.job_id_for_logging = job_id_for_logging
+        # Strict metadata verification: require metadata files to be present in manifest and hash-match
+        try:
+            if strict_metadata is None:
+                import os as _os
+                strict_env = _os.environ.get("WEATHER_STRICT_ZARR_METADATA", "true").lower()
+                self.strict_metadata = strict_env in ("1", "true", "yes", "on")
+            else:
+                self.strict_metadata = bool(strict_metadata)
+        except Exception:
+            self.strict_metadata = True
+        logger.info(
+            f"Job {self.job_id_for_logging}: VerifyingChunkMapper strict metadata mode: {self.strict_metadata}"
+        )
         if not self.trusted_manifest_files:
             logger.warning(
                 f"Job {self.job_id_for_logging}: VerifyingChunkMapper initialized with empty manifest file list."
@@ -1891,11 +1905,19 @@ class VerifyingChunkMapper(fsspec.mapping.FSMap):
         chunk_content_bytes = super().__getitem__(key)
         expected_hash = self.trusted_manifest_files.get(lookup_key)
         if expected_hash is None:
-            if key.startswith(".") or key.endswith(
+            is_metadata = key.startswith(".") or key.endswith(
                 (".zarray", ".zattrs", ".zgroup", ".zmetadata")
-            ):
+            )
+            if is_metadata:
+                if self.strict_metadata:
+                    msg = (
+                        f"Job {self.job_id_for_logging}: Metadata file '{lookup_key}' not present in trusted manifest files. "
+                        f"Strict metadata verification is enabled; treating as verification failure."
+                    )
+                    logger.error(msg)
+                    raise KeyError(msg)
                 logger.debug(
-                    f"Job {self.job_id_for_logging}: Passthrough for Zarr metadata file: {key} (not in manifest 'files')"
+                    f"Job {self.job_id_for_logging}: Passthrough for Zarr metadata file: {key} (not in manifest 'files', strict_metadata=False)"
                 )
                 return chunk_content_bytes
             else:
