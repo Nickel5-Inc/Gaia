@@ -509,6 +509,46 @@ async def run_item(
                 )
             
             # ERA5 successor job creation removed. Global guard will orchestrate lead-ready steps.
+            # TEST MODE FAST-PATH: Directly enqueue per-miner ERA5 jobs with a short delay, but only
+            # for miners that have completed Day1 scoring for this run.
+            try:
+                if getattr(task, "test_mode", False):
+                    # Verify this miner has recorded Day1 score for the run
+                    row = await db.fetch_one(
+                        sa.text(
+                            """
+                            SELECT 1
+                            FROM weather_miner_scores
+                            WHERE run_id = :rid AND miner_uid = :uid AND score_type = 'day1_qc_score'
+                            LIMIT 1
+                            """
+                        ),
+                        {"rid": run_id, "uid": miner_uid},
+                    )
+                    if row:
+                        # Enqueue the miner-level ERA5 step after ~2 minutes
+                        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+                        scheduled = _dt.now(_tz.utc) + _td(minutes=2)
+                        await db.enqueue_validator_job(
+                            job_type="weather.era5",
+                            payload={
+                                "run_id": run_id,
+                                "miner_uid": miner_uid,
+                                "response_id": response_id,
+                            },
+                            priority=85,
+                            scheduled_at=scheduled,
+                            run_id=run_id,
+                            miner_uid=miner_uid,
+                            response_id=response_id,
+                        )
+                        logger.info(
+                            f"[Day1Step] TEST MODE: Scheduled immediate ERA5 job (in ~2m) for run {run_id}, miner {miner_uid}"
+                        )
+            except Exception as _e_enqueue:
+                logger.warning(
+                    f"[Day1Step] TEST MODE: Failed to enqueue ERA5 job fast-path for run {run_id}, miner {miner_uid}: {_e_enqueue}"
+                )
             
         from gaia.tasks.defined_tasks.weather.processing.weather_logic import _check_run_completion
         try:

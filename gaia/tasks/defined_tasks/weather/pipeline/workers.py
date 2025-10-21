@@ -1093,6 +1093,10 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     now_utc = datetime.now(timezone.utc)
                     delay_days = int(t.config.get("era5_delay_days", 5))
                     buffer_hours = int(t.config.get("era5_buffer_hours", 6))
+                    # Test mode: run immediately
+                    if getattr(t, "test_mode", False):
+                        delay_days = 0
+                        buffer_hours = 0
                     def _needed_time(h: int):
                         return gfs_init + timedelta(hours=h) + timedelta(days=delay_days) + timedelta(hours=buffer_hours)
                     time_ready_leads = [h for h in leads if now_utc >= _needed_time(h)]
@@ -1437,8 +1441,9 @@ async def process_one_utility(db: ValidatorDatabaseManager, validator: Optional[
         except Exception:
             _pname = "utility"
 
-        # Claim non-weather queues only
-        for prefix in ("stats.", "metagraph.", "miners.", "era5.", "ops."):
+        # Claim only queues this utility worker actually handles
+        # Avoid claiming miners.* and metagraph.* so normal workers can sync node_table
+        for prefix in ("stats.",):
             job = await db.claim_validator_job(worker_name=_pname, job_type_prefix=prefix, is_utility_worker=True)
             if job:
                 try:

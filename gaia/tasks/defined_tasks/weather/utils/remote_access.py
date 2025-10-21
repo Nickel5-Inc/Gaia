@@ -2,7 +2,7 @@ import asyncio
 import os
 import time
 import traceback
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union, Tuple, Any
 import fsspec
 import xarray as xr
 import psutil
@@ -400,10 +400,13 @@ async def open_verified_remote_zarr_variable(
     variable_names: List[str],
     storage_options: Optional[Dict] = None,
     job_id: Optional[str] = "unknown_job",
-) -> Optional[xr.Dataset]:
+    frozen_manifest: Optional[Dict[str, Any]] = None,
+    return_manifest: bool = False,
+) -> Optional[Union[xr.Dataset, Tuple[Optional[xr.Dataset], Optional[Dict[str, Any]]]]]:
     """
     Opens specific variables from a remote Zarr dataset to minimize HTTP requests.
     Only loads the requested variables instead of the entire dataset.
+    If frozen_manifest is provided, it will be used instead of fetching the manifest from the miner.
     """
     import multiprocessing as mp
     import threading
@@ -419,21 +422,23 @@ async def open_verified_remote_zarr_variable(
         logger.critical(
             f"Job {job_id}: Hashing utilities not available. Cannot perform verified open."
         )
-        return None
+        return (None, None) if return_manifest else None
 
     headers_for_manifest = storage_options.get("headers") if storage_options else None
 
-    trusted_manifest = await get_trusted_manifest(
-        zarr_store_url=zarr_store_url,
-        claimed_manifest_content_hash=claimed_manifest_content_hash,
-        miner_hotkey_ss58=miner_hotkey_ss58,
-        headers=headers_for_manifest,
-        job_id=job_id,
-    )
+    trusted_manifest = frozen_manifest
+    if trusted_manifest is None:
+        trusted_manifest = await get_trusted_manifest(
+            zarr_store_url=zarr_store_url,
+            claimed_manifest_content_hash=claimed_manifest_content_hash,
+            miner_hotkey_ss58=miner_hotkey_ss58,
+            headers=headers_for_manifest,
+            job_id=job_id,
+        )
 
     if trusted_manifest is None:
-        logger.error(f"Job {job_id}: Manifest verification failed for {zarr_store_url}")
-        return None
+        logger.error(f"Job {job_id}: Manifest verification failed for {zarr_store_url} (suspected file swap/cheating)")
+        return (None, None) if return_manifest else None
 
     try:
         zarr_store_url_cleaned = zarr_store_url + (
@@ -454,6 +459,7 @@ async def open_verified_remote_zarr_variable(
             fs=fs,
             trusted_manifest=trusted_manifest,
             job_id_for_logging=job_id,
+            strict_metadata=True,
         )
 
         is_consolidated = ".zmetadata" in trusted_manifest.get("files", {})
@@ -473,14 +479,16 @@ async def open_verified_remote_zarr_variable(
 
         if dataset is not None:
             logger.success(f"Job {job_id}: ✅ Successfully opened {len(variable_names)} variables from Zarr")
-            return dataset
         else:
             logger.error(f"Job {job_id}: Failed to open specific variables from Zarr")
-            return None
+
+        if return_manifest:
+            return dataset, trusted_manifest
+        return dataset
 
     except Exception as e:
         logger.error(f"Job {job_id}: Error opening variable-specific Zarr: {e}")
-        return None
+        return (None, frozen_manifest) if return_manifest else None
 
 
 async def open_verified_remote_zarr_dataset(
@@ -489,13 +497,15 @@ async def open_verified_remote_zarr_dataset(
     miner_hotkey_ss58: str,
     storage_options: Optional[Dict] = None,
     job_id: Optional[str] = "unknown_job",
-) -> Optional[xr.Dataset]:
+    frozen_manifest: Optional[Dict[str, Any]] = None,
+    return_manifest: bool = False,
+) -> Optional[Union[xr.Dataset, Tuple[Optional[xr.Dataset], Optional[Dict[str, Any]]]]]:
     """
     Opens a remote Zarr dataset with on-read chunk verification after validating manifest.
-    1. Verifies manifest (content hash, signature) by calling hashing.get_trusted_manifest.
+    1. Verifies manifest (content hash, signature) by calling hashing.get_trusted_manifest (unless frozen_manifest provided).
     2. If manifest is OK, creates a VerifyingChunkMapper.
     3. Opens the Zarr store using xarray with this verifying mapper.
-    Returns an xarray.Dataset if successful, None otherwise.
+    Returns an xarray.Dataset if successful, None otherwise. If return_manifest is True, returns a tuple (dataset, manifest_dict).
     """
     import multiprocessing as mp
     import threading
@@ -506,29 +516,39 @@ async def open_verified_remote_zarr_dataset(
         f"🔍 ZARR OPEN FULL [{process_name}:{thread_name}] Job {job_id}: "
         f"Attempting VERIFIED open for Zarr: {zarr_store_url}"
     )
+    # Log strict verification flags
+    try:
+        strict_meta_env = os.getenv("WEATHER_STRICT_ZARR_METADATA", "true")
+        logger.info(
+            f"Job {job_id}: Strict metadata verification flag WEATHER_STRICT_ZARR_METADATA={strict_meta_env}"
+        )
+    except Exception:
+        pass
     # removed code marker
 
     if get_trusted_manifest is None or VerifyingChunkMapper is None:
         logger.critical(
             f"Job {job_id}: Hashing utilities (get_trusted_manifest or VerifyingChunkMapper) not imported. Cannot perform verified open."
         )
-        return None
+        return (None, None) if return_manifest else None
 
     headers_for_manifest = storage_options.get("headers") if storage_options else None
 
-    trusted_manifest = await get_trusted_manifest(
-        zarr_store_url=zarr_store_url,
-        claimed_manifest_content_hash=claimed_manifest_content_hash,
-        miner_hotkey_ss58=miner_hotkey_ss58,
-        headers=headers_for_manifest,
-        job_id=job_id,
-    )
+    trusted_manifest = frozen_manifest
+    if trusted_manifest is None:
+        trusted_manifest = await get_trusted_manifest(
+            zarr_store_url=zarr_store_url,
+            claimed_manifest_content_hash=claimed_manifest_content_hash,
+            miner_hotkey_ss58=miner_hotkey_ss58,
+            headers=headers_for_manifest,
+            job_id=job_id,
+        )
 
     if trusted_manifest is None:
         logger.error(
             f"Job {job_id}: Manifest verification failed for {zarr_store_url}. Cannot open verified dataset."
         )
-        return None
+        return (None, None) if return_manifest else None
 
     try:
         zarr_store_url_cleaned = zarr_store_url.rstrip("/") + (
@@ -555,6 +575,7 @@ async def open_verified_remote_zarr_dataset(
             fs=fs,
             trusted_manifest=trusted_manifest,
             job_id_for_logging=job_id,
+            strict_metadata=True,
         )
         logger.info(
             f"Job {job_id}: VerifyingChunkMapper created for {zarr_store_url_cleaned}."
@@ -611,13 +632,14 @@ async def open_verified_remote_zarr_dataset(
             logger.info(
                 f"Job {job_id}: Successfully opened VERIFIED remote Zarr dataset: {zarr_store_url}"
             )
+            if return_manifest:
+                return dataset, trusted_manifest
             return dataset
         else:
             logger.error(
                 f"Job {job_id}: Opening Zarr with VerifyingChunkMapper returned None for {zarr_store_url}"
             )
             set_last_verified_open_error(job_id, "open_with_verifying_mapper returned None")
-            # Strict: fail immediately (no fallback)
             raise RuntimeError("open_with_verifying_mapper returned None")
 
     except Exception as e:
@@ -629,5 +651,6 @@ async def open_verified_remote_zarr_dataset(
             set_last_verified_open_error(job_id, f"exception: {e}")
         except Exception:
             pass
-        # Strict: re-raise so upstream treats as failure (no fallback)
+        if return_manifest:
+            return None, frozen_manifest
         raise

@@ -231,6 +231,30 @@ def _load_config(self):
     config["era5_cache_retention_days"] = int(
         os.getenv("WEATHER_ERA5_CACHE_RETENTION_DAYS", "30")
     )
+    # Strictness controls
+    try:
+        config["era5_strict_time_tolerance_hours"] = float(
+            os.getenv("WEATHER_ERA5_STRICT_TIME_TOLERANCE_HOURS", "0")
+        )
+    except Exception:
+        config["era5_strict_time_tolerance_hours"] = 0.0
+    try:
+        config["era5_strict_level_tolerance_hpa"] = float(
+            os.getenv("WEATHER_ERA5_STRICT_LEVEL_TOLERANCE_HPA", "0")
+        )
+    except Exception:
+        config["era5_strict_level_tolerance_hpa"] = 0.0
+    try:
+        # Aurora-friendly default without sacrificing integrity
+        config["era5_min_finite_coverage_ratio"] = float(
+            os.getenv("WEATHER_ERA5_MIN_FINITE_COVERAGE_RATIO", "0.9985")
+        )
+    except Exception:
+        config["era5_min_finite_coverage_ratio"] = 0.9985
+    # Optional edge salvage: default ON to tolerate 1-cell seam
+    config["era5_edge_salvage_enabled"] = os.getenv("WEATHER_ERA5_EDGE_SALVAGE", "true").lower() in ("1", "true", "yes", "on")
+    # Allow miner units attribute to be missing; still enforce on truth/expected
+    config["units_allow_missing_miner_attr"] = os.getenv("WEATHER_ALLOW_MISSING_MINER_UNITS", "true").lower() in ("1", "true", "yes", "on")
     # Progressive scoring optimization: enable more selective ERA5 data fetching
     config["progressive_era5_fetch"] = os.getenv(
         "WEATHER_PROGRESSIVE_ERA5_FETCH", "true"
@@ -6053,7 +6077,11 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
             # 3. Find runs that need ERA5 final scoring (have day1_qc scores but no era5 scores, and are old enough)
             era5_delay_days = self.config.get("era5_delay_days", 5)
-            cutoff_time = datetime.now(timezone.utc) - timedelta(days=era5_delay_days)
+            # In test mode, backfill immediately without waiting for cutoff
+            if getattr(self, "test_mode", False):
+                cutoff_time = datetime.now(timezone.utc)
+            else:
+                cutoff_time = datetime.now(timezone.utc) - timedelta(days=era5_delay_days)
 
             era5_candidates_query = """
             SELECT DISTINCT wms.run_id, wfr.gfs_init_time_utc, wfr.status as run_status
