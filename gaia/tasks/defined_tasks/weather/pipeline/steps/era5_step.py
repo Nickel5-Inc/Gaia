@@ -276,9 +276,9 @@ async def run_item(
     buffer_hours = int(getattr(task.config, "era5_buffer_hours", task.config.get("era5_buffer_hours", 6))) if hasattr(task, "config") else 6
     now_utc = datetime.now(timezone.utc)
     if getattr(task, "test_mode", False):
-        # In test mode, significantly reduce delays to allow immediate testing
-        delay_days = min(delay_days, 1)  # Reduce delay to 1 day max in test mode
-        buffer_hours = min(buffer_hours, 1)
+        # In test mode, run immediately after Day1 completes
+        delay_days = 0
+        buffer_hours = 0
     pending_leads = [h for h in leads if h not in existing_scores]
     def needed_time_for_lead(h: int) -> datetime:
         return gfs_init + timedelta(hours=h) + timedelta(days=delay_days) + timedelta(hours=buffer_hours)
@@ -370,7 +370,14 @@ async def run_item(
     if truth is None:
         try:
             truth = await _get_era5_truth(task, run_id, gfs_init, ready_leads, prefer_cache_only=False)
-        except Exception:
+        except Exception as e_truth:
+            try:
+                import traceback as _tb
+                logger.error(
+                    f"[ERA5] Truth fetch failed for run {run_id}, miner {miner_uid}: {type(e_truth).__name__}: {e_truth}\n{''.join(_tb.format_exc(limit=5))}"
+                )
+            except Exception:
+                pass
             truth = None
     try:
         n_times = 0
@@ -392,20 +399,20 @@ async def run_item(
     except Exception:
         pass
     if not truth or not clim:
-        # Treat this as a fetch failure (likely miner/network), not truth gating; mark per-lead failed
+        # Treat this as "truth not ready" rather than a hard failure; schedule retry
         try:
-            from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_failure
+            poll_minutes = int(getattr(task.config, "era5_poll_interval_minutes", task.config.get("era5_poll_interval_minutes", 60))) if hasattr(task, "config") else 60
+            from datetime import timedelta as _td
+            nrt = datetime.now(timezone.utc) + _td(minutes=poll_minutes)
             for _lh in ready_leads:
                 try:
-                    await log_failure(
-                        db,
-                        run_id=run_id,
-                        miner_uid=miner_uid,
-                        miner_hotkey=miner_hotkey,
-                        step_name="era5",
-                        substep="score",
-                        lead_hours=int(_lh),
-                        error_json={"type": "truth_or_clim_fetch_failed"},
+                    await db.execute(
+                        """
+                        UPDATE weather_forecast_steps
+                        SET status = 'waiting_for_truth', next_retry_time = :nrt
+                        WHERE run_id = :rid AND miner_uid = :uid AND step_name = 'era5' AND substep = 'score' AND lead_hours = :lh
+                        """,
+                        {"rid": run_id, "uid": miner_uid, "lh": int(_lh), "nrt": nrt},
                     )
                 except Exception:
                     pass
@@ -552,7 +559,7 @@ async def run_item(
                         step_name="era5",
                         substep="score",
                         lead_hours=int(_lh),
-                        error_json={"type": "scoring_failed"},
+                        error_json={"type": "scoring_failed", "reason": "manifest_verification_failed_or_open_error"},
                     )
                     try:
                         await db.execute(
@@ -574,11 +581,12 @@ async def run_item(
             substep="score",
             error_json={
                 "type": "scoring_failed",
-                "message": "calculate_era5_miner_score returned False",
+                "message": "calculate_era5_miner_score returned False (manifest verification/open error). This failure will NOT be rescheduled.",
                 "context": {"run_id": run_id, "miner_uid": miner_uid, "ready_leads": ready_leads},
             },
         )
-        return False
+        # Ensure no reschedule by returning True (job completed) and leaving step rows in failed state
+        return True
     latency_ms = int((time.perf_counter() - t0) * 1000)
     try:
         logger.info(

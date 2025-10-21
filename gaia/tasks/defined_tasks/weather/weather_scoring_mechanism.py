@@ -12,6 +12,7 @@ import numpy as np
 import xarray as xr
 import pandas as pd
 import xskillscore as xs
+from json import dumps
 
 from gaia.utils.custom_logger import get_logger
 from typing import TYPE_CHECKING, Any, Optional, Dict, List, Tuple
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
     from .weather_task import WeatherTask
 
 from .processing.weather_logic import _request_fresh_token
-from .utils.remote_access import open_verified_remote_zarr_dataset, get_last_verified_open_error
+from .utils.remote_access import open_verified_remote_zarr_dataset, get_last_verified_open_error, open_verified_remote_zarr_variable
 from .utils.hashing import verify_minimal_chunks_and_reconstruct_manifest_hash, is_rehash_verified, get_last_manifest_log
 
 from .weather_scoring.metrics import (
@@ -183,7 +184,67 @@ async def evaluate_miner_forecast_day1(
                 day1_results["qc_passed_all_vars_leads"] = False
                 return day1_results  # Return graceful failure rather than exception
 
-        access_token, zarr_store_url, claimed_manifest_content_hash = token_data_tuple
+        access_token, miner_reported_url, miner_reported_manifest_hash = token_data_tuple
+
+        # Use frozen URL/hash from DB when available; if missing (fast-path), fall back to miner-reported and freeze post-verify
+        stored_rec = await task_instance.db_manager.fetch_one(
+            "SELECT kerchunk_json_url, verification_hash_claimed, kerchunk_json_retrieved, frozen_manifest_files FROM weather_miner_responses WHERE id = :rid",
+            {"rid": response_id},
+        )
+        # If frozen URL/hash are missing (fast-path), freeze them now using miner-reported values
+        if not stored_rec or not stored_rec.get("kerchunk_json_url") or not stored_rec.get("verification_hash_claimed"):
+            try:
+                if miner_reported_url and miner_reported_manifest_hash:
+                    await task_instance.db_manager.execute(
+                        """
+                        UPDATE weather_miner_responses
+                        SET kerchunk_json_url = COALESCE(kerchunk_json_url, :url),
+                            verification_hash_claimed = COALESCE(verification_hash_claimed, :hash)
+                        WHERE id = :rid
+                        """,
+                        {"rid": response_id, "url": miner_reported_url, "hash": miner_reported_manifest_hash},
+                    )
+                    stored_rec = await task_instance.db_manager.fetch_one(
+                        "SELECT kerchunk_json_url, verification_hash_claimed, kerchunk_json_retrieved, frozen_manifest_files FROM weather_miner_responses WHERE id = :rid",
+                        {"rid": response_id},
+                    )
+            except Exception as _freeze_e:
+                logger.warning(f"[Day1Score] Failed to freeze URL/hash on fast-path for response {response_id}: {_freeze_e}")
+            if not stored_rec or not stored_rec.get("kerchunk_json_url") or not stored_rec.get("verification_hash_claimed"):
+                logger.error(
+                    f"[Day1Score] Missing frozen URL/hash for response {response_id} after freeze attempt. Aborting day1 scoring."
+                )
+                day1_results["error_message"] = "Missing frozen URL/hash"
+                day1_results["overall_day1_score"] = 0.0
+                day1_results["qc_passed_all_vars_leads"] = False
+                return day1_results
+
+        zarr_store_url = stored_rec["kerchunk_json_url"]
+        claimed_manifest_content_hash = stored_rec["verification_hash_claimed"]
+        frozen_manifest_json = stored_rec.get("kerchunk_json_retrieved")
+        needs_freeze = frozen_manifest_json is None
+
+        # Strict: if frozen exists, enforce mismatch; if freezing now, verification will guard integrity before freezing
+        if not needs_freeze:
+            if (
+                miner_reported_manifest_hash
+                and miner_reported_manifest_hash != claimed_manifest_content_hash
+            ):
+                logger.error(
+                    f"[Day1Score] Manifest hash mismatch. Stored={claimed_manifest_content_hash[:10]}..., MinerNow={miner_reported_manifest_hash[:10]}..."
+                )
+                await task_instance.db_manager.execute(
+                    """
+                    UPDATE weather_miner_responses
+                    SET status = 'verification_error', error_message = 'Manifest hash mismatch between stored and miner-reported during day1 scoring'
+                    WHERE id = :rid
+                    """,
+                    {"rid": response_id},
+                )
+                day1_results["error_message"] = "Manifest hash mismatch (day1)"
+                day1_results["overall_day1_score"] = 0.0
+                day1_results["qc_passed_all_vars_leads"] = False
+                return day1_results
 
         if not all([access_token, zarr_store_url, claimed_manifest_content_hash]):
             raise ValueError(
@@ -191,7 +252,7 @@ async def evaluate_miner_forecast_day1(
             )
 
         logger.info(
-            f"[Day1Score] Opening VERIFIED Zarr store for {miner_hotkey}: {zarr_store_url}"
+            f"[Day1Score] Opening VERIFIED Zarr store (FROZEN) for {miner_hotkey}: {zarr_store_url}"
         )
         storage_options = {
             "headers": {"Authorization": f"Bearer {access_token}"},
@@ -231,38 +292,53 @@ async def evaluate_miner_forecast_day1(
                 times=[pd.Timestamp(t) for t in times_to_evaluate],
                 levels=levels,
                 headers=storage_options.get("headers"),
+                num_samples=int(task_instance.config.get("day1_minimal_verify_samples", 0)),
                 job_id=f"{job_id}_day1_minrehash",
             )
             if ok_min and preopened_ds is not None:
                 miner_forecast_ds = preopened_ds
             else:
-                # Strict single-pass fallback: skip minimal verify and attempt strict verified open directly
                 logger.warning(
                     f"[Day1Score] Minimal verify failed or preopen None (error={min_details.get('error') if isinstance(min_details, dict) else 'unknown'}). "
-                    f"Attempting strict verified open without minimal subset." 
+                    f"Attempting strict verified open without minimal subset."
                 )
-                miner_forecast_ds = await asyncio.wait_for(
-                    open_verified_remote_zarr_dataset(
-                        zarr_store_url=zarr_store_url,
-                        claimed_manifest_content_hash=claimed_manifest_content_hash,
-                        miner_hotkey_ss58=miner_hotkey,
-                        storage_options=storage_options,
-                        job_id=f"{job_id}_day1_strict_open",
-                    ),
-                    timeout=verification_timeout_seconds,
-                )
+
         if miner_forecast_ds is None:
             try:
-                miner_forecast_ds = await asyncio.wait_for(
+                result_ds = await asyncio.wait_for(
                     open_verified_remote_zarr_dataset(
                         zarr_store_url=zarr_store_url,
                         claimed_manifest_content_hash=claimed_manifest_content_hash,
                         miner_hotkey_ss58=miner_hotkey,
                         storage_options=storage_options,
                         job_id=f"{job_id}_day1_score",
+                        frozen_manifest=frozen_manifest_json,
+                        return_manifest=True,
                     ),
                     timeout=verification_timeout_seconds,
                 )
+                if isinstance(result_ds, tuple):
+                    miner_forecast_ds, manifest_used = result_ds
+                    if manifest_used and frozen_manifest_json is None:
+                        try:
+                            await task_instance.db_manager.execute(
+                                """
+                                UPDATE weather_miner_responses
+                                SET kerchunk_json_retrieved = COALESCE(kerchunk_json_retrieved, :manifest::jsonb),
+                                    frozen_manifest_files = COALESCE(frozen_manifest_files, :files::jsonb)
+                                WHERE id = :rid
+                                """,
+                                {
+                                    "rid": response_id,
+                                    "manifest": dumps(manifest_used),
+                                    "files": dumps(manifest_used.get("files", {})) if isinstance(manifest_used, dict) else None,
+                                },
+                            )
+                            frozen_manifest_json = manifest_used
+                        except Exception as freeze_err:
+                            logger.warning(f"[Day1Score] Failed to store frozen manifest after open: {freeze_err}")
+                else:
+                    miner_forecast_ds = result_ds
             except Exception as open_err:
                 logger.error(
                     f"[Day1Score] Exception during verified open for {miner_hotkey} at {zarr_store_url}: {open_err}",
@@ -299,15 +375,11 @@ async def evaluate_miner_forecast_day1(
                 """UPDATE weather_miner_responses 
                    SET status = 'verification_failed', 
                        error_message = 'Manifest verification failed during day1 scoring',
-                       kerchunk_json_url = :url,
-                       verification_hash_claimed = :hash,
                        verification_passed = false
                    WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey""",
                 {
                     "run_id": run_id, 
                     "miner_hotkey": miner_hotkey,
-                    "url": zarr_store_url,
-                    "hash": claimed_manifest_content_hash
                 },
             )
             # Check if this was the last miner in the run
@@ -317,18 +389,31 @@ async def evaluate_miner_forecast_day1(
             day1_results["qc_passed_all_vars_leads"] = False
             return day1_results  # Return graceful failure rather than exception
         else:
-            # Verification succeeded - update tracking
+            # Verification succeeded - update tracking; if we were missing frozen values, freeze them now via COALESCE
+            if needs_freeze:
+                try:
+                    await task_instance.db_manager.execute(
+                        """
+                        UPDATE weather_miner_responses
+                        SET kerchunk_json_url = COALESCE(kerchunk_json_url, :url),
+                            verification_hash_claimed = COALESCE(verification_hash_claimed, :hash)
+                        WHERE id = :rid
+                        """,
+                        {"rid": response_id, "url": zarr_store_url, "hash": claimed_manifest_content_hash},
+                    )
+                except Exception:
+                    logger.error(f"[Day1Score] Failed to freeze URL/hash for response {response_id}")
+                    day1_results["error_message"] = "Failed to freeze URL/hash"
+                    day1_results["overall_day1_score"] = 0.0
+                    day1_results["qc_passed_all_vars_leads"] = False
+                    return day1_results
             await task_instance.db_manager.execute(
                 """UPDATE weather_miner_responses 
-                   SET kerchunk_json_url = :url,
-                       verification_hash_claimed = :hash,
-                       verification_passed = true
+                   SET verification_passed = true
                    WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey""",
                 {
                     "run_id": run_id, 
                     "miner_hotkey": miner_hotkey,
-                    "url": zarr_store_url,
-                    "hash": claimed_manifest_content_hash
                 },
             )
 
@@ -560,7 +645,12 @@ async def evaluate_miner_forecast_day1(
                 precomputed_climatology_cache=precomputed_climatology_cache,
                 day1_scoring_config=day1_scoring_config,
                 run_gfs_init_time=run_gfs_init_time,
-                miner_hotkey=miner_hotkey,
+            miner_hotkey=miner_hotkey,
+            zarr_store_url=zarr_store_url,
+            claimed_manifest_content_hash=claimed_manifest_content_hash,
+            access_token=access_token,
+            job_id=job_id,
+            frozen_manifest_json=frozen_manifest_json,
             )
             timestep_results.append(timestep_result)
 
@@ -2042,6 +2132,14 @@ async def _process_single_variable_parallel_preloaded(
                 target_grid_da = target_grid_da.isel(
                     {actual_lat_dim_in_target_for_ordering: slice(None, None, -1)}
                 )
+            else:
+                logger.debug(
+                    f"[Day1Score] Latitude coordinate '{actual_lat_dim_in_target_for_ordering}' in target_grid_da is already descending or has too few points to determine order."
+                )
+        else:
+            logger.warning(
+                "[Day1Score] Could not determine latitude dimension in target_grid_da to check/ensure descending order."
+            )
 
         def _standardize_spatial_dims(data_array: xr.DataArray) -> xr.DataArray:
             if not isinstance(data_array, xr.DataArray):
@@ -2683,6 +2781,11 @@ async def _process_single_timestep_sequential(
     day1_scoring_config: Dict,
     run_gfs_init_time: datetime,
     miner_hotkey: str,
+    zarr_store_url: str,
+    claimed_manifest_content_hash: str,
+    access_token: str,
+    job_id: str,
+    frozen_manifest_json: Optional[Dict],
 ) -> Dict:
     """
     Process a single time step with all its variables in parallel.
@@ -2906,40 +3009,50 @@ async def _process_single_timestep_sequential(
             # Use pre-loaded variables if available, otherwise pass datasets
             if var_name in preloaded_variables:
                 task_datasets = preloaded_variables[var_name]
-                result = await _process_single_variable_parallel_preloaded(
-                    var_config=var_config,
-                    miner_var_da=task_datasets["miner"],
-                    truth_var_da=task_datasets["truth"],
-                    ref_var_da=task_datasets["ref"],
-                    era5_climatology=era5_climatology,
-                    precomputed_climatology_cache=precomputed_climatology_cache,
-                    day1_scoring_config=day1_scoring_config,
-                    valid_time_dt=valid_time_dt,
-                    effective_lead_h=effective_lead_h,
-                    miner_hotkey=miner_hotkey,
-                    cached_pressure_dims=cached_pressure_dims,
-                    cached_lat_weights=cached_lat_weights,
-                    cached_grid_dims=cached_grid_dims,
-                    variables_to_score=variables_to_score,
-                )
             else:
-                # Fallback to original method
-                result = await _process_single_variable_parallel(
-                    var_config=var_config,
-                    miner_forecast_lead=miner_forecast_lead,
-                    gfs_analysis_lead=gfs_analysis_lead,
-                    gfs_reference_lead=gfs_reference_lead,
-                    era5_climatology=era5_climatology,
-                    precomputed_climatology_cache=precomputed_climatology_cache,
-                    day1_scoring_config=day1_scoring_config,
-                    valid_time_dt=valid_time_dt,
-                    effective_lead_h=effective_lead_h,
-                    miner_hotkey=miner_hotkey,
-                    cached_pressure_dims=cached_pressure_dims,
-                    cached_lat_weights=cached_lat_weights,
-                    cached_grid_dims=cached_grid_dims,
-                    variables_to_score=variables_to_score,
-                )
+                try:
+                    dataset_slice, _ = await open_verified_remote_zarr_variable(
+                        zarr_store_url=zarr_store_url,
+                        claimed_manifest_content_hash=claimed_manifest_content_hash,
+                        miner_hotkey_ss58=miner_hotkey,
+                        variable_names=[var_name],
+                        storage_options={
+                            "headers": {"Authorization": f"Bearer {access_token}"},
+                            "ssl": False,
+                        },
+                        job_id=f"{job_id}_day1_var_{var_name}",
+                        frozen_manifest=frozen_manifest_json,
+                        return_manifest=True,
+                    )
+                    if dataset_slice is None or var_name not in dataset_slice.data_vars:
+                        logger.warning(f"[Day1Score] Miner {miner_hotkey}: Variable {var_name} not returned by verified slice")
+                        continue
+                    task_datasets = {
+                        "miner": dataset_slice[var_name],
+                        "truth": gfs_analysis_lead[var_name],
+                        "ref": gfs_reference_lead[var_name],
+                    }
+                    preloaded_variables[var_name] = task_datasets
+                except Exception as var_fetch_err:
+                    logger.error(f"[Day1Score] Failed to fetch variable {var_name} on-demand: {var_fetch_err}")
+                    continue
+
+            result = await _process_single_variable_parallel_preloaded(
+                var_config=var_config,
+                miner_var_da=task_datasets["miner"],
+                truth_var_da=task_datasets["truth"],
+                ref_var_da=task_datasets["ref"],
+                era5_climatology=era5_climatology,
+                precomputed_climatology_cache=precomputed_climatology_cache,
+                day1_scoring_config=day1_scoring_config,
+                valid_time_dt=valid_time_dt,
+                effective_lead_h=effective_lead_h,
+                miner_hotkey=miner_hotkey,
+                cached_pressure_dims=cached_pressure_dims,
+                cached_lat_weights=cached_lat_weights,
+                cached_grid_dims=cached_grid_dims,
+                variables_to_score=variables_to_score,
+            )
 
             # Process result immediately
             if isinstance(result, Exception):

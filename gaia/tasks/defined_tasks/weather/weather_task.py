@@ -6053,7 +6053,11 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
             # 3. Find runs that need ERA5 final scoring (have day1_qc scores but no era5 scores, and are old enough)
             era5_delay_days = self.config.get("era5_delay_days", 5)
-            cutoff_time = datetime.now(timezone.utc) - timedelta(days=era5_delay_days)
+            # In test mode, backfill immediately without waiting for cutoff
+            if getattr(self, "test_mode", False):
+                cutoff_time = datetime.now(timezone.utc)
+            else:
+                cutoff_time = datetime.now(timezone.utc) - timedelta(days=era5_delay_days)
 
             era5_candidates_query = """
             SELECT DISTINCT wms.run_id, wfr.gfs_init_time_utc, wfr.status as run_status

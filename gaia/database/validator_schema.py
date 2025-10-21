@@ -405,6 +405,8 @@ weather_miner_responses_table = sa.Table(
     sa.Column("kerchunk_json_url", sa.Text, nullable=True),
     sa.Column("target_netcdf_url_template", sa.Text, nullable=True),
     sa.Column("kerchunk_json_retrieved", postgresql.JSONB, nullable=True),
+    # Frozen per-file manifest (file path -> hash map) captured at first submission
+    sa.Column("frozen_manifest_files", postgresql.JSONB, nullable=True),
     sa.Column("verification_hash_computed", sa.VARCHAR(64), nullable=True),
     sa.Column("verification_hash_claimed", sa.VARCHAR(64), nullable=True),
     sa.Column("verification_passed", sa.Boolean, nullable=True),

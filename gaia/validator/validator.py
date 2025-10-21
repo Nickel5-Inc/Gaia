@@ -3923,6 +3923,27 @@ class GaiaValidator:
                     
                     logger.info("🚀 Job enqueuer starting after database stability wait")
 
+                    # Startup recovery: reset potentially-stuck periodic jobs
+                    try:
+                        await db.execute(
+                            """
+                            UPDATE validator_jobs
+                            SET status = 'pending', claimed_by = NULL, started_at = NULL, lease_expires_at = NULL
+                            WHERE status = 'in_progress'
+                              AND (
+                                job_type LIKE 'stats.%' OR
+                                job_type LIKE 'metagraph.%' OR
+                                job_type LIKE 'miners.%' OR
+                                job_type LIKE 'era5.%' OR
+                                job_type LIKE 'ops.%' OR
+                                job_type LIKE 'db.%'
+                              )
+                            """
+                        )
+                        logger.info("[JobEnqueuer] Reset in-progress periodic jobs to pending (startup recovery)")
+                    except Exception as _reset_err:
+                        logger.warning(f"[JobEnqueuer] Failed to reset deregistration job on startup: {_reset_err}")
+
                     # Track last enqueued dates to avoid relying on exact clock minutes
                     last_reconcile_date = None
                     
@@ -3946,6 +3967,26 @@ class GaiaValidator:
                     
                     while not self._shutdown_event.is_set():
                         try:
+                            # Periodic recovery: unstick any expired in-progress periodic jobs
+                            try:
+                                await db.execute(
+                                    """
+                                    UPDATE validator_jobs
+                                    SET status = 'pending', claimed_by = NULL, started_at = NULL, lease_expires_at = NULL
+                                    WHERE status = 'in_progress'
+                                      AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
+                                      AND (
+                                        job_type LIKE 'stats.%' OR
+                                        job_type LIKE 'metagraph.%' OR
+                                        job_type LIKE 'miners.%' OR
+                                        job_type LIKE 'era5.%' OR
+                                        job_type LIKE 'ops.%' OR
+                                        job_type LIKE 'db.%'
+                                      )
+                                    """
+                                )
+                            except Exception:
+                                pass
                             now = _dt.datetime.now(_dt.timezone.utc)
                             # Stats aggregation and subnet snapshot every 10 minutes
                             await db.enqueue_singleton_job(
@@ -4018,6 +4059,19 @@ class GaiaValidator:
                             
                             # Metagraph sync and miner dereg handling every 5 minutes
                             if now.minute % 5 == 0:
+                                # Periodic recovery: unstick deregistration job if lease expired
+                                try:
+                                    await db.execute(
+                                        """
+                                        UPDATE validator_jobs
+                                        SET status = 'pending', claimed_by = NULL, started_at = NULL, lease_expires_at = NULL
+                                        WHERE job_type = 'miners.handle_deregistrations' 
+                                          AND status = 'in_progress' 
+                                          AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
+                                        """
+                                    )
+                                except Exception:
+                                    pass
                                 await db.enqueue_singleton_job(
                                     singleton_key="metagraph_sync",
                                     job_type="metagraph.sync",
@@ -4243,9 +4297,43 @@ class GaiaValidator:
                     logger.info(
                         "AutoSyncManager is not active for this node (initialization failed or not configured)."
                     )
-                    # Start job enqueuer since AutoSyncManager didn't start it
-                    logger.info("🚀 Starting job enqueuer (AutoSyncManager not active)")
-                    self.create_tracked_task(_enqueue_recurring_jobs(), "job_enqueuer")
+                    # Start worker pool and job enqueuer since AutoSyncManager didn't start them
+                    if self._per_miner_exec_enabled and not self._weather_worker_processes:
+                        procs = self._weather_worker_num
+                        logger.info(f"Starting weather worker pool with {procs} processes (80% of cores, floored)")
+                        processes: list[mp.Process] = []
+                        for i in range(procs):
+                            if procs > 1 and i == 0:
+                                name = "UTILITY WORKER"
+                                target = _utility_worker_entrypoint
+                            else:
+                                if procs > 1:
+                                    heavy_total = procs - 1
+                                    heavy_index = i  # first heavy is i==1 -> 1/heavy_total
+                                else:
+                                    heavy_total = procs
+                                    heavy_index = i + 1
+                                name = f"worker-{heavy_index}/{heavy_total}"
+                                target = _weather_worker_entrypoint
+                            p = mp.Process(name=name, target=target, daemon=True)
+                            processes.append(p)
+                        for p in processes:
+                            p.start()
+                        self._weather_worker_processes.extend(processes)
+
+                        try:
+                            await asyncio.sleep(0.5)
+                        except Exception:
+                            pass
+
+                        logger.info("🚀 Starting job enqueuer (AutoSyncManager not active)")
+                        self.create_tracked_task(_enqueue_recurring_jobs(), "job_enqueuer")
+
+                        logger.info("🔧 Starting worker monitoring task")
+                        self.create_tracked_task(self._monitor_worker_processes(), "worker_monitor")
+                    else:
+                        logger.info("🚀 Starting job enqueuer (AutoSyncManager not active)")
+                        self.create_tracked_task(_enqueue_recurring_jobs(), "job_enqueuer")
 
                 # Legacy MinerScoreSender removed (replaced by websync subprocess)
 

@@ -31,7 +31,7 @@ except ImportError:
         return json.loads(s)
 
 
-from ..utils.remote_access import open_verified_remote_zarr_dataset
+from ..utils.remote_access import open_verified_remote_zarr_dataset, open_verified_remote_zarr_variable
 from ..utils.json_sanitizer import safe_json_dumps_for_db
 from ..utils.era5_api import fetch_era5_data
 from ..utils.gfs_api import fetch_gfs_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
@@ -817,9 +817,9 @@ async def _trigger_final_scoring(task_instance: "WeatherTask", run_id: int):
 async def _request_fresh_token(
     task_instance: "WeatherTask", miner_hotkey: str, job_id: str
 ) -> Optional[Tuple[str, str, str]]:
-    """Requests a fresh JWT, Zarr URL, and manifest_content_hash from the miner."""
+    """Requests a fresh JWT from the miner (URL/hash will be ignored if frozen)."""
     logger.info(
-        f"[VerifyLogic] Requesting fresh token/manifest_hash for job {job_id} from miner {miner_hotkey[:12]}..."
+        f"[VerifyLogic] Requesting fresh token for job {job_id} from miner {miner_hotkey[:12]}..."
     )
     forecast_request_payload = {"nonce": str(uuid.uuid4()), "data": {"job_id": job_id}}
     from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import query_single_miner
@@ -881,7 +881,7 @@ async def _request_fresh_token(
                         + zarr_store_relative_url.lstrip("/")
                     )
                     logger.info(
-                        f"[VerifyLogic] Success: Token, URL: {full_zarr_url}, ManifestHash: {manifest_content_hash[:10]}..."
+                        f"[VerifyLogic] Success: Token received for job {job_id}"
                     )
                     return token, full_zarr_url, manifest_content_hash
                 else:
@@ -1261,11 +1261,11 @@ async def verify_miner_response(
                 f"Critical information missing after token request: {err_details}"
             )
 
-        # Freeze manifest hash and URL after first set. If a miner reports a different
+        # Freeze URL/hash/manifest on first set. If miner reports a different
         # manifest hash or URL later, treat it as a verification error.
         try:
             existing_rec = await task_instance.db_manager.fetch_one(
-                "SELECT kerchunk_json_url, verification_hash_claimed FROM weather_miner_responses WHERE id = :id",
+                "SELECT kerchunk_json_url, verification_hash_claimed, kerchunk_json_retrieved, frozen_manifest_files FROM weather_miner_responses WHERE id = :id",
                 {"id": response_id},
             )
         except Exception:
@@ -1292,17 +1292,49 @@ async def verify_miner_response(
                     {"id": response_id},
                 )
                 return
+            frozen_manifest = existing_rec.get("kerchunk_json_retrieved") or existing_rec.get("frozen_manifest_files")
+        else:
+            frozen_manifest = None
 
-        # Set URL if not set yet; do NOT overwrite stored manifest hash here
+        if frozen_manifest is None:
+            # Fetch manifest directly from miner and freeze it
+            from ..utils.hashing import get_trusted_manifest
+
+            headers_for_manifest = storage_opts.get("headers") if storage_opts else None
+            frozen_manifest = await get_trusted_manifest(
+                zarr_store_url=zarr_store_url,
+                claimed_manifest_content_hash=claimed_manifest_content_hash,
+                miner_hotkey_ss58=miner_hotkey,
+                headers=headers_for_manifest,
+                job_id=job_id,
+            )
+            if frozen_manifest is None:
+                logger.error(
+                    f"[VerifyLogic, Resp {response_id}] Failed to fetch manifest for freezing."
+                )
+                await task_instance.db_manager.execute(
+                    "UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Failed to fetch manifest for freezing' WHERE id = :id",
+                    {"id": response_id},
+                )
+                return
+
+        # Freeze URL, hash, and manifest JSON/hash map on first set
         await task_instance.db_manager.execute(
             """
             UPDATE weather_miner_responses
-            SET kerchunk_json_url = COALESCE(kerchunk_json_url, :url), status = 'verifying_manifest'
+            SET kerchunk_json_url = COALESCE(kerchunk_json_url, :url),
+                verification_hash_claimed = COALESCE(verification_hash_claimed, :hash),
+                kerchunk_json_retrieved = COALESCE(kerchunk_json_retrieved, :manifest::jsonb),
+                frozen_manifest_files = COALESCE(frozen_manifest_files, :manifest_files::jsonb),
+                status = 'verifying_manifest'
             WHERE id = :id
         """,
             {
                 "id": response_id,
                 "url": zarr_store_url,
+                "hash": claimed_manifest_content_hash,
+                "manifest": dumps(frozen_manifest),
+                "manifest_files": dumps(frozen_manifest.get("files", {})) if isinstance(frozen_manifest, dict) else None,
             },
         )
 
@@ -1318,16 +1350,23 @@ async def verify_miner_response(
             "verification_timeout_seconds", 300
         )
 
-        verified_dataset = await asyncio.wait_for(
+        verified_dataset_result = await asyncio.wait_for(
             open_verified_remote_zarr_dataset(
                 zarr_store_url=zarr_store_url,
                 claimed_manifest_content_hash=claimed_manifest_content_hash,
                 miner_hotkey_ss58=miner_hotkey,
                 storage_options=storage_opts,
                 job_id=job_id,
+                frozen_manifest=frozen_manifest,
+                return_manifest=True,
             ),
             timeout=verification_timeout_seconds,
         )
+        if isinstance(verified_dataset_result, tuple):
+            verified_dataset, manifest_used = verified_dataset_result
+        else:
+            verified_dataset = verified_dataset_result
+            manifest_used = None
 
         verification_succeeded_bool = verified_dataset is not None
         db_status_after_verification = ""
@@ -1361,39 +1400,56 @@ async def verify_miner_response(
                 else:
                     error_message_for_db = f"Post-manifest op error: {e_ds_ops}"
         else:
-            # Schedule retry – exponential backoff capped at 60 min
-            existing_retry_rec = await task_instance.db_manager.fetch_one(
-                "SELECT retry_count FROM weather_miner_responses WHERE id = :rid",
-                {"rid": response_id},
-            )
-            current_retry_count = (
-                existing_retry_rec["retry_count"]
-                if existing_retry_rec and existing_retry_rec["retry_count"] is not None
-                else 0
-            )
-            new_retry_count = current_retry_count + 1
-            delay_minutes = min(
-                5 * (2 ** (new_retry_count - 1)), 60
-            )  # 5,10,20,40,60,60...
-            next_retry_at = datetime.now(timezone.utc) + timedelta(
-                minutes=delay_minutes
-            )
-
-            db_status_after_verification = "retry_scheduled"
-            error_message_for_db = "Manifest verification failed. Scheduled retry."
+            # HARD FAIL: Do not schedule retries on verification failure
+            db_status_after_verification = "verification_failed"
+            error_message_for_db = "Manifest verification failed. No retries."
             logger.error(
-                f"[VerifyLogic, Resp {response_id}] Manifest verification failed. Scheduling retry #{new_retry_count} in {delay_minutes} min."
+                f"[VerifyLogic, Resp {response_id}] Manifest verification failed. Marking miner as failed with score 0 and no retries."
             )
 
+            # Mark the response as verification_failed and completed for ERA5
             await task_instance.db_manager.execute(
                 """
                 UPDATE weather_miner_responses
-                SET retry_count = :rc,
-                    next_retry_time = :nrt
+                SET status = 'verification_failed',
+                    verification_passed = FALSE,
+                    era5_scoring_completed_at = NOW(),
+                    error_message = COALESCE(:err_msg, error_message)
                 WHERE id = :resp_id
                 """,
-                {"resp_id": response_id, "rc": new_retry_count, "nrt": next_retry_at},
+                {"resp_id": response_id, "err_msg": error_message_for_db},
             )
+
+            # Insert a zero aggregated score to finalize this miner for the run
+            try:
+                resp_meta = await task_instance.db_manager.fetch_one(
+                    "SELECT run_id, miner_uid, miner_hotkey FROM weather_miner_responses WHERE id = :rid",
+                    {"rid": response_id},
+                )
+                if resp_meta:
+                    calc_time = datetime.now(timezone.utc)
+                    await task_instance.db_manager.execute(
+                        """
+                        INSERT INTO weather_miner_scores (
+                            response_id, run_id, miner_uid, miner_hotkey, score_type, score,
+                            calculation_time, error_message, lead_hours, variable_level, valid_time_utc
+                        ) VALUES (
+                            :response_id, :run_id, :miner_uid, :miner_hotkey, 'era5_final_composite_score', 0.0,
+                            :calculation_time, 'verification_failed', -1, 'aggregated_final', :valid_time
+                        )
+                        ON CONFLICT (response_id, score_type, lead_hours, variable_level, valid_time_utc) DO NOTHING
+                        """,
+                        {
+                            "response_id": response_id,
+                            "run_id": resp_meta.get("run_id"),
+                            "miner_uid": resp_meta.get("miner_uid"),
+                            "miner_hotkey": resp_meta.get("miner_hotkey"),
+                            "calculation_time": calc_time,
+                            "valid_time": calc_time,
+                        },
+                    )
+            except Exception as e_ins:
+                logger.debug(f"[VerifyLogic, Resp {response_id}] Could not insert zero aggregated score on verification fail: {e_ins}")
 
         await task_instance.db_manager.execute(
             """ 
@@ -1640,7 +1696,7 @@ async def calculate_era5_miner_score(
             )
             return False
         
-        stored_response_details_query = "SELECT kerchunk_json_url, verification_hash_claimed FROM weather_miner_responses WHERE id = :response_id"
+        stored_response_details_query = "SELECT kerchunk_json_url, verification_hash_claimed, kerchunk_json_retrieved, frozen_manifest_files FROM weather_miner_responses WHERE id = :response_id"
         stored_response_data = await task_instance.db_manager.fetch_one(
             stored_response_details_query, {"response_id": response_id}
         )
@@ -1656,6 +1712,8 @@ async def calculate_era5_miner_score(
             return False
 
         stored_manifest_hash = stored_response_data["verification_hash_claimed"]
+        stored_frozen_manifest = stored_response_data.get("kerchunk_json_retrieved")
+        stored_manifest_files = stored_response_data.get("frozen_manifest_files")
         token_data_tuple = await _request_fresh_token(
             task_instance, miner_hotkey, job_id
         )
@@ -1684,11 +1742,9 @@ async def calculate_era5_miner_score(
 
         access_token, current_zarr_store_url, miner_reported_manifest_hash = token_data_tuple
 
-        logger.info(
-            f"[FinalScore] Miner {miner_hotkey}: Using stored manifest hash: {stored_manifest_hash[:10]}... and current Zarr URL: {current_zarr_store_url}"
-        )
-
-        # STRICT: Ensure miner-reported manifest hash matches originally claimed/stored hash
+        # Always use the stored URL/hash; miner-reported values are ignored except for mismatch detection
+        current_zarr_store_url = stored_response_data["kerchunk_json_url"]
+        # Fail fast if miner reports a different hash now (attempted swap)
         try:
             if miner_reported_manifest_hash and miner_reported_manifest_hash != stored_manifest_hash:
                 logger.error(
@@ -1704,8 +1760,10 @@ async def calculate_era5_miner_score(
                 )
                 return False
         except Exception:
-            # If any DB/log error occurs, fail fast to maintain integrity
             return False
+        logger.info(
+            f"[FinalScore] Miner {miner_hotkey}: Using FROZEN manifest hash {stored_manifest_hash[:10]}... and FROZEN URL {current_zarr_store_url}"
+        )
 
         storage_options = {
             "headers": {"Authorization": f"Bearer {access_token}"},
@@ -1717,9 +1775,13 @@ async def calculate_era5_miner_score(
 
         # RIGOR: Full rehash verification of remote store before any reads
         from ..utils.hashing import recompute_remote_manifest_content_hash
-        from ..utils.hashing import is_rehash_verified, verify_minimal_chunks_and_reconstruct_manifest_hash
-        if not is_rehash_verified(current_zarr_store_url, stored_manifest_hash):
-            # Efficient path: verify only needed chunks for this scoring window (variables/times/levels), then reconstruct manifest hash
+        from ..utils.hashing import verify_minimal_chunks_and_reconstruct_manifest_hash
+        # Optionally run minimal verification for final scoring to pre-detect swaps
+        # Default is disabled (0) to minimize data transfer; rely on verifying mapper during scoring reads
+        n_min_samples = int(task_instance.config.get("era5_minimal_verify_samples", 0))
+        preopened_ds = None
+        if n_min_samples > 0:
+            # Efficient path: verify only needed chunks for this scoring window (variables/times/levels)
             variables = [vc["name"] for vc in variables_to_score if isinstance(vc, dict) and "name" in vc]
             # Build the times to score for this call
             times_to_score = [pd.Timestamp(dt) for dt in target_datetimes]
@@ -1738,6 +1800,7 @@ async def calculate_era5_miner_score(
                 times=times_to_score,
                 levels=levels,
                 headers=storage_options.get("headers"),
+                num_samples=n_min_samples,
                 job_id=f"{job_id}_final_score_minrehash",
             )
             if not ok_rehash:
@@ -1756,22 +1819,54 @@ async def calculate_era5_miner_score(
                 return False
 
         # Reuse verified open dataset if provided by minimal verifier; otherwise open once here
+        requested_variables = sorted({vc["name"] for vc in variables_to_score if isinstance(vc, dict) and vc.get("name")})
+        if not requested_variables:
+            requested_variables = sorted(list({vc for vc in variables_to_score if isinstance(vc, str)}))
+
         if 'preopened_ds' in locals() and preopened_ds is not None:
-            miner_forecast_ds = preopened_ds
+            miner_forecast_ds = preopened_ds[[var for var in requested_variables if var in preopened_ds.data_vars]]
         else:
-            miner_forecast_ds = await asyncio.wait_for(
-                open_verified_remote_zarr_dataset(
+            result_dataset = await asyncio.wait_for(
+                open_verified_remote_zarr_variable(
                     zarr_store_url=current_zarr_store_url,
                     claimed_manifest_content_hash=stored_manifest_hash,
                     miner_hotkey_ss58=miner_hotkey,
+                    variable_names=requested_variables,
                     storage_options=storage_options,
                     job_id=f"{job_id}_final_score_reverify",
+                    frozen_manifest=stored_frozen_manifest,
+                    return_manifest=True,
                 ),
                 timeout=verification_timeout_seconds,
             )
+            if isinstance(result_dataset, tuple):
+                miner_forecast_ds, manifest_used = result_dataset
+                if manifest_used and not stored_frozen_manifest:
+                    try:
+                        await task_instance.db_manager.execute(
+                            """
+                            UPDATE weather_miner_responses
+                            SET kerchunk_json_retrieved = COALESCE(kerchunk_json_retrieved, :manifest::jsonb),
+                                frozen_manifest_files = COALESCE(frozen_manifest_files, :files::jsonb)
+                            WHERE id = :rid
+                            """,
+                            {
+                                "rid": response_id,
+                                "manifest": dumps(manifest_used),
+                                "files": dumps(manifest_used.get("files", {})) if isinstance(manifest_used, dict) else None,
+                            },
+                        )
+                    except Exception as freeze_err:
+                        logger.warning(f"[FinalScore] Failed to freeze manifest from open path: {freeze_err}")
+                        stored_frozen_manifest = stored_frozen_manifest or manifest_used
+                else:
+                    stored_frozen_manifest = stored_frozen_manifest or manifest_used
+            else:
+                miner_forecast_ds = result_dataset
+
         if miner_forecast_ds is None:
             logger.error(
-                f"[FinalScore] Failed to open verified Zarr dataset for miner {miner_hotkey} - manifest verification failed"
+                f"[FinalScore] Manifest verification FAILED for miner {miner_hotkey} — frozen manifest does not match served content (possible file swap/cheating)."
             )
             # Mark this miner as failed but don't crash the entire batch
             await task_instance.db_manager.execute(
@@ -1866,46 +1961,7 @@ async def calculate_era5_miner_score(
 
         # PRE-LOAD STRATEGY: Download all required data chunks ONCE before processing
         # This prevents duplicate HTTP requests when processing multiple variables
-        logger.info(f"[FinalScore] Miner {miner_hotkey}: Pre-loading forecast data to prevent duplicate requests...")
-        preload_start_time = time.time()
-        
-        try:
-            variables_needed = [var_config.get("name") for var_config in variables_to_score if isinstance(var_config, dict) and var_config.get("name")]
-            variables_in_dataset = [var for var in variables_needed if var in miner_forecast_ds.data_vars]
-            
-            if variables_in_dataset:
-                # Convert target datetimes to proper time coordinates for selection
-                time_coords = []
-                for dt in target_datetimes:
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    else:
-                        dt = dt.astimezone(timezone.utc)
-                    time_coords.append(pd.Timestamp(dt))
-                
-                # Select only the variables and times we need
-                miner_subset = miner_forecast_ds[variables_in_dataset].sel(time=time_coords, method="nearest")
-                
-                # Load all data at once to cache in memory
-                await asyncio.to_thread(lambda: miner_subset.load())
-                
-                # Replace the original dataset with the pre-loaded subset
-                miner_forecast_ds = miner_subset
-                
-                preload_time = time.time() - preload_start_time
-                logger.info(f"[FinalScore] Miner {miner_hotkey}: Pre-loaded forecast data in {preload_time:.2f}s - processing will use cached data")
-            else:
-                logger.warning(f"[FinalScore] Miner {miner_hotkey}: No scoring variables found in dataset")
-                
-        except Exception as preload_err:
-            preload_time = time.time() - preload_start_time
-            logger.warning(f"[FinalScore] Miner {miner_hotkey}: Pre-loading failed after {preload_time:.2f}s: {preload_err}")
-            logger.warning("Continuing with lazy loading (may result in duplicate requests)")
-
-        if gfs_operational_fcst_ds is None:
-            logger.debug(
-                f"[FinalScore] Miner {miner_hotkey}: Using ERA5-climatology-based skill scores only (no GFS operational reference in final scoring)"
-            )
+        logger.info(f"[FinalScore] Miner {miner_hotkey}: Skipping dataset-wide preloading; relying on on-demand verified reads per variable/time.")
 
         for valid_time_dt in target_datetimes:
             logger.info(
@@ -2201,7 +2257,7 @@ async def calculate_era5_miner_score(
                     }
 
                     miner_var_mappings = {
-                        "2t": ["2t", "temperature_2m"],  # FIXED: Remove "t" to avoid confusion with atmospheric temperature
+                        "2t": ["2t", "t2m", "temperature_2m"],  # include common alias 't2m'
                         "10u": ["10u", "u10", "10m_u_component_of_wind"],
                         "10v": ["10v", "v10", "10m_v_component_of_wind"],
                         "msl": ["msl", "mean_sea_level_pressure", "sp"],
@@ -2253,6 +2309,36 @@ async def calculate_era5_miner_score(
                                 logger.info(f"  Dimensions: {selected_var.dims}")
                                 logger.info(f"  Shape: {selected_var.shape}")
                                 logger.info(f"  Attributes: {dict(selected_var.attrs)}")
+                                # LIGHT VERIFICATION PROBE: trigger a single chunk read through verifying mapper
+                                try:
+                                    probe_da = selected_var
+                                    # Prefer center point if lat/lon available, otherwise first element
+                                    lat_dim = next((d for d in probe_da.dims if d.lower() in ("lat", "latitude")), None)
+                                    lon_dim = next((d for d in probe_da.dims if d.lower() in ("lon", "longitude")), None)
+                                    indexer = {}
+                                    if lat_dim:
+                                        indexer[lat_dim] = probe_da.sizes.get(lat_dim, 1) // 2
+                                    if lon_dim:
+                                        indexer[lon_dim] = probe_da.sizes.get(lon_dim, 1) // 2
+                                    if indexer:
+                                        _ = probe_da.isel(**indexer).values  # forces verified read
+                                    else:
+                                        _ = probe_da.isel(...).values
+                                    logger.debug(f"[FinalScore] Verification probe succeeded for '{alt_name}' at {valid_time_dt}")
+                                except Exception as probe_err:
+                                    logger.error(
+                                        f"[FinalScore] Verification probe FAILED for '{alt_name}' at {valid_time_dt}: {probe_err}"
+                                    )
+                                    await task_instance.db_manager.execute(
+                                        """
+                                        UPDATE weather_miner_responses 
+                                        SET status = 'verification_failed', error_message = 'Verification probe failed before scoring'
+                                        WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey
+                                        """,
+                                        {"run_id": run_id, "miner_hotkey": miner_hotkey},
+                                    )
+                                    await _check_run_completion(task_instance, run_id)
+                                    return False
                                 break
                         else:
                             logger.error(
@@ -2661,7 +2747,31 @@ async def calculate_era5_miner_score(
                     def calculate_raw_mse_preserve_dims(*args, **kwargs):
                         """Calculate MSE preserving pressure level dimensions for per-level processing."""
                         try:
-                            res = xs.mse(*args, **kwargs)
+                            # Defensive rechunk to avoid dask core-dimension errors on lat/lon
+                            def _rechunk_if_needed(da):
+                                try:
+                                    import dask.array as _da
+                                    if hasattr(da, "data") and hasattr(da.data, "chunks"):
+                                        # If lat/lon are chunked into multiple chunks, rechunk to single chunk
+                                        chunk_map = {}
+                                        if "lat" in getattr(da, "dims", ()):  # type: ignore
+                                            chunk_map["lat"] = -1
+                                        if "lon" in getattr(da, "dims", ()):  # type: ignore
+                                            chunk_map["lon"] = -1
+                                        if chunk_map:
+                                            return da.chunk(chunk_map)
+                                except Exception:
+                                    pass
+                                return da
+
+                            new_args = []
+                            for a in args:
+                                if hasattr(a, "dims"):
+                                    new_args.append(_rechunk_if_needed(a))
+                                else:
+                                    new_args.append(a)
+
+                            res = xs.mse(*new_args, **kwargs)
                             if hasattr(res, "compute"):
                                 res = res.compute()
                             return res  # Return raw result, preserving dimensions

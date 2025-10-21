@@ -367,7 +367,7 @@ async def calculate_acc_by_pressure_level(
     try:
         spatial_dims = [
             d for d in forecast_da.dims
-            if d.lower() in ("latitude", "longitude", "lat", "lon")
+            if d.lower() in ("latitude", "longitude", "lat", "lon", "lat_lon")
         ]
         if not spatial_dims:
             logger.error("No spatial dimensions (lat/lon) found for ACC.")
@@ -376,6 +376,26 @@ async def calculate_acc_by_pressure_level(
         # Calculate anomalies once
         forecast_anom = forecast_da - climatology_da
         truth_anom = truth_da - climatology_da
+
+        # Rechunk guard for Dask core-dimension errors (lat, lon, or combined lat_lon)
+        def _rechunk_spatial(da: xr.DataArray) -> xr.DataArray:
+            try:
+                dims = getattr(da, "dims", ())
+                chunk_map = {}
+                if "lat" in dims:
+                    chunk_map["lat"] = -1
+                if "lon" in dims:
+                    chunk_map["lon"] = -1
+                if "lat_lon" in dims:
+                    chunk_map["lat_lon"] = -1
+                if chunk_map:
+                    return da.chunk(chunk_map)
+            except Exception:
+                pass
+            return da
+
+        forecast_anom = _rechunk_spatial(forecast_anom)
+        truth_anom = _rechunk_spatial(truth_anom)
 
         # Debug logging
         logger.debug(f"ACC calculation - Data dims: {forecast_da.dims}, spatial_dims: {spatial_dims}")
@@ -386,9 +406,10 @@ async def calculate_acc_by_pressure_level(
         if lat_weights is not None:
             weights_dims_set = set(lat_weights.dims)
             spatial_dims_set = set(spatial_dims)
-            if weights_dims_set != spatial_dims_set:
+            if not spatial_dims_set.issubset(weights_dims_set) and weights_dims_set != spatial_dims_set:
                 raise ValueError(
-                    f"Weights dims must match spatial dims exactly. Spatial dims: {spatial_dims}, Weights dims: {list(lat_weights.dims)}"
+                    f"Weights dims must match spatial dims exactly or be broadcastable. "
+                    f"Spatial dims: {spatial_dims}, Weights dims: {list(lat_weights.dims)}"
                 )
 
         # Debug the input data dimensions before calling xskillscore
@@ -403,7 +424,7 @@ async def calculate_acc_by_pressure_level(
             xs.pearson_r,
             forecast_anom,
             truth_anom,
-            dim=spatial_dims,  # Only reduce lat/lon, preserve pressure_level
+            dim=spatial_dims,  # Only reduce spatial dims, preserve pressure_level
             weights=validated_weights,
             skipna=True,
         )
@@ -420,22 +441,16 @@ async def calculate_acc_by_pressure_level(
         # Extract per-pressure-level scores
         per_level_scores = {}
         if "pressure_level" in acc_result.dims:
-            # Atmospheric variable - extract each pressure level
             for level in acc_result.coords["pressure_level"]:
                 level_val = int(level.item())
                 level_result = acc_result.sel(pressure_level=level)
-                
-                # Handle case where result might still have extra dimensions
                 if level_result.size == 1:
                     score_val = float(level_result.item())
                 else:
-                    # If still multi-dimensional, take mean (shouldn't happen with proper spatial reduction)
                     logger.warning(f"ACC result for level {level_val} has {level_result.size} elements, taking mean")
                     score_val = float(level_result.mean().item())
-                
                 per_level_scores[level_val] = score_val
         else:
-            # Surface variable - single score must be scalar
             if acc_result.size != 1:
                 raise ValueError(
                     f"Surface ACC result must be scalar. Got size={acc_result.size}"

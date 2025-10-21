@@ -946,7 +946,17 @@ async def _fetch_single_day_era5(
             ]
 
             logger.debug(f"Requesting single level data for {date_str}")
-            c.retrieve("reanalysis-era5-single-levels", sl_request, str(temp_sl_file))
+            try:
+                c.retrieve("reanalysis-era5-single-levels", sl_request, str(temp_sl_file))
+            except Exception as e_sl:
+                try:
+                    import traceback as _tb
+                    logger.error(
+                        f"ERA5 single-level retrieve failed for {date_str}: {type(e_sl).__name__}: {e_sl}\n{''.join(_tb.format_exc(limit=3))}"
+                    )
+                except Exception:
+                    pass
+                raise
 
             # Fetch pressure level data
             pl_request = common_request.copy()
@@ -960,7 +970,17 @@ async def _fetch_single_day_era5(
             pl_request["pressure_level"] = AURORA_PRESSURE_LEVELS
 
             logger.debug(f"Requesting pressure level data for {date_str}")
-            c.retrieve("reanalysis-era5-pressure-levels", pl_request, str(temp_pl_file))
+            try:
+                c.retrieve("reanalysis-era5-pressure-levels", pl_request, str(temp_pl_file))
+            except Exception as e_pl:
+                try:
+                    import traceback as _tb
+                    logger.error(
+                        f"ERA5 pressure-level retrieve failed for {date_str}: {type(e_pl).__name__}: {e_pl}\n{''.join(_tb.format_exc(limit=3))}"
+                    )
+                except Exception:
+                    pass
+                raise
 
             # Process and combine the downloaded data
             logger.debug(f"Processing downloaded data for {date_str}")

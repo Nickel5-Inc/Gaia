@@ -56,6 +56,8 @@ async def reconcile_run(db: ValidatorDatabaseManager, run_id: int) -> int:
             SELECT r.run_id, r.miner_uid, r.miner_hotkey, r.verification_passed, r.status AS response_status, r.id AS response_id
             FROM weather_miner_responses r
             WHERE r.run_id = :rid
+              AND COALESCE(r.verification_passed, FALSE) = TRUE
+              AND r.status <> 'verification_failed'
             """
         ),
         {"rid": run_id},
@@ -66,6 +68,9 @@ async def reconcile_run(db: ValidatorDatabaseManager, run_id: int) -> int:
         if uid is None:
             continue
         if not await _is_miner_registered(db, uid):
+            continue
+        # Skip any miner responses that failed manifest verification or are in a failed state
+        if r.get("response_status") in {"verification_failed", "failed", "error"}:
             continue
 
         # Enforce dependency: if any earlier lead exhausted retries, do not create later leads

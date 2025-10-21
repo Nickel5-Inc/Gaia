@@ -124,6 +124,12 @@ async def recompute_remote_manifest_content_hash(
     Returns (ok, details_dict)
     """
     start_time = time.time()
+    try:
+        logger.info(
+            f"REHASH START Job {job_id}: store={zarr_store_url} claimed_hash={claimed_manifest_content_hash[:10]}..."
+        )
+    except Exception:
+        pass
     details: Dict[str, Any] = {
         "job_id": job_id,
         "store": zarr_store_url,
@@ -226,6 +232,12 @@ async def recompute_remote_manifest_content_hash(
     recomputed_content_hash = hashlib.sha256(manifest_json_bytes).hexdigest()
     details["recomputed_hash"] = recomputed_content_hash
     details["duration_seconds"] = time.time() - start_time
+    try:
+        logger.info(
+            f"REHASH END Job {job_id}: recomputed_hash={recomputed_content_hash[:10]}... files_processed={details.get('files_processed')} mismatches={mismatches} missing={missing} duration={details['duration_seconds']:.2f}s"
+        )
+    except Exception:
+        pass
 
     # Strict check: recomputed content hash must equal claimed
     if recomputed_content_hash != claimed_manifest_content_hash:
@@ -253,6 +265,7 @@ async def verify_minimal_chunks_and_reconstruct_manifest_hash(
     variables: List[str],
     times: List[pd.Timestamp],
     levels: Optional[List[int]] = None,
+    num_samples: int = 64,
     headers: Optional[Dict[str, str]] = None,
     job_id: Optional[str] = "unknown_job",
 ) -> Tuple[bool, Dict[str, Any], Optional[xr.Dataset]]:
@@ -262,6 +275,12 @@ async def verify_minimal_chunks_and_reconstruct_manifest_hash(
     the final content hash equals the claimed hash.
     """
     start_time = time.time()
+    try:
+        logger.info(
+            f"MIN-REHASH START Job {job_id}: store={zarr_store_url} claimed_hash={claimed_manifest_content_hash[:10]}..."
+        )
+    except Exception:
+        pass
     # removed code marker
     details: Dict[str, Any] = {
         "job_id": job_id,
@@ -359,57 +378,113 @@ async def verify_minimal_chunks_and_reconstruct_manifest_hash(
         # keep the provided times; selection will snap to nearest
         pass
 
-    # Actively read a minimal subset to force mapper verification
+    # Deterministic sampling across variables/times/levels/lat/lon to force mapper verification
+    def _choose_dim(name_candidates: List[str], dims: Tuple[str, ...]) -> Optional[str]:
+        lower = {d.lower(): d for d in dims}
+        for c in name_candidates:
+            if c.lower() in lower:
+                return lower[c.lower()]
+        return None
+
+    # Secret-salted deterministic seed for reproducibility and unpredictability to miners
+    try:
+        import os as _os
+        import hmac as _hmac
+        seed_material_str = f"{claimed_manifest_content_hash}:{miner_hotkey_ss58}:{job_id}"
+        secret = _os.environ.get("EARTHDATA_API_KEY", "")
+        if secret:
+            seed_bytes = _hmac.new(secret.encode("utf-8"), seed_material_str.encode("utf-8"), hashlib.sha256).digest()[:8]
+        else:
+            # Fallback to non-salted deterministic seed if secret not present
+            seed_bytes = hashlib.sha256(seed_material_str.encode("utf-8")).digest()[:8]
+        seed_int = int.from_bytes(seed_bytes, byteorder="big", signed=False)
+    except Exception:
+        seed_int = 0xC0FFEE
+    rng = np.random.default_rng(seed_int)
+
+    # Normalize times list to pandas Timestamps if provided
+    provided_times: List[pd.Timestamp] = []
+    try:
+        if isinstance(times_to_check, list):
+            provided_times = [pd.Timestamp(t) for t in times_to_check]
+    except Exception:
+        provided_times = []
+
+    total_samples = max(1, int(num_samples))
+    per_var = max(1, total_samples // max(1, len(vars_present)))
+    remainder = total_samples - per_var * max(1, len(vars_present))
+
     verified_count = 0
     try:
-        for var_name in vars_present:
+        for v_idx, var_name in enumerate(vars_present):
             da = ds_full[var_name]
-            # select up to 2 provided times to limit IO
-            sel_times = times_to_check[:2] if isinstance(times_to_check, list) else times_to_check
-            try:
-                if sel_times:
-                    da_sel = da.sel(time=sel_times, method="nearest", drop=True)
-                else:
-                    da_sel = da.isel(time=slice(0, 1)) if "time" in da.dims else da
-            except Exception:
-                da_sel = da.isel(time=slice(0, 1)) if "time" in da.dims else da
+            var_samples = per_var + (1 if v_idx < remainder else 0)
 
-            # include a representative level if present
-            level_dim_candidates = [d for d in da_sel.dims if d.lower() in ("level", "pressure_level", "isobaricinhpa", "plev")]
-            if level_dim_candidates:
-                lev = level_dim_candidates[0]
-                if da_sel.sizes.get(lev, 0) > 0:
-                    da_sel = da_sel.isel({lev: 0})
+            # Identify common dims
+            dims = tuple(da.dims)
+            time_dim = _choose_dim(["time", "valid_time"], dims)
+            level_dim = _choose_dim(["level", "pressure_level", "isobaricinhpa", "plev"], dims)
+            lat_dim = _choose_dim(["lat", "latitude", "y"], dims)
+            lon_dim = _choose_dim(["lon", "longitude", "x"], dims)
 
-            # pick a couple of points to trigger chunk reads
-            try:
-                lat_dim = next((d for d in da_sel.dims if d.lower() in ("lat", "latitude", "y")), None)
-                lon_dim = next((d for d in da_sel.dims if d.lower() in ("lon", "longitude", "x")), None)
-                if lat_dim and lon_dim and da_sel.sizes.get(lat_dim, 0) > 0 and da_sel.sizes.get(lon_dim, 0) > 0:
-                    pts = [
-                        {lat_dim: 0, lon_dim: 0},
-                        {lat_dim: da_sel.sizes[lat_dim] // 2, lon_dim: da_sel.sizes[lon_dim] // 2},
-                    ]
-                    for pt in pts:
-                        _ = da_sel.isel(**pt).values  # forces read → hash check via mapper
-                        verified_count += 1
-                else:
-                    # fallback: load small slice
-                    _ = da_sel.isel(...).values
+            # Fetch sizes
+            size_time = da.sizes.get(time_dim, 0) if time_dim else 0
+            size_level = da.sizes.get(level_dim, 0) if level_dim else 0
+            size_lat = da.sizes.get(lat_dim, 0) if lat_dim else 0
+            size_lon = da.sizes.get(lon_dim, 0) if lon_dim else 0
+
+            for _ in range(var_samples):
+                sel_da = da
+                # Select time (prefer provided times with nearest selection)
+                try:
+                    if time_dim:
+                        if provided_times:
+                            t_choice = provided_times[rng.integers(0, len(provided_times))]
+                            sel_da = sel_da.sel({time_dim: t_choice}, method="nearest", drop=True)
+                        elif size_time > 0:
+                            t_idx = int(rng.integers(0, size_time))
+                            sel_da = sel_da.isel({time_dim: t_idx})
+                except Exception:
+                    # Fallback to first index if selection fails
+                    if time_dim and size_time > 0:
+                        sel_da = sel_da.isel({time_dim: 0})
+
+                # Select level (random index if present)
+                try:
+                    if level_dim and size_level > 0:
+                        lev_idx = int(rng.integers(0, size_level))
+                        sel_da = sel_da.isel({level_dim: lev_idx})
+                except Exception:
+                    if level_dim and size_level > 0:
+                        sel_da = sel_da.isel({level_dim: 0})
+
+                # Select spatial point
+                try:
+                    indexer: Dict[str, int] = {}
+                    if lat_dim and size_lat > 0:
+                        indexer[lat_dim] = int(rng.integers(0, size_lat))
+                    if lon_dim and size_lon > 0:
+                        indexer[lon_dim] = int(rng.integers(0, size_lon))
+                    if indexer:
+                        _ = sel_da.isel(**indexer).values
+                    else:
+                        _ = sel_da.isel(...).values
                     verified_count += 1
-            except Exception as read_err:
-                details["error"] = f"subset_chunk_verification_failed: {read_err}"
-                details["verified_subset_files"] = verified_count
-                details["duration_seconds"] = time.time() - start_time
-                return False, details, None
+                except Exception as read_err:
+                    details["error"] = f"subset_chunk_verification_failed: {read_err}"
+                    details["verified_subset_files"] = verified_count
+                    details["duration_seconds"] = time.time() - start_time
+                    return False, details, None
     except Exception as e_any:
         details["error"] = f"subset_verification_error: {e_any}"
         details["verified_subset_files"] = verified_count
         details["duration_seconds"] = time.time() - start_time
         return False, details, None
 
-    details["verification_mode"] = "subset_read_enforced"
+    details["verification_mode"] = "deterministic_sampling"
     details["verified_subset_files"] = verified_count
+    details["num_samples_requested"] = total_samples
+    details["sampling_seed"] = seed_int
 
     # Reconstruct manifest content hash from trusted manifest metadata
     manifest_to_hash = {
@@ -423,6 +498,12 @@ async def verify_minimal_chunks_and_reconstruct_manifest_hash(
     recomputed_content_hash = hashlib.sha256(manifest_json_bytes).hexdigest()
     details["recomputed_content_hash"] = recomputed_content_hash
     details["duration_seconds"] = time.time() - start_time
+    try:
+        logger.info(
+            f"MIN-REHASH END Job {job_id}: recomputed_hash={recomputed_content_hash[:10]}... verified_subset_files={details.get('verified_subset_files')} duration={details['duration_seconds']:.2f}s"
+        )
+    except Exception:
+        pass
     if recomputed_content_hash != claimed_manifest_content_hash:
         details["error"] = "content_hash_mismatch"
         return False, details, ds_full
@@ -1783,29 +1864,32 @@ class VerifyingChunkMapper(fsspec.mapping.FSMap):
         request_msg = f"🌐 ZARR REQUEST [{process_name}:{thread_name}] Job {self.job_id_for_logging}: Requesting chunk '{key}'"
         logger.info(request_msg)
         print(f"DEBUG ZARR: {request_msg}", flush=True)  # Immediate output for testing
+        # Normalize key to match manifest entries (strip any leading '/')
+        lookup_key = key.lstrip("/")
+
         # LRU cache check
-        if key in self._chunk_cache:
-            content = self._chunk_cache.pop(key)
-            self._chunk_cache[key] = content
-            expected_hash = self.trusted_manifest_files.get(key)
+        if lookup_key in self._chunk_cache:
+            content = self._chunk_cache.pop(lookup_key)
+            self._chunk_cache[lookup_key] = content
+            expected_hash = self.trusted_manifest_files.get(lookup_key)
             if expected_hash is not None:
-                computed_hash = self._hash_chunk(key, content)
+                computed_hash = self._hash_chunk(lookup_key, content)
                 if computed_hash != expected_hash:
                     msg = (
-                        f"CHUNK INTEGRITY FAIL Job {self.job_id_for_logging}: For cached chunk '{key}'. "
+                        f"CHUNK INTEGRITY FAIL Job {self.job_id_for_logging}: For cached chunk '{lookup_key}'. "
                         f"Expected: {expected_hash}, Computed: {computed_hash}"
                     )
                     logger.error(msg)
                     # Drop bad cache and fall through to fetch
-                    self._chunk_cache.pop(key, None)
+                    self._chunk_cache.pop(lookup_key, None)
                 else:
                     logger.debug(
-                        f"Job {self.job_id_for_logging}: Served '{key}' from cache with verified integrity"
+                        f"Job {self.job_id_for_logging}: Served '{lookup_key}' from cache with verified integrity"
                     )
                     return content
 
         chunk_content_bytes = super().__getitem__(key)
-        expected_hash = self.trusted_manifest_files.get(key)
+        expected_hash = self.trusted_manifest_files.get(lookup_key)
         if expected_hash is None:
             if key.startswith(".") or key.endswith(
                 (".zarray", ".zattrs", ".zgroup", ".zmetadata")
@@ -1815,20 +1899,20 @@ class VerifyingChunkMapper(fsspec.mapping.FSMap):
                 )
                 return chunk_content_bytes
             else:
-                msg = f"Data chunk path '{key}' not found in trusted manifest for job {self.job_id_for_logging}. Cannot verify integrity."
+                msg = f"Data chunk path '{lookup_key}' not found in trusted manifest for job {self.job_id_for_logging}. Cannot verify integrity."
                 logger.error(msg)
                 raise KeyError(msg)
-        computed_hash = self._hash_chunk(key, chunk_content_bytes)
+        computed_hash = self._hash_chunk(lookup_key, chunk_content_bytes)
         if computed_hash != expected_hash:
-            msg = f"CHUNK INTEGRITY FAIL Job {self.job_id_for_logging}: For chunk '{key}'. Expected: {expected_hash}, Computed: {computed_hash}"
+            msg = f"CHUNK INTEGRITY FAIL Job {self.job_id_for_logging}: For chunk '{lookup_key}'. Expected: {expected_hash}, Computed: {computed_hash}"
             logger.error(msg)
             raise IOError(msg)
         logger.debug(
-            f"Job {self.job_id_for_logging}: Chunk integrity PASSED for '{key}'"
+            f"Job {self.job_id_for_logging}: Chunk integrity PASSED for '{lookup_key}'"
         )
         # Insert into LRU cache
         try:
-            self._chunk_cache[key] = chunk_content_bytes
+            self._chunk_cache[lookup_key] = chunk_content_bytes
             if len(self._chunk_cache) > self._chunk_cache_max_entries:
                 self._chunk_cache.popitem(last=False)
         except Exception:
