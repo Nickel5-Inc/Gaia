@@ -3946,7 +3946,14 @@ class GaiaValidator:
 
                     # Track last enqueued dates to avoid relying on exact clock minutes
                     last_reconcile_date = None
-                    
+                    # Track last-run times for periodic jobs to avoid modulo-boundary misses
+                    last_weight_check_at = None
+                    last_stats_enqueue_at = None
+                    last_metagraph_sync_at = None
+                    last_miner_dereg_at = None
+                    metagraph_interval = _dt.timedelta(minutes=20)
+                    miners_interval = _dt.timedelta(minutes=20)
+
                     # CRITICAL: Enqueue essential jobs after stability wait
                     startup_now = _dt.datetime.now(_dt.timezone.utc)
                     logger.info("🚀 Enqueuing critical startup jobs (metagraph sync, node table population)")
@@ -3957,6 +3964,7 @@ class GaiaValidator:
                         priority=150,
                         scheduled_at=startup_now,
                     )
+                    last_metagraph_sync_at = startup_now
                     await db.enqueue_singleton_job(
                         singleton_key="miners_handle_deregistrations",
                         job_type="miners.handle_deregistrations",
@@ -3964,6 +3972,7 @@ class GaiaValidator:
                         priority=160,
                         scheduled_at=startup_now,
                     )
+                    last_miner_dereg_at = startup_now
                     
                     while not self._shutdown_event.is_set():
                         try:
@@ -3988,21 +3997,29 @@ class GaiaValidator:
                             except Exception:
                                 pass
                             now = _dt.datetime.now(_dt.timezone.utc)
-                            # Stats aggregation and subnet snapshot every 10 minutes
-                            await db.enqueue_singleton_job(
-                                singleton_key="stats_aggregate",
-                                job_type="stats.aggregate",
-                                payload={"ts": now.isoformat()},
-                                priority=120,
-                                scheduled_at=now,
-                            )
-                            await db.enqueue_singleton_job(
-                                singleton_key="stats_subnet_snapshot",
-                                job_type="stats.subnet_snapshot",
-                                payload={"ts": now.isoformat()},
-                                priority=130,
-                                scheduled_at=now,
-                            )
+                            # Stats aggregation and subnet snapshot every 10 minutes (gated)
+                            try:
+                                if (
+                                    last_stats_enqueue_at is None
+                                    or (now - last_stats_enqueue_at).total_seconds() >= 600
+                                ):
+                                    await db.enqueue_singleton_job(
+                                        singleton_key="stats_aggregate",
+                                        job_type="stats.aggregate",
+                                        payload={"ts": now.isoformat()},
+                                        priority=120,
+                                        scheduled_at=now,
+                                    )
+                                    await db.enqueue_singleton_job(
+                                        singleton_key="stats_subnet_snapshot",
+                                        job_type="stats.subnet_snapshot",
+                                        payload={"ts": now.isoformat()},
+                                        priority=130,
+                                        scheduled_at=now,
+                                    )
+                                    last_stats_enqueue_at = now
+                            except Exception:
+                                pass
                             # Weights: handle directly in main validator process (has substrate access)
                             try:
                                 current_block = self._get_current_block_cached()
@@ -4050,42 +4067,106 @@ class GaiaValidator:
                             except Exception as e:
                                 logger.error(f"[WeightScheduler] Error in block-based weight scheduling: {e}")
                             
-                            # Sleep for 30 minutes between checks since 250 blocks ≈ 50 minutes (12s/block)
-                            # This reduces unnecessary substrate queries while still being responsive
-                            await asyncio.sleep(1800)  # 30 minutes
-                            
-                            
-                            now = _dt.datetime.now(_dt.timezone.utc)
-                            
-                            # Metagraph sync and miner dereg handling every 5 minutes
-                            if now.minute % 5 == 0:
-                                # Periodic recovery: unstick deregistration job if lease expired
-                                try:
-                                    await db.execute(
-                                        """
-                                        UPDATE validator_jobs
-                                        SET status = 'pending', claimed_by = NULL, started_at = NULL, lease_expires_at = NULL
-                                        WHERE job_type = 'miners.handle_deregistrations' 
-                                          AND status = 'in_progress' 
-                                          AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
-                                        """
+                            # Gate weight checks every ~30 minutes to avoid frequent substrate queries
+                            try:
+                                if (
+                                    last_weight_check_at is None
+                                    or (now - last_weight_check_at).total_seconds() >= 1800
+                                ):
+                                    # Perform the block-based weight scheduling check
+                                    try:
+                                        current_block = self._get_current_block_cached()
+                                        target_block_interval = 250  # Target ~250 blocks between weight sets
+                                        if self.validator_uid is not None:
+                                            try:
+                                                from gaia.validator.weights.weight_service import get_last_weight_set_block_from_chain
+                                                last_weight_block_chain = await get_last_weight_set_block_from_chain(
+                                                    self.substrate, self.netuid, int(self.validator_uid)
+                                                )
+                                                blocks_since_weights = current_block - last_weight_block_chain
+                                                logger.debug(f"[WeightScheduler] Current block: {current_block}, Chain last weight block: {last_weight_block_chain}, Blocks since: {blocks_since_weights}")
+                                                if blocks_since_weights >= target_block_interval:
+                                                    logger.info(f"[WeightScheduler] Setting weights directly - {blocks_since_weights} blocks since last set (target: {target_block_interval})")
+                                                    from gaia.validator.weights.weight_service import commit_weights_if_eligible
+                                                    weight_success = await commit_weights_if_eligible(self)
+                                                    if weight_success:
+                                                        logger.success("[WeightScheduler] ✅ Weight setting completed successfully")
+                                                    else:
+                                                        logger.info("[WeightScheduler] ⏳ Weight setting not eligible yet")
+                                            except Exception as chain_error:
+                                                logger.warning(f"[WeightScheduler] Failed to get chain weight data: {chain_error}")
+                                                blocks_since_weights = current_block - self.last_set_weights_block
+                                                logger.debug(f"[WeightScheduler] Fallback - Current block: {current_block}, Local last weight block: {self.last_set_weights_block}, Blocks since: {blocks_since_weights}")
+                                                if blocks_since_weights >= target_block_interval:
+                                                    logger.info(f"[WeightScheduler] Setting weights directly (fallback) - {blocks_since_weights} blocks since last set")
+                                                    from gaia.validator.weights.weight_service import commit_weights_if_eligible
+                                                    weight_success = await commit_weights_if_eligible(self)
+                                                    if weight_success:
+                                                        logger.success("[WeightScheduler] ✅ Weight setting completed successfully (fallback)")
+                                                    else:
+                                                        logger.info("[WeightScheduler] ⏳ Weight setting not eligible yet (fallback)")
+                                        else:
+                                            logger.debug("[WeightScheduler] Validator UID not available, skipping weight scheduling")
+                                    except Exception as e:
+                                        logger.error(f"[WeightScheduler] Error in block-based weight scheduling: {e}")
+                                    finally:
+                                        last_weight_check_at = now
+                            except Exception:
+                                pass
+
+                            # Metagraph sync and miner deregistration every 20 minutes (gated by timestamp)
+                            try:
+                                if (
+                                    last_metagraph_sync_at is None
+                                    or now - last_metagraph_sync_at >= metagraph_interval
+                                ):
+                                    try:
+                                        await db.execute(
+                                            """
+                                            UPDATE validator_jobs
+                                            SET status = 'pending', claimed_by = NULL, started_at = NULL, lease_expires_at = NULL
+                                            WHERE job_type = 'metagraph.sync'
+                                              AND status = 'in_progress'
+                                              AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
+                                            """
+                                        )
+                                    except Exception:
+                                        pass
+                                    await db.enqueue_singleton_job(
+                                        singleton_key="metagraph_sync",
+                                        job_type="metagraph.sync",
+                                        payload={},
+                                        priority=150,
+                                        scheduled_at=now,
                                     )
-                                except Exception:
-                                    pass
-                                await db.enqueue_singleton_job(
-                                    singleton_key="metagraph_sync",
-                                    job_type="metagraph.sync",
-                                    payload={},
-                                    priority=150,
-                                    scheduled_at=now,
-                                )
-                                await db.enqueue_singleton_job(
-                                    singleton_key="miners_handle_deregistrations",
-                                    job_type="miners.handle_deregistrations",
-                                    payload={},
-                                    priority=160,
-                                    scheduled_at=now,
-                                )
+                                    last_metagraph_sync_at = now
+
+                                if (
+                                    last_miner_dereg_at is None
+                                    or now - last_miner_dereg_at >= miners_interval
+                                ):
+                                    try:
+                                        await db.execute(
+                                            """
+                                            UPDATE validator_jobs
+                                            SET status = 'pending', claimed_by = NULL, started_at = NULL, lease_expires_at = NULL
+                                            WHERE job_type = 'miners.handle_deregistrations' 
+                                              AND status = 'in_progress' 
+                                              AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
+                                            """
+                                        )
+                                    except Exception:
+                                        pass
+                                    await db.enqueue_singleton_job(
+                                        singleton_key="miners_handle_deregistrations",
+                                        job_type="miners.handle_deregistrations",
+                                        payload={},
+                                        priority=160,
+                                        scheduled_at=now,
+                                    )
+                                    last_miner_dereg_at = now
+                            except Exception:
+                                pass
                             # ERA5 token refresh hourly on top of the hour
                             if now.minute == 0:
                                 await db.enqueue_singleton_job(

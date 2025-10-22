@@ -18,14 +18,12 @@ from gaia.tasks.defined_tasks.weather.pipeline.steps import seed_step
 from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import (
     evaluate_miner_forecast_day1,
 )
-from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
 from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
     fetch_gfs_analysis_data,
     fetch_gfs_data,
 )
 from gaia.validator.utils.substrate_manager import get_process_isolated_substrate
 from fiber.chain.fetch_nodes import get_nodes_for_netuid
-from gaia.validator.weights.weight_service import commit_weights_if_eligible
 import os
 import re
 from pathlib import Path
@@ -67,6 +65,250 @@ async def _autosync_startup_barrier(db: ValidatorDatabaseManager) -> bool:
     except Exception:
         return False
 
+
+
+async def _handle_metagraph_job(job: Dict[str, Any], db: ValidatorDatabaseManager, validator: Optional[Any]) -> bool:
+    """Handle metagraph.* jobs uniformly for normal and utility workers."""
+    try:
+        try:
+            logger.info(
+                f"claimed job id={job.get('id')} type={job.get('job_type')}"
+            )
+        except Exception:
+            pass
+        # Placeholder: actual metagraph sync handled elsewhere; mark completed
+        await db.complete_validator_job(job["id"], result={"ok": True})
+        return True
+    except Exception as exc:
+        await db.fail_validator_job(job["id"], f"exception: {exc}")
+        return False
+
+
+async def _handle_miners_job(job: Dict[str, Any], db: ValidatorDatabaseManager, validator: Optional[Any]) -> bool:
+    """Handle miners.* jobs uniformly for normal and utility workers."""
+    try:
+        # Opportunistically ensure polling jobs exist
+        try:
+            await db.enqueue_miner_poll_jobs(limit=500)
+        except Exception:
+            pass
+
+        try:
+            job_type = job.get("job_type")
+            job_id = job.get("id")
+            logger.info(
+                f"claimed job id={job_id} type={job_type} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
+            )
+        except Exception:
+            pass
+
+        j = job.get("job_type")
+        if j == "miners.poll_inference_status":
+            payload = job.get("payload") or {}
+            if isinstance(payload, str):
+                import json as _json
+                try:
+                    payload = _json.loads(payload)
+                except Exception:
+                    payload = {}
+            run_id = payload.get("run_id")
+            miner_uid = payload.get("miner_uid")
+            response_id = payload.get("response_id")
+            miner_hotkey = payload.get("miner_hotkey")
+            if response_id and miner_hotkey:
+                # Hard cancel if miner no longer exists in node_table (deregistered or hotkey changed)
+                try:
+                    # Require BOTH uid and hotkey to match the same row; OR may pass during hotkey churn
+                    exists_row = await db.fetch_one(
+                        "SELECT 1 FROM node_table WHERE uid = :uid AND hotkey = :hk",
+                        {"uid": miner_uid, "hk": miner_hotkey},
+                    )
+                except Exception:
+                    exists_row = None
+                if not exists_row:
+                    logger.warning(
+                        f"[miners.poll_inference_status] Miner not found in node_table (uid={miner_uid}, hk={str(miner_hotkey)[:8]}), cancelling poll job {job.get('id')}"
+                    )
+                    try:
+                        await db.execute(
+                            """
+                            UPDATE weather_forecast_stats
+                            SET current_forecast_status = 'error',
+                                last_error_message = 'miner not found in node_table',
+                                updated_at = NOW()
+                            WHERE run_id = :rid AND miner_uid = :uid
+                            """,
+                            {"rid": run_id, "uid": miner_uid},
+                        )
+                    except Exception:
+                        pass
+                    # Hard-cancel: mark job completed without scheduling future retries
+                    await db.complete_validator_job(job["id"], result={"cancelled": "miner_not_found"})
+                    return True
+                try:
+                    from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import poll_miner_job_status
+                    status_response = await poll_miner_job_status(
+                        validator=validator,
+                        miner_hotkey=miner_hotkey,
+                        job_id=payload.get("job_id", ""),
+                        db_manager=db,
+                    )
+                    # Minimal interpretation: if not ready, reschedule
+                    ready = False
+                    if status_response and status_response.get("success"):
+                        data = status_response.get("data", {})
+                        status = data.get("status", "")
+                        ready = status in ["ready", "completed"]
+                    if ready:
+                        # Mark response as submitted/ready for scoring
+                        try:
+                            if response_id:
+                                await db.execute(
+                                    "UPDATE weather_miner_responses SET status = 'forecast_submitted', last_polled_time = NOW() WHERE id = :rid",
+                                    {"rid": response_id},
+                                )
+                        except Exception:
+                            pass
+                        await db.complete_validator_job(job["id"], result={"ready": True})
+                        # Ensure a day1 step exists/enqueued for this miner
+                        # REMOVED: Bulk job enqueuing - next steps are created by predecessor completion
+                        return True
+                    else:
+                        # Not ready; reschedule poll in ~8 minutes
+                        await db.fail_validator_job(job["id"], "not ready", schedule_retry_in_seconds=480)
+                        return True
+                except Exception as e:
+                    await db.fail_validator_job(job["id"], f"poll exception: {e}", schedule_retry_in_seconds=600)
+                    return False
+            await db.fail_validator_job(job["id"], "missing payload fields")
+            return False
+        elif j == "miners.handle_deregistrations":
+            # Fetch current nodes, clean stale data on hotkey changes, and upsert node_table
+            try:
+                import os as _os
+                netuid = int(_os.getenv("NETUID", "237"))
+                logger.info(f"[miners.handle_deregistrations] Starting with netuid={netuid}")
+                substrate = get_process_isolated_substrate(
+                    subtensor_network=_os.getenv("SUBTENSOR_NETWORK", "test"),
+                    chain_endpoint=_os.getenv("SUBTENSOR_ADDRESS", "") or "",
+                )
+                logger.info(f"[miners.handle_deregistrations] Created substrate interface")
+                nodes = get_nodes_for_netuid(substrate=substrate, netuid=netuid)
+                logger.info(f"[miners.handle_deregistrations] Retrieved {len(nodes or [])} nodes from chain")
+
+                miners_data = []
+                hotkey_change_entries = []  # (uid, old_hotkey, new_hotkey)
+                for n in nodes or []:
+                    try:
+                        index_val = int(getattr(n, "node_id", None) or getattr(n, "uid", 0))
+                        existing = await db.fetch_one(
+                            "SELECT hotkey, coldkey, ip, ip_type, port, incentive, stake, trust, vtrust, protocol FROM node_table WHERE uid = :u",
+                            {"u": index_val},
+                        )
+                        row = {
+                            "index": index_val,
+                            "hotkey": getattr(n, "hotkey", None),
+                            "coldkey": getattr(n, "coldkey", None),
+                            "ip": getattr(n, "ip", None),
+                            "ip_type": getattr(n, "ip_type", None),
+                            "port": getattr(n, "port", None),
+                            "incentive": getattr(n, "incentive", None),
+                            "stake": getattr(n, "stake", None),
+                            "trust": getattr(n, "trust", None),
+                            "vtrust": getattr(n, "validator_trust", None),
+                            "protocol": getattr(n, "protocol", None),
+                        }
+                        if existing and existing.get("hotkey") and row["hotkey"] and existing.get("hotkey") != row["hotkey"]:
+                            hotkey_change_entries.append((index_val, existing.get("hotkey"), row["hotkey"]))
+                            logger.info(
+                                f"[miners.handle_deregistrations] Detected hotkey change for UID {index_val}: {existing.get('hotkey')} -> {row['hotkey']}"
+                            )
+                        miners_data.append(row)
+                    except Exception as e:
+                        logger.warning(f"[miners.handle_deregistrations] Failed to process node {index_val}: {e}")
+                        continue
+
+                if hotkey_change_entries:
+                    uids_to_zero = [uid for uid, _, _ in hotkey_change_entries]
+                    logger.info(f"[miners.handle_deregistrations] Hotkey changes detected for UIDs {uids_to_zero}; cascading cleanup via node_table delete")
+                    try:
+                        await db.execute(
+                            "DELETE FROM node_table WHERE uid = ANY(:uids)",
+                            {"uids": uids_to_zero},
+                        )
+                    except Exception as e:
+                        logger.warning(f"[miners.handle_deregistrations] node_table delete for UIDs {uids_to_zero} failed or partial: {e}")
+                    for uid, old_hk, new_hk in hotkey_change_entries:
+                        try:
+                            logger.info(f"[miners.handle_deregistrations] Cleaning up records tied to old hotkey {old_hk}")
+                            try:
+                                await db.execute(
+                                    "UPDATE validator_jobs SET status = 'canceled', updated_at = NOW(), lease_expires_at = NULL WHERE miner_uid = :uid AND job_type LIKE 'weather.%'",
+                                    {"uid": uid},
+                                )
+                            except Exception as e_cancel:
+                                logger.warning(f"[miners.handle_deregistrations] Failed cancelling active jobs for old hotkey {old_hk}: {e_cancel}")
+                            try:
+                                await db.execute(
+                                    "DELETE FROM weather_forecast_stats WHERE miner_uid = :uid",
+                                    {"uid": uid},
+                                )
+                            except Exception as e_zero:
+                                logger.warning(f"[miners.handle_deregistrations] Failed zeroing score_table for hotkey {old_hk}: {e_zero}")
+                        except Exception as e:
+                            logger.warning(f"[miners.handle_deregistrations] Cleanup failed for old hotkey {old_hk}: {e}")
+
+                    try:
+                        await db.execute(
+                            "UPDATE score_table SET raw_score = 0, normalized_score = 0 WHERE miner_uid = ANY(:uids)",
+                            {"uids": uids_to_zero},
+                        )
+                    except Exception as e:
+                        logger.warning(f"[miners.handle_deregistrations] Failed zeroing score_table for UIDs {uids_to_zero}: {e}")
+
+                logger.info(f"[miners.handle_deregistrations] Processed {len(miners_data)} miner updates")
+                if miners_data:
+                    try:
+                        await db.batch_update_miners(miners_data)
+                        logger.info(f"[miners.handle_deregistrations] Successfully updated {len(miners_data)} miners in node_table")
+                    except Exception as e:
+                        logger.warning(f"[miners.handle_deregistrations] Failed batch_update_miners: {e}")
+                else:
+                    logger.info(f"[miners.handle_deregistrations] No miner updates needed")
+
+                try:
+                    existing_uids = {row["uid"] for row in await db.fetch_all("SELECT uid FROM node_table")}
+                    final_miners_data = []
+                    for row in miners_data:
+                        try:
+                            if row["index"] in existing_uids:
+                                final_miners_data.append(row)
+                        except Exception:
+                            continue
+                    if final_miners_data:
+                        await db.batch_update_miners(final_miners_data)
+                        logger.info("[miners.handle_deregistrations] Finalized node_table synchronization with current metagraph")
+                except Exception as e_final:
+                    logger.warning(f"[miners.handle_deregistrations] Final node_table sync skipped due to error: {e_final}")
+
+                await db.complete_validator_job(job["id"], result={"updated": len(miners_data)})
+                return True
+            except Exception as e:
+                await db.fail_validator_job(job["id"], f"dereg exception: {e}", schedule_retry_in_seconds=300)
+                return False
+        elif j == "miners.weights.set":
+            # Weight setting has been moved to main validator process
+            # Workers don't have substrate access needed for weight setting
+            logger.info(f"[WeightSetter] Weight setting job {job.get('id')} - redirecting to main validator process")
+            await db.fail_validator_job(job["id"], "weight setting moved to main validator process", schedule_retry_in_seconds=300)
+            return True
+        else:
+            # Unknown miners.* job
+            await db.fail_validator_job(job["id"], "unknown miners job")
+            return False
+    except Exception as exc:
+        await db.fail_validator_job(job["id"], f"exception: {exc}")
+        return False
 
 
 # REMOVED: process_day1_one and process_era5_one functions that called unused run() methods
@@ -748,317 +990,11 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
 
     job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="metagraph.", is_utility_worker=False)
     if job:
-        try:
-            try:
-                logger.info(
-                    f"claimed job id={job.get('id')} type={job.get('job_type')}"
-                )
-            except Exception:
-                pass
-            # Placeholder: actual metagraph sync handled elsewhere; mark completed
-            await db.complete_validator_job(job["id"], result={"ok": True})
-            return True
-        except Exception as e:
-            await db.fail_validator_job(job["id"], f"exception: {e}")
-            return False
+        return await _handle_metagraph_job(job, db, validator)
 
     job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="miners.", is_utility_worker=False)
     if job:
-        try:
-            # Opportunistically ensure polling jobs exist
-            try:
-                await db.enqueue_miner_poll_jobs(limit=500)
-            except Exception:
-                pass
-            try:
-                job_type = job.get('job_type')
-                job_id = job.get('id')
-                
-                logger.info(
-                    f"claimed job id={job_id} type={job_type} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
-                )
-            except Exception:
-                pass
-            j = job.get("job_type")
-            if j == "miners.poll_inference_status":
-                # Poll a miner for inference progress and reschedule until ready
-                payload = job.get("payload") or {}
-                if isinstance(payload, str):
-                    import json as _json
-                    try:
-                        payload = _json.loads(payload)
-                    except Exception:
-                        payload = {}
-                run_id = payload.get("run_id")
-                miner_uid = payload.get("miner_uid")
-                response_id = payload.get("response_id")
-                miner_hotkey = payload.get("miner_hotkey")
-                if response_id and miner_hotkey:
-                    # Hard cancel if miner no longer exists in node_table (deregistered or hotkey changed)
-                    try:
-                        # Require BOTH uid and hotkey to match the same row; OR may pass during hotkey churn
-                        exists_row = await db.fetch_one(
-                            "SELECT 1 FROM node_table WHERE uid = :uid AND hotkey = :hk",
-                            {"uid": miner_uid, "hk": miner_hotkey},
-                        )
-                    except Exception:
-                        exists_row = None
-                    if not exists_row:
-                        logger.warning(
-                            f"[miners.poll_inference_status] Miner not found in node_table (uid={miner_uid}, hk={str(miner_hotkey)[:8]}), cancelling poll job {job.get('id')}"
-                        )
-                        try:
-                            await db.execute(
-                                """
-                                UPDATE weather_forecast_stats
-                                SET current_forecast_status = 'error',
-                                    last_error_message = 'miner not found in node_table',
-                                    updated_at = NOW()
-                                WHERE run_id = :rid AND miner_uid = :uid
-                                """,
-                                {"rid": run_id, "uid": miner_uid},
-                            )
-                        except Exception:
-                            pass
-                        # Hard-cancel: mark job completed without scheduling future retries
-                        await db.complete_validator_job(job["id"], result={"cancelled": "miner_not_found"})
-                        return True
-                    try:
-                        from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import poll_miner_job_status
-                        status_response = await poll_miner_job_status(
-                            validator=validator,
-                            miner_hotkey=miner_hotkey,
-                            job_id=payload.get("job_id", ""),
-                            db_manager=db,
-                        )
-                        # Minimal interpretation: if not ready, reschedule
-                        ready = False
-                        if status_response and status_response.get("success"):
-                            data = status_response.get("data", {})
-                            status = data.get("status", "")
-                            ready = status in ["ready", "completed"]
-                        if ready:
-                            # Mark response as submitted/ready for scoring
-                            try:
-                                if response_id:
-                                    await db.execute(
-                                        "UPDATE weather_miner_responses SET status = 'forecast_submitted', last_polled_time = NOW() WHERE id = :rid",
-                                        {"rid": response_id},
-                                    )
-                            except Exception:
-                                pass
-                            await db.complete_validator_job(job["id"], result={"ready": True})
-                            # Ensure a day1 step exists/enqueued for this miner
-                            # REMOVED: Bulk job enqueuing - next steps are created by predecessor completion
-                            return True
-                        else:
-                            # Not ready; reschedule poll in ~8 minutes
-                            await db.fail_validator_job(job["id"], "not ready", schedule_retry_in_seconds=480)
-                            return True
-                    except Exception as e:
-                        await db.fail_validator_job(job["id"], f"poll exception: {e}", schedule_retry_in_seconds=600)
-                        return False
-                await db.fail_validator_job(job["id"], "missing payload fields")
-                return False
-            elif j == "miners.handle_deregistrations":
-                # Fetch current nodes, clean stale data on hotkey changes, and upsert node_table
-                try:
-                    import os as _os
-                    netuid = int(_os.getenv("NETUID", "237"))
-                    logger.info(f"[miners.handle_deregistrations] Starting with netuid={netuid}")
-                    substrate = get_process_isolated_substrate(
-                        subtensor_network=_os.getenv("SUBTENSOR_NETWORK", "test"),
-                        chain_endpoint=_os.getenv("SUBTENSOR_ADDRESS", "") or "",
-                    )
-                    logger.info(f"[miners.handle_deregistrations] Created substrate interface")
-                    nodes = get_nodes_for_netuid(substrate=substrate, netuid=netuid)
-                    logger.info(f"[miners.handle_deregistrations] Retrieved {len(nodes or [])} nodes from chain")
-
-                    miners_data = []
-                    hotkey_change_entries = []  # (uid, old_hotkey, new_hotkey)
-                    for n in nodes or []:
-                        try:
-                            index_val = int(getattr(n, "node_id", None) or getattr(n, "uid", 0))
-                            existing = await db.fetch_one(
-                                "SELECT hotkey, coldkey, ip, ip_type, port, incentive, stake, trust, vtrust, protocol FROM node_table WHERE uid = :u",
-                                {"u": index_val},
-                            )
-                            row = {
-                                "index": index_val,
-                                "hotkey": getattr(n, "hotkey", None),
-                                "coldkey": getattr(n, "coldkey", None),
-                                "ip": getattr(n, "ip", None),
-                                "ip_type": getattr(n, "ip_type", None),
-                                "port": getattr(n, "port", None),
-                                "incentive": getattr(n, "incentive", None),
-                                "stake": getattr(n, "stake", None),
-                                "trust": getattr(n, "trust", None),
-                                "vtrust": getattr(n, "validator_trust", None),
-                                "protocol": getattr(n, "protocol", None),
-                            }
-                            if existing and existing.get("hotkey") and row["hotkey"] and existing.get("hotkey") != row["hotkey"]:
-                                hotkey_change_entries.append((index_val, existing.get("hotkey"), row["hotkey"]))
-                            if not existing or any((existing.get(k) != row.get(k)) for k in [
-                                "hotkey","coldkey","ip","ip_type","port","incentive","stake","trust","vtrust","protocol"
-                            ]):
-                                miners_data.append(row)
-                                logger.debug(f"[miners.handle_deregistrations] Added miner UID {index_val} to update batch")
-                        except Exception as e:
-                            logger.warning(f"[miners.handle_deregistrations] Failed to process node {index_val}: {e}")
-                            continue
-
-                    # Clean slate for any UID with hotkey change (DB cascade via node_table delete, plus score_table zero, and hotkey safety wipes)
-                    if hotkey_change_entries:
-                        uids_to_zero = sorted({uid for uid, _, _ in hotkey_change_entries})
-                        old_hotkeys = sorted({old_hk for _, old_hk, _ in hotkey_change_entries if old_hk})
-                        logger.info(f"[miners.handle_deregistrations] Hotkey changes detected for UIDs {uids_to_zero}; cascading cleanup via node_table delete")
-                        # Prefer DB-level cascade by deleting node_table row(s) and re-inserting updated info
-                        try:
-                            for _uid in uids_to_zero:
-                                await db.execute("DELETE FROM node_table WHERE uid = :u", {"u": _uid})
-                        except Exception as e:
-                            logger.warning(f"[miners.handle_deregistrations] node_table delete for UIDs {uids_to_zero} failed or partial: {e}")
-
-                        # Safety: also delete by old hotkey across weather tables in case any non-cascading tables exist
-                        for old_hk in old_hotkeys:
-                            try:
-                                await db.execute("DELETE FROM weather_miner_scores WHERE miner_hotkey = :hk", {"hk": old_hk})
-                                await db.execute("DELETE FROM weather_miner_responses WHERE miner_hotkey = :hk", {"hk": old_hk})
-                                try:
-                                    await db.execute("DELETE FROM weather_historical_weights WHERE miner_hotkey = :hk", {"hk": old_hk})
-                                except Exception:
-                                    pass
-                                # Also remove step rows that were logged under the old hotkey to avoid collisions with new occupant at same UID
-                                try:
-                                    await db.execute(
-                                        "DELETE FROM weather_forecast_steps WHERE miner_hotkey = :hk",
-                                        {"hk": old_hk},
-                                    )
-                                except Exception:
-                                    pass
-                                # Cancel active validator jobs tied to the old hotkey without touching jobs for the new hotkey at same UID
-                                try:
-                                    await db.execute(
-                                        """
-                                        UPDATE validator_jobs
-                                        SET status = 'completed', completed_at = NOW(), lease_expires_at = NULL,
-                                            result = '{"cancelled":"deregistered"}'::jsonb
-                                        WHERE status IN ('pending','in_progress','retry_scheduled')
-                                          AND (
-                                            (payload ->> 'miner_hotkey') = :hk
-                                            OR (response_id IS NOT NULL AND response_id IN (
-                                                  SELECT id FROM weather_miner_responses WHERE miner_hotkey = :hk
-                                              ))
-                                            OR (step_id IS NOT NULL AND step_id IN (
-                                                  SELECT id FROM weather_forecast_steps WHERE miner_hotkey = :hk
-                                              ))
-                                          )
-                                        """,
-                                        {"hk": old_hk},
-                                    )
-                                except Exception as e_cancel:
-                                    logger.warning(f"[miners.handle_deregistrations] Failed cancelling active jobs for old hotkey {old_hk}: {e_cancel}")
-                                # Zero out old entries in score_table for this hotkey across all weather task rows
-                                try:
-                                    # Find UID(s) historically associated with this hotkey to target correct columns
-                                    uid_row = await db.fetch_one("SELECT uid FROM node_table WHERE hotkey = :hk", {"hk": old_hk})
-                                    # If the hotkey is fully removed, we may not find it in node_table; try stats as fallback
-                                    if not uid_row:
-                                        uid_row = await db.fetch_one(
-                                            "SELECT miner_uid AS uid FROM weather_forecast_stats WHERE miner_hotkey = :hk ORDER BY updated_at DESC LIMIT 1",
-                                            {"hk": old_hk},
-                                        )
-                                    if uid_row and uid_row.get("uid") is not None:
-                                        uid = int(uid_row["uid"])
-                                        if 0 <= uid < 256:
-                                            await db.execute(
-                                                f"""
-                                                UPDATE score_table
-                                                SET uid_{uid}_score = 0.0
-                                                WHERE task_name = 'weather'
-                                                """
-                                            )
-                                except Exception as e_zero:
-                                    logger.warning(f"[miners.handle_deregistrations] Failed zeroing score_table for hotkey {old_hk}: {e_zero}")
-                            except Exception as e:
-                                logger.warning(f"[miners.handle_deregistrations] Cleanup failed for old hotkey {old_hk}: {e}")
-                        try:
-                            if uids_to_zero:
-                                await db.remove_miner_from_score_tables(
-                                    uids=uids_to_zero, task_names=["weather"], filter_start_time=None, filter_end_time=None
-                                )
-                        except Exception as e:
-                            logger.warning(f"[miners.handle_deregistrations] Failed zeroing score_table for UIDs {uids_to_zero}: {e}")
-
-                    # Upsert node_table updates
-                    logger.info(f"[miners.handle_deregistrations] Processed {len(miners_data)} miner updates")
-                    if miners_data:
-                        await db.batch_update_miners(miners_data)
-                        logger.info(f"[miners.handle_deregistrations] Successfully updated {len(miners_data)} miners in node_table")
-                    else:
-                        logger.info(f"[miners.handle_deregistrations] No miner updates needed")
-
-                    # Orphan cleanup (rows whose hotkey no longer exists in node_table)
-                    try:
-                        await db.execute(
-                            "DELETE FROM weather_miner_scores w WHERE NOT EXISTS (SELECT 1 FROM node_table n WHERE n.hotkey = w.miner_hotkey)"
-                        )
-                        await db.execute(
-                            "DELETE FROM weather_miner_responses w WHERE NOT EXISTS (SELECT 1 FROM node_table n WHERE n.hotkey = w.miner_hotkey)"
-                        )
-                    except Exception:
-                        pass
-
-                    # FINALIZATION: Ensure node_table is fully synchronized with current metagraph as the last step
-                    try:
-                        try:
-                            nodes_final = get_nodes_for_netuid(substrate=substrate, netuid=netuid)
-                        except Exception:
-                            nodes_final = nodes  # Fallback to earlier snapshot
-                        final_miners_data = []
-                        for n in nodes_final or []:
-                            try:
-                                index_val = int(getattr(n, "node_id", None) or getattr(n, "uid", 0))
-                                row = {
-                                    "index": index_val,
-                                    "hotkey": getattr(n, "hotkey", None),
-                                    "coldkey": getattr(n, "coldkey", None),
-                                    "ip": getattr(n, "ip", None),
-                                    "ip_type": getattr(n, "ip_type", None),
-                                    "port": getattr(n, "port", None),
-                                    "incentive": getattr(n, "incentive", None),
-                                    "stake": getattr(n, "stake", None),
-                                    "trust": getattr(n, "trust", None),
-                                    "vtrust": getattr(n, "validator_trust", None),
-                                    "protocol": getattr(n, "protocol", None),
-                                }
-                                final_miners_data.append(row)
-                            except Exception:
-                                continue
-                        if final_miners_data:
-                            await db.batch_update_miners(final_miners_data)
-                            logger.info("[miners.handle_deregistrations] Finalized node_table synchronization with current metagraph")
-                    except Exception as e_final:
-                        logger.warning(f"[miners.handle_deregistrations] Final node_table sync skipped due to error: {e_final}")
-
-                    await db.complete_validator_job(job["id"], result={"updated": len(miners_data)})
-                    return True
-                except Exception as e:
-                    await db.fail_validator_job(job["id"], f"dereg exception: {e}", schedule_retry_in_seconds=300)
-                    return False
-            elif j == "miners.weights.set":
-                # Weight setting has been moved to main validator process
-                # Workers don't have substrate access needed for weight setting
-                logger.info(f"[WeightSetter] Weight setting job {job.get('id')} - redirecting to main validator process")
-                await db.fail_validator_job(job["id"], "weight setting moved to main validator process", schedule_retry_in_seconds=300)
-                return True
-            else:
-                # Unknown miners.* job
-                await db.fail_validator_job(job["id"], "unknown miners job")
-                return False
-        except Exception as e:
-            await db.fail_validator_job(job["id"], f"exception: {e}")
-            return False
+        return await _handle_miners_job(job, db, validator)
 
     job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="era5.", is_utility_worker=False)
     if job:
@@ -1442,8 +1378,7 @@ async def process_one_utility(db: ValidatorDatabaseManager, validator: Optional[
             _pname = "utility"
 
         # Claim only queues this utility worker actually handles
-        # Avoid claiming miners.* and metagraph.* so normal workers can sync node_table
-        for prefix in ("stats.",):
+        for prefix in ("stats.", "metagraph.", "miners."):
             job = await db.claim_validator_job(worker_name=_pname, job_type_prefix=prefix, is_utility_worker=True)
             if job:
                 try:
@@ -1475,33 +1410,36 @@ async def process_one_utility(db: ValidatorDatabaseManager, validator: Optional[
                             await db.fail_validator_job(job["id"], "utility-only release", schedule_retry_in_seconds=2)
                         return True
 
-                    # Otherwise, process via the existing handlers by temporarily monkey-patching
-                    # the job_type into a minimal switch
-                    # We re-enter process_one's handler space by mimicking its structure in brief
-                    ok = True
                     if jtype == "stats.aggregate":
-                        manager = WeatherStatsManager(db, validator_hotkey=getattr(validator, "validator_wallet", None))
-                        try:
-                            await manager.aggregate_miner_stats()
-                        except Exception:
-                            ok = False
-                    elif jtype.startswith("metagraph."):
-                        # Delegate to existing miners/metagraph handlers by failing to requeue if unknown
-                        ok = False
-                    elif jtype.startswith("miners."):
-                        ok = False
-                    elif jtype.startswith("era5."):
-                        ok = False
-                    elif jtype.startswith("ops."):
-                        ok = False
-                    else:
-                        ok = False
+                        from gaia.tasks.defined_tasks.weather.pipeline.steps.aggregate_step import run_miner_aggregation
 
-                    if ok:
-                        await db.complete_validator_job(job["id"], result={"ok": True})
-                    else:
-                        await db.fail_validator_job(job["id"], "unhandled utility job", schedule_retry_in_seconds=60)
-                    return True
+                        ok = await run_miner_aggregation(db, validator=validator)
+                        if ok:
+                            await db.complete_validator_job(job["id"], result={"ok": True})
+                        else:
+                            await db.fail_validator_job(job["id"], "stats aggregate failed")
+                        return ok
+                    if jtype == "stats.subnet_snapshot":
+                        from gaia.tasks.defined_tasks.weather.pipeline.steps.aggregate_step import compute_subnet_stats
+                        try:
+                            snapshot = await compute_subnet_stats(db)
+                            try:
+                                logger.info(f"[SubnetSnapshot] active_miners={snapshot.get('active_miners')}, avg_forecast_score={snapshot.get('avg_forecast_score')}")
+                            except Exception:
+                                pass
+                            await db.complete_validator_job(job["id"], result={"ok": True})
+                            return True
+                        except Exception as err:
+                            logger.error(f"compute_subnet_stats failed: {err}", exc_info=True)
+                            await db.fail_validator_job(job["id"], "stats snapshot failed")
+                            return False
+                    if isinstance(jtype, str) and jtype.startswith("metagraph."):
+                        return await _handle_metagraph_job(job, db, validator)
+                    if isinstance(jtype, str) and jtype.startswith("miners."):
+                        return await _handle_miners_job(job, db, validator)
+
+                    await db.fail_validator_job(job["id"], "unhandled utility job", schedule_retry_in_seconds=60)
+                    return False
                 except Exception as e:
                     await db.fail_validator_job(job["id"], f"exception: {e}")
                     return False
@@ -1509,5 +1447,3 @@ async def process_one_utility(db: ValidatorDatabaseManager, validator: Optional[
         return False
     except Exception:
         return False
-
-
