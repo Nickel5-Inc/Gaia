@@ -1,9 +1,9 @@
-# *Validator Information*
+# Gaia Validator Setup Guide
 
 ---
 
 
-## **API's required**
+## Required APIs
 
 
 ### NASA EarthData
@@ -32,7 +32,9 @@ key: <your_cds_api_key>
 ```
 ---
 
-#### Create .env file for validator with the following components:
+### Environment Configuration
+
+Create a `.env` file for validator with the following components:
 ```bash
 # Gaia Validator Configuration Template
 # Rename this file to .env and fill in your specific values.
@@ -86,14 +88,14 @@ PGBACKREST_STANZA_NAME=gaia
 PGBACKREST_R2_REGION=auto
 ```
 
-#### Run the validator
+### Running the Validator
 ```bash
 pm2 start --name validator --instances 1 python -- gaia/validator/validator.py 
 ```
 
 ---
 
-## **Database Synchronization System (Optional, highly recommended)**
+## Database Synchronization System (Optional, highly recommended)
 
 This system allows for near real-time replication of the validator database from a designated source validator to other replica validators using pgBackRest with Cloudflare R2 storage. This provides efficient incremental backups and point-in-time recovery capabilities.
 
@@ -205,17 +207,17 @@ DB_CONNECTION_TYPE=socket alembic -c alembic_validator.ini history
 
 ## Custom Models (Advanced)
 
-Validators can benefit from miners using custom models for better performance:
+Validators can benefit from miners using custom weather models for better performance:
 
 ### Encouraging Custom Models
 - Miners with custom models typically provide better predictions
-- Custom models can be task-specific (geomagnetic, soil moisture, weather)
+- Custom weather models can be optimized for specific atmospheric conditions
 - Improved accuracy leads to better rewards for miners
 
 ### Model Requirements
-- **Soil Moisture**: Must output 11x11 arrays for surface/rootzone moisture (0-1 range)
-- **Geomagnetic**: Must predict next-hour DST index with UTC timestamp
-- **Weather**: Must generate 40-step forecasts in Zarr format
+- **Weather**: Must generate 40-step forecasts in Zarr format compatible with Aurora model
+- Must follow Microsoft Aurora model input/output specifications
+- Should maintain compatibility with the existing scoring system
 
 Custom model files must follow naming conventions and implement specific methods (`run_inference()`).
 
