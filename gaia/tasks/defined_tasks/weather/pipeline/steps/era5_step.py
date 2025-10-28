@@ -139,7 +139,7 @@ async def run_item(
         setattr(task, "validator", validator)
     # Pull response details
     resp = await db.fetch_one(
-        "SELECT id, run_id, miner_uid, miner_hotkey, job_id FROM weather_miner_responses WHERE id = :rid",
+        "SELECT id, run_id, miner_uid, miner_hotkey, job_id, verification_passed, status FROM weather_miner_responses WHERE id = :rid",
         {"rid": response_id},
     )
     if not resp:
@@ -159,6 +159,16 @@ async def run_item(
             f"but job specifies miner UID {miner_uid}. Aborting to prevent crossover."
         )
         return False
+    # Gate ERA5 scoring on verified manifest to prevent TOCTOU swaps
+    try:
+        if not bool(resp.get("verification_passed")) or resp.get("status") != "verified_manifest_store_opened":
+            logger.warning(
+                f"[ERA5] Run {run_id} Miner {miner_uid}: Skipping ERA5 scoring - manifest not verified (verification_passed={resp.get('verification_passed')}, status={resp.get('status')})"
+            )
+            return False
+    except Exception:
+        return False
+
     run = await db.fetch_one(
         "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :rid",
         {"rid": run_id},

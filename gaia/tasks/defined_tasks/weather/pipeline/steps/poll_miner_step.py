@@ -13,6 +13,7 @@ from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import poll_m
 from gaia.tasks.defined_tasks.weather.schemas.weather_outputs import WeatherTaskStatus
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
 from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_failure, log_success, log_start
+from gaia.tasks.defined_tasks.weather.processing.weather_logic import verify_miner_response
 
 from gaia.utils.custom_logger import get_logger
 logger = get_logger(__name__)
@@ -154,6 +155,27 @@ async def run_poll_miner_job(
                     """,
                     {"id": response_id}
                 )
+
+                # Freeze manifest immediately to eliminate swap window
+                try:
+                    # Create or reuse WeatherTask via validator singleton like other steps
+                    task = None
+                    if validator is not None:
+                        task = getattr(validator, "weather_task_singleton", None)
+                    if task is None:
+                        from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+                        task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+                        if validator is not None:
+                            try:
+                                setattr(validator, "weather_task_singleton", task)
+                            except Exception:
+                                pass
+
+                    run_details = {"id": run_id}
+                    response_details = {"id": response_id, "miner_hotkey": miner_hotkey, "job_id": job_id}
+                    await verify_miner_response(task, run_details, response_details)
+                except Exception as freeze_err:
+                    logger.error(f"[Run {run_id}] Manifest freeze failed for miner {miner_hotkey[:8]}: {freeze_err}")
                 
                 # Update stats with inference time and status
                 await db.execute(

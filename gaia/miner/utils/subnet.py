@@ -470,10 +470,12 @@ def factory_router(miner_instance) -> APIRouter:
                 logger.info("Successfully validated JWT token")
 
                 if "file_path" in payload:
-                    token_file_path = payload["file_path"]
+                    token_file_path = payload["file_path"].strip("/")
+                    requested_path_clean = file_path.strip("/")
+                    # Strict prefix: request must be exactly the zarr dir or within it
                     if not (
-                        file_path.startswith(token_file_path)
-                        or token_file_path.startswith(file_path.rstrip("/"))
+                        requested_path_clean == token_file_path
+                        or requested_path_clean.startswith(token_file_path + "/")
                     ):
                         logger.warning(
                             f"Token path mismatch: {token_file_path} vs {file_path}"
@@ -540,7 +542,18 @@ def factory_router(miner_instance) -> APIRouter:
                         status_code=500, detail=f"Error listing directory: {str(e)}"
                     )
 
-        full_path = forecasts_dir / file_path.rstrip("/")
+        # Resolve full path and prevent traversal/symlink escapes
+        full_path = (forecasts_dir / file_path.rstrip("/")).resolve()
+        base_resolved = forecasts_dir.resolve()
+        try:
+            # Python 3.9+: Path.is_relative_to
+            is_within = full_path.is_relative_to(base_resolved)
+        except AttributeError:
+            # Fallback for older Python: manual check
+            is_within = str(full_path).startswith(str(base_resolved) + "/") or str(full_path) == str(base_resolved)
+        if not is_within:
+            logger.warning(f"Attempted access outside forecast directory: {full_path}")
+            raise HTTPException(status_code=403, detail="Forbidden path")
 
         if full_path.is_file():
             logger.info(f"Returning file: {full_path}")
