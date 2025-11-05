@@ -1101,7 +1101,7 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
                                 zarr_store_path=Path(output_zarr_path),
                                 miner_hotkey_keypair=miner_keypair,
                                 include_zarr_metadata_in_manifest=True,
-                                chunk_hash_algo_name="xxh64",
+                                chunk_hash_algo_name="sha256",
                             )
 
                         manifest_result = await asyncio.to_thread(
@@ -4328,7 +4328,7 @@ async def _download_forecast_from_r2_to_local(
                                 zarr_store_path=Path(output_zarr_path),
                                 miner_hotkey_keypair=miner_keypair,
                                 include_zarr_metadata_in_manifest=True,
-                                chunk_hash_algo_name="xxh64",
+                                chunk_hash_algo_name="sha256",
                             )
 
                         manifest_result = await asyncio.to_thread(

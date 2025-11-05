@@ -192,33 +192,20 @@ async def evaluate_miner_forecast_day1(
             "SELECT kerchunk_json_url, verification_hash_claimed, kerchunk_json_retrieved, frozen_manifest_files FROM weather_miner_responses WHERE id = :rid",
             {"rid": response_id},
         )
-        # If frozen URL/hash are missing (fast-path), freeze them now using miner-reported values
-        if not stored_rec or not stored_rec.get("kerchunk_json_url") or not stored_rec.get("verification_hash_claimed"):
-            try:
-                if miner_reported_url and miner_reported_manifest_hash:
-                    await task_instance.db_manager.execute(
-                        """
-                        UPDATE weather_miner_responses
-                        SET kerchunk_json_url = COALESCE(kerchunk_json_url, :url),
-                            verification_hash_claimed = COALESCE(verification_hash_claimed, :hash)
-                        WHERE id = :rid
-                        """,
-                        {"rid": response_id, "url": miner_reported_url, "hash": miner_reported_manifest_hash},
-                    )
-                    stored_rec = await task_instance.db_manager.fetch_one(
-                        "SELECT kerchunk_json_url, verification_hash_claimed, kerchunk_json_retrieved, frozen_manifest_files FROM weather_miner_responses WHERE id = :rid",
-                        {"rid": response_id},
-                    )
-            except Exception as _freeze_e:
-                logger.warning(f"[Day1Score] Failed to freeze URL/hash on fast-path for response {response_id}: {_freeze_e}")
-            if not stored_rec or not stored_rec.get("kerchunk_json_url") or not stored_rec.get("verification_hash_claimed"):
-                logger.error(
-                    f"[Day1Score] Missing frozen URL/hash for response {response_id} after freeze attempt. Aborting day1 scoring."
-                )
-                day1_results["error_message"] = "Missing frozen URL/hash"
-                day1_results["overall_day1_score"] = 0.0
-                day1_results["qc_passed_all_vars_leads"] = False
-                return day1_results
+        # Strict: Day1 requires frozen URL/hash/manifest present; do not freeze during scoring
+        if (
+            not stored_rec
+            or not stored_rec.get("kerchunk_json_url")
+            or not stored_rec.get("verification_hash_claimed")
+            or not stored_rec.get("kerchunk_json_retrieved")
+        ):
+            logger.error(
+                f"[Day1Score] Missing frozen URL/hash/manifest for response {response_id}. Aborting day1 scoring."
+            )
+            day1_results["error_message"] = "Missing frozen manifest at day1"
+            day1_results["overall_day1_score"] = 0.0
+            day1_results["qc_passed_all_vars_leads"] = False
+            return day1_results
 
         zarr_store_url = stored_rec["kerchunk_json_url"]
         # Normalize relative Zarr paths to fully-qualified URLs using miner origin
@@ -255,29 +242,27 @@ async def evaluate_miner_forecast_day1(
             pass
         claimed_manifest_content_hash = stored_rec["verification_hash_claimed"]
         frozen_manifest_json = stored_rec.get("kerchunk_json_retrieved")
-        needs_freeze = frozen_manifest_json is None
 
-        # Strict: if frozen exists, enforce mismatch; if freezing now, verification will guard integrity before freezing
-        if not needs_freeze:
-            if (
-                miner_reported_manifest_hash
-                and miner_reported_manifest_hash != claimed_manifest_content_hash
-            ):
-                logger.error(
-                    f"[Day1Score] Manifest hash mismatch. Stored={claimed_manifest_content_hash[:10]}..., MinerNow={miner_reported_manifest_hash[:10]}..."
-                )
-                await task_instance.db_manager.execute(
-                    """
-                    UPDATE weather_miner_responses
-                    SET status = 'verification_error', error_message = 'Manifest hash mismatch between stored and miner-reported during day1 scoring'
-                    WHERE id = :rid
-                    """,
-                    {"rid": response_id},
-                )
-                day1_results["error_message"] = "Manifest hash mismatch (day1)"
-                day1_results["overall_day1_score"] = 0.0
-                day1_results["qc_passed_all_vars_leads"] = False
-                return day1_results
+        # Enforce mismatch policy strictly
+        if (
+            miner_reported_manifest_hash
+            and miner_reported_manifest_hash != claimed_manifest_content_hash
+        ):
+            logger.error(
+                f"[Day1Score] Manifest hash mismatch. Stored={claimed_manifest_content_hash[:10]}..., MinerNow={miner_reported_manifest_hash[:10]}..."
+            )
+            await task_instance.db_manager.execute(
+                """
+                UPDATE weather_miner_responses
+                SET status = 'verification_error', error_message = 'Manifest hash mismatch between stored and miner-reported during day1 scoring'
+                WHERE id = :rid
+                """,
+                {"rid": response_id},
+            )
+            day1_results["error_message"] = "Manifest hash mismatch (day1)"
+            day1_results["overall_day1_score"] = 0.0
+            day1_results["qc_passed_all_vars_leads"] = False
+            return day1_results
 
         if not all([access_token, zarr_store_url, claimed_manifest_content_hash]):
             raise ValueError(
@@ -327,10 +312,11 @@ async def evaluate_miner_forecast_day1(
                 headers=storage_options.get("headers"),
                 num_samples=int(task_instance.config.get("day1_minimal_verify_samples", 0)),
                 job_id=f"{job_id}_day1_minrehash",
+                frozen_manifest=frozen_manifest_json,
             )
-            if ok_min and preopened_ds is not None:
-                miner_forecast_ds = preopened_ds
-            else:
+            # The minimal verification now returns None for the dataset to prevent caching
+            # Always open a fresh dataset for scoring
+            if not ok_min:
                 logger.warning(
                     f"[Day1Score] Minimal verify failed or preopen None (error={min_details.get('error') if isinstance(min_details, dict) else 'unknown'}). "
                     f"Attempting strict verified open without minimal subset."
@@ -351,25 +337,7 @@ async def evaluate_miner_forecast_day1(
                     timeout=verification_timeout_seconds,
                 )
                 if isinstance(result_ds, tuple):
-                    miner_forecast_ds, manifest_used = result_ds
-                    if manifest_used and frozen_manifest_json is None:
-                        try:
-                            await task_instance.db_manager.execute(
-                                """
-                                UPDATE weather_miner_responses
-                                SET kerchunk_json_retrieved = COALESCE(kerchunk_json_retrieved, CAST(:manifest AS jsonb)),
-                                    frozen_manifest_files = COALESCE(frozen_manifest_files, CAST(:files AS jsonb))
-                                WHERE id = :rid
-                                """,
-                                {
-                                    "rid": response_id,
-                                    "manifest": dumps(manifest_used),
-                                    "files": dumps(manifest_used.get("files", {})) if isinstance(manifest_used, dict) else None,
-                                },
-                            )
-                            frozen_manifest_json = manifest_used
-                        except Exception as freeze_err:
-                            logger.warning(f"[Day1Score] Failed to store frozen manifest after open: {freeze_err}")
+                    miner_forecast_ds, _manifest_used = result_ds
                 else:
                     miner_forecast_ds = result_ds
             except Exception as open_err:
@@ -422,24 +390,7 @@ async def evaluate_miner_forecast_day1(
             day1_results["qc_passed_all_vars_leads"] = False
             return day1_results  # Return graceful failure rather than exception
         else:
-            # Verification succeeded - update tracking; if we were missing frozen values, freeze them now via COALESCE
-            if needs_freeze:
-                try:
-                    await task_instance.db_manager.execute(
-                        """
-                        UPDATE weather_miner_responses
-                        SET kerchunk_json_url = COALESCE(kerchunk_json_url, :url),
-                            verification_hash_claimed = COALESCE(verification_hash_claimed, :hash)
-                        WHERE id = :rid
-                        """,
-                        {"rid": response_id, "url": zarr_store_url, "hash": claimed_manifest_content_hash},
-                    )
-                except Exception:
-                    logger.error(f"[Day1Score] Failed to freeze URL/hash for response {response_id}")
-                    day1_results["error_message"] = "Failed to freeze URL/hash"
-                    day1_results["overall_day1_score"] = 0.0
-                    day1_results["qc_passed_all_vars_leads"] = False
-                    return day1_results
+            # Verification succeeded - mark as verified (do not freeze during scoring)
             await task_instance.db_manager.execute(
                 """UPDATE weather_miner_responses 
                    SET verification_passed = true
@@ -563,6 +514,27 @@ async def evaluate_miner_forecast_day1(
             miner_forecast_ds = apply_variable_mapping(miner_forecast_ds, "miner_forecast")
             gfs_analysis_data_for_run = apply_variable_mapping(gfs_analysis_data_for_run, "gfs_analysis")
             gfs_reference_forecast_for_run = apply_variable_mapping(gfs_reference_forecast_for_run, "gfs_reference")
+            # Normalize and deduplicate time coordinates to avoid reindex errors
+            def _dedup_time(ds: xr.Dataset, name: str) -> xr.Dataset:
+                try:
+                    if hasattr(ds, "time") and "time" in ds.coords:
+                        time_vals = getattr(ds, "time", None)
+                        if time_vals is not None:
+                            try:
+                                np_vals = np.array(time_vals.values)
+                                if len(np_vals) > len(np.unique(np_vals)):
+                                    logger.debug(f"[Day1Score] Removing duplicate time indices from {name}")
+                                    _, unique_indices = np.unique(np_vals, return_index=True)
+                                    ds = ds.isel(time=sorted(unique_indices))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                return ds
+
+            miner_forecast_ds = _dedup_time(miner_forecast_ds, "miner_forecast")
+            gfs_analysis_data_for_run = _dedup_time(gfs_analysis_data_for_run, "gfs_analysis")
+            gfs_reference_forecast_for_run = _dedup_time(gfs_reference_forecast_for_run, "gfs_reference")
                 
         except Exception as e:
             logger.error(f"[Day1Score] Failed to apply variable mapping: {e}")
@@ -716,6 +688,7 @@ async def evaluate_miner_forecast_day1(
                 logger.warning(
                     f"[Day1Score] Miner {miner_hotkey}: Time step {effective_lead_h}h skipped - {result['skip_reason']}"
                 )
+                day1_results["qc_passed_all_vars_leads"] = False
                 continue
 
             if result.get("error_message"):
@@ -726,7 +699,7 @@ async def evaluate_miner_forecast_day1(
                 continue
 
             # Process successful time step results
-            if not result.get("qc_passed", True):
+            if not result.get("qc_passed", True) or result.get("qc_failure_reason"):
                 day1_results["qc_passed_all_vars_leads"] = False
 
             # Copy variable results to the main results structure
@@ -2951,6 +2924,25 @@ async def _process_single_timestep_sequential(
         timestep_start = time.time()
 
         # Time data selection (this is the expensive I/O part)
+        # Deduplicate time indices to avoid reindexing errors during selection
+        try:
+            def _dedup_time_inline(ds: xr.Dataset, label: str) -> xr.Dataset:
+                try:
+                    if hasattr(ds, "time") and "time" in ds.coords:
+                        arr = np.array(ds.time.values)
+                        if len(arr) > len(np.unique(arr)):
+                            logger.debug(f"[Day1Score] Removing duplicate time indices from {label}")
+                            _, unique_idx = np.unique(arr, return_index=True)
+                            ds = ds.isel(time=sorted(unique_idx))
+                except Exception:
+                    pass
+                return ds
+            gfs_analysis_data_for_run = _dedup_time_inline(gfs_analysis_data_for_run, "gfs_analysis")
+            gfs_reference_forecast_for_run = _dedup_time_inline(gfs_reference_forecast_for_run, "gfs_reference")
+            miner_forecast_ds = _dedup_time_inline(miner_forecast_ds, "miner_forecast")
+        except Exception:
+            pass
+
         valid_time_np = np.datetime64(valid_time_dt.replace(tzinfo=None))
 
         try:
@@ -3045,42 +3037,64 @@ async def _process_single_timestep_sequential(
             )
             return timestep_results
 
-        # Validate time selection
+        # Validate time selection using robust ns conversion with default tolerance
         miner_time_value_from_sel = miner_forecast_lead.time.item()
         time_diff_too_large = False
 
-        # Enforce strict (or configured) time tolerance for miner selection
+        def _as_ns_int(val) -> Optional[int]:
+            try:
+                import numpy as _np
+                import pandas as _pd
+                # pandas Timestamp
+                if hasattr(val, "value"):
+                    return int(_pd.Timestamp(val).value)
+                # numpy datetime64
+                if isinstance(val, _np.datetime64):
+                    return int(val.astype("datetime64[ns]").astype(_np.int64))
+                # int-like
+                if isinstance(val, (int, _np.integer)):
+                    return int(val)
+                # string or datetime
+                return int(_pd.Timestamp(val).value)
+            except Exception:
+                return None
+
         try:
             max_time_dev_hours_cfg = float(day1_scoring_config.get("max_time_deviation_hours", 0))
-            max_time_dev_ns = int(max_time_dev_hours_cfg * 3600 * 1e9)
         except Exception:
-            max_time_dev_ns = 0
-        if not is_integer_time:
-            try:
-                miner_time_dt64 = np.datetime64(miner_time_value_from_sel, "ns")
-                if is_timezone_aware:
-                    target_naive = selection_label_for_miner.tz_convert(
-                        "UTC"
-                    ).tz_localize(None)
-                    target_dt64 = np.datetime64(target_naive, "ns")
-                    if abs(miner_time_dt64 - target_dt64).astype('timedelta64[ns]').astype(int) > max_time_dev_ns:
-                        time_diff_too_large = True
-                else:
-                    if abs(miner_time_dt64 - selection_label_for_miner).astype('timedelta64[ns]').astype(int) > max_time_dev_ns:
-                        time_diff_too_large = True
-            except Exception:
-                time_diff_too_large = True
+            max_time_dev_hours_cfg = 0.0
+        # Default tolerance: use configured value; otherwise allow up to the lead hours (at least 3h)
+        default_hours = max_time_dev_hours_cfg if max_time_dev_hours_cfg > 0 else float(max(3, effective_lead_h))
+        allowed_ns = int(default_hours * 3600 * 1e9)
+
+        # Normalize target label for miner comparison
+        if is_integer_time:
+            target_ns = _as_ns_int(selection_label_for_miner)
         else:
-            hour_in_nanos = (
-                np.timedelta64(1, "h").astype("timedelta64[ns]").astype(np.int64)
+            if is_timezone_aware:
+                try:
+                    _ts = selection_label_for_miner.tz_convert("UTC").tz_localize(None)
+                except Exception:
+                    _ts = selection_label_for_miner
+                target_ns = _as_ns_int(_ts)
+            else:
+                target_ns = _as_ns_int(selection_label_for_miner)
+
+        miner_ns = _as_ns_int(miner_time_value_from_sel)
+
+        if miner_ns is None or target_ns is None:
+            # If we cannot determine times reliably, mark as error for this timestep
+            timestep_results["error_message"] = (
+                f"Unable to normalize times for comparison (miner={miner_time_value_from_sel}, target={selection_label_for_miner})"
             )
-            threshold = max_time_dev_ns if max_time_dev_ns > 0 else 0
-            if abs(miner_time_value_from_sel - selection_label_for_miner) > threshold:
-                time_diff_too_large = True
+            return timestep_results
+
+        if abs(miner_ns - target_ns) > allowed_ns:
+            time_diff_too_large = True
 
         if time_diff_too_large:
             timestep_results["skip_reason"] = (
-                f"Miner forecast time {miner_time_value_from_sel} too far from target {selection_label_for_miner}"
+                f"Miner forecast time {miner_ns} too far from target {pd.to_datetime(target_ns, unit='ns', utc=True)}"
             )
             return timestep_results
 

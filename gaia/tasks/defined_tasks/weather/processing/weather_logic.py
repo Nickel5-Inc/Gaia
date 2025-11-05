@@ -1257,15 +1257,17 @@ async def verify_miner_response(
 
         if not all([access_token, zarr_store_url, claimed_manifest_content_hash]):
             err_details = f"Token:Set='{bool(access_token)}', URL:'{zarr_store_url}', ManifestHash:Set='{bool(claimed_manifest_content_hash)}'"
+            logger.error(
+                f"[VerifyLogic, Resp {response_id}] Critical information missing after token request. Details: {err_details}"
+            )
             raise ValueError(
                 f"Critical information missing after token request: {err_details}"
             )
 
-        # Freeze URL/hash/manifest on first set. If miner reports a different
-        # manifest hash or URL later, treat it as a verification error.
+        # Freeze URL/hash/manifest only after we independently verify manifest signature & content
         try:
             existing_rec = await task_instance.db_manager.fetch_one(
-                "SELECT kerchunk_json_url, verification_hash_claimed, kerchunk_json_retrieved, frozen_manifest_files FROM weather_miner_responses WHERE id = :id",
+                "SELECT kerchunk_json_url, verification_hash_claimed, kerchunk_json_retrieved, frozen_manifest_files, verification_passed, manifest_frozen_at FROM weather_miner_responses WHERE id = :id",
                 {"id": response_id},
             )
         except Exception:
@@ -1274,12 +1276,22 @@ async def verify_miner_response(
         if existing_rec:
             existing_hash = existing_rec.get("verification_hash_claimed")
             existing_url = existing_rec.get("kerchunk_json_url")
+            # If already verified and frozen, do not refetch/overwrite
+            if (
+                existing_rec.get("verification_passed") is True
+                and existing_rec.get("kerchunk_json_retrieved") is not None
+                and existing_rec.get("manifest_frozen_at") is not None
+            ):
+                logger.info(
+                    f"[VerifyLogic, Resp {response_id}] Already verified and frozen at {existing_rec.get('manifest_frozen_at')}. Skipping re-verification."
+                )
+                return
             if existing_hash and existing_hash != claimed_manifest_content_hash:
                 logger.error(
                     f"[VerifyLogic, Resp {response_id}] Manifest hash changed after submission. Stored={existing_hash[:10]}..., New={claimed_manifest_content_hash[:10]}..."
                 )
                 await task_instance.db_manager.execute(
-                    "UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Manifest hash changed after submission' WHERE id = :id",
+                    "UPDATE weather_miner_responses SET status = 'verification_error', verification_passed = FALSE, error_message = 'Manifest hash changed after submission' WHERE id = :id",
                     {"id": response_id},
                 )
                 return
@@ -1288,13 +1300,17 @@ async def verify_miner_response(
                     f"[VerifyLogic, Resp {response_id}] Zarr URL changed after submission. Stored={existing_url}, New={zarr_store_url}"
                 )
                 await task_instance.db_manager.execute(
-                    "UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Zarr URL changed after submission' WHERE id = :id",
+                    "UPDATE weather_miner_responses SET status = 'verification_error', verification_passed = FALSE, error_message = 'Zarr URL changed after submission' WHERE id = :id",
                     {"id": response_id},
                 )
                 return
-            frozen_manifest = existing_rec.get("kerchunk_json_retrieved") or existing_rec.get("frozen_manifest_files")
-        else:
-            frozen_manifest = None
+        frozen_manifest = None  # Always re-fetch and verify independently
+
+        # Prepare storage options early for manifest fetches
+        storage_opts = {
+            "headers": {"Authorization": f"Bearer {access_token}"},
+            "ssl": False,
+        }
 
         if frozen_manifest is None:
             # Fetch manifest directly from miner and freeze it
@@ -1313,19 +1329,17 @@ async def verify_miner_response(
                     f"[VerifyLogic, Resp {response_id}] Failed to fetch manifest for freezing."
                 )
                 await task_instance.db_manager.execute(
-                    "UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Failed to fetch manifest for freezing' WHERE id = :id",
+                    "UPDATE weather_miner_responses SET status = 'verification_error', verification_passed = FALSE, error_message = 'Failed to fetch manifest for freezing' WHERE id = :id",
                     {"id": response_id},
                 )
                 return
 
-        # Freeze URL, hash, and manifest JSON/hash map on first set
+        # Mark verifying status
         await task_instance.db_manager.execute(
             """
             UPDATE weather_miner_responses
             SET kerchunk_json_url = COALESCE(kerchunk_json_url, :url),
                 verification_hash_claimed = COALESCE(verification_hash_claimed, :hash),
-                kerchunk_json_retrieved = COALESCE(kerchunk_json_retrieved, :manifest::jsonb),
-                frozen_manifest_files = COALESCE(frozen_manifest_files, :manifest_files::jsonb),
                 status = 'verifying_manifest'
             WHERE id = :id
         """,
@@ -1333,8 +1347,6 @@ async def verify_miner_response(
                 "id": response_id,
                 "url": zarr_store_url,
                 "hash": claimed_manifest_content_hash,
-                "manifest": dumps(frozen_manifest),
-                "manifest_files": dumps(frozen_manifest.get("files", {})) if isinstance(frozen_manifest, dict) else None,
             },
         )
 
@@ -1342,13 +1354,92 @@ async def verify_miner_response(
             f"[VerifyLogic, Resp {response_id}] Attempting to open VERIFIED Zarr store: {zarr_store_url}..."
         )
 
-        storage_opts = {
-            "headers": {"Authorization": f"Bearer {access_token}"},
-            "ssl": False,
-        }
+        # storage_opts already prepared above
         verification_timeout_seconds = task_instance.config.get(
             "verification_timeout_seconds", 300
         )
+
+        # Always fetch a trusted manifest and enforce policy before attempting open
+        from ..utils.hashing import get_trusted_manifest as _get_trusted_manifest
+        trusted_manifest = await _get_trusted_manifest(
+            zarr_store_url=zarr_store_url,
+            claimed_manifest_content_hash=claimed_manifest_content_hash,
+            miner_hotkey_ss58=miner_hotkey,
+            headers=storage_opts.get("headers"),
+            job_id=job_id,
+        )
+        if trusted_manifest is None:
+            logger.error(
+                f"[VerifyLogic, Resp {response_id}] Manifest fetch/verify failed for {zarr_store_url} (hash={claimed_manifest_content_hash[:10] if claimed_manifest_content_hash else 'N/A'})"
+            )
+            await task_instance.db_manager.execute(
+                "UPDATE weather_miner_responses SET status = 'verification_failed', error_message = 'Manifest fetch/verify failed' WHERE id = :rid",
+                {"rid": response_id},
+            )
+            return
+        # Enforce chunk hash algorithm policy
+        algo = trusted_manifest.get("chunk_hash_algorithm", "xxh64")
+        if task_instance.config.get("require_sha256_manifests", False) and algo != "sha256":
+            logger.error(
+                f"[VerifyLogic, Resp {response_id}] Manifest chunk hash algorithm '{algo}' rejected (require_sha256_manifests=true)."
+            )
+            await task_instance.db_manager.execute(
+                "UPDATE weather_miner_responses SET status = 'verification_failed', error_message = 'Non-sha256 manifests are not accepted' WHERE id = :rid",
+                {"rid": response_id},
+            )
+            return
+        # Compute content hash we verified (store as computed)
+        try:
+            import hashlib as _hl
+            computed_m_hash = _hl.sha256(dumps(trusted_manifest).encode("utf-8")).hexdigest()
+        except Exception:
+            computed_m_hash = claimed_manifest_content_hash
+
+        # Enforce freeze window
+        try:
+            run_row = await task_instance.db_manager.fetch_one(
+                "SELECT run_initiation_time FROM weather_forecast_runs WHERE id = :rid",
+                {"rid": run_id},
+            )
+            freeze_window_hours = float(task_instance.config.get("manifest_freeze_window_hours", 2.0))
+            from datetime import timedelta as _td
+            now_ts = datetime.now(timezone.utc)
+            if not run_row or not run_row.get("run_initiation_time") or now_ts > run_row["run_initiation_time"] + _td(hours=freeze_window_hours):
+                try:
+                    rin = run_row and run_row.get("run_initiation_time")
+                    logger.error(
+                        f"[VerifyLogic, Resp {response_id}] Manifest freeze outside allowed window: now={now_ts}, run_initiation={rin}, window_h={freeze_window_hours}"
+                    )
+                except Exception:
+                    pass
+                await task_instance.db_manager.execute(
+                    "UPDATE weather_miner_responses SET status = 'verification_error', verification_passed = FALSE, error_message = 'Manifest freeze outside allowed window' WHERE id = :rid",
+                    {"rid": response_id},
+                )
+                return
+        except Exception as _e:
+            logger.warning(f"[VerifyLogic, Resp {response_id}] Failed to enforce freeze window: {_e}")
+
+        # Persist trusted manifest immediately prior to open
+        try:
+            await task_instance.db_manager.execute(
+                """
+                UPDATE weather_miner_responses
+                SET kerchunk_json_retrieved = CAST(:manifest AS jsonb),
+                    frozen_manifest_files = CAST(:manifest_files AS jsonb),
+                    verification_hash_computed = :computed,
+                    manifest_frozen_at = NOW()
+                WHERE id = :rid
+                """,
+                {
+                    "rid": response_id,
+                    "manifest": dumps(trusted_manifest),
+                    "manifest_files": dumps(trusted_manifest.get("files", {})) if isinstance(trusted_manifest, dict) else None,
+                    "computed": computed_m_hash,
+                },
+            )
+        except Exception:
+            pass
 
         verified_dataset_result = await asyncio.wait_for(
             open_verified_remote_zarr_dataset(
@@ -1357,7 +1448,7 @@ async def verify_miner_response(
                 miner_hotkey_ss58=miner_hotkey,
                 storage_options=storage_opts,
                 job_id=job_id,
-                frozen_manifest=frozen_manifest,
+                frozen_manifest=trusted_manifest,
                 return_manifest=True,
             ),
             timeout=verification_timeout_seconds,
@@ -1723,6 +1814,23 @@ async def calculate_era5_miner_score(
         stored_manifest_hash = stored_response_data["verification_hash_claimed"]
         stored_frozen_manifest = stored_response_data.get("kerchunk_json_retrieved")
         stored_manifest_files = stored_response_data.get("frozen_manifest_files")
+        # Hard gate: final scoring requires a previously frozen manifest
+        if not stored_frozen_manifest or not stored_manifest_hash:
+            logger.error(
+                f"[FinalScore] Missing frozen manifest or claimed hash for response {response_id}. Aborting ERA5 scoring."
+            )
+            try:
+                await task_instance.db_manager.execute(
+                    """
+                    UPDATE weather_miner_responses 
+                    SET status = 'verification_failed', error_message = 'Missing frozen manifest at final scoring' 
+                    WHERE id = :rid
+                    """,
+                    {"rid": response_id},
+                )
+            except Exception:
+                pass
+            return False
         token_data_tuple = await _request_fresh_token(
             task_instance, miner_hotkey, job_id
         )
@@ -1811,6 +1919,7 @@ async def calculate_era5_miner_score(
                 headers=storage_options.get("headers"),
                 num_samples=n_min_samples,
                 job_id=f"{job_id}_final_score_minrehash",
+                frozen_manifest=stored_frozen_manifest,
             )
             if not ok_rehash:
                 logger.error(
@@ -1832,9 +1941,33 @@ async def calculate_era5_miner_score(
         if not requested_variables:
             requested_variables = sorted(list({vc for vc in variables_to_score if isinstance(vc, str)}))
 
-        if 'preopened_ds' in locals() and preopened_ds is not None:
-            miner_forecast_ds = preopened_ds[[var for var in requested_variables if var in preopened_ds.data_vars]]
-        else:
+        # CRITICAL: DO NOT reuse preopened_ds from minimal verification!
+        # We need fresh verification for EVERY chunk read during ERA5 scoring.
+        # The preopened dataset has cached values that won't be re-verified.
+        
+        # The minimal verification now returns None for the dataset to prevent caching
+        # We always need to open a fresh dataset for ERA5 scoring
+        if 'preopened_ds' in locals():
+            if preopened_ds is not None:
+                logger.warning(f"[FinalScore] Unexpected: preopened_ds should be None after minimal verification")
+                try:
+                    preopened_ds.close()
+                except Exception:
+                    pass
+            preopened_ds = None
+        
+        # Clear any xarray/dask caches
+        try:
+            import gc
+            gc.collect()
+            logger.info(f"[FinalScore] Cleared memory caches before opening fresh dataset")
+        except Exception:
+            pass
+        
+        logger.info(f"[FinalScore] Opening fresh verified dataset for ERA5 scoring to ensure all chunks are verified")
+        
+        # Always open a fresh verified dataset for ERA5 scoring
+        if True:  # Force fresh open, ignoring any cached data
             result_dataset = await asyncio.wait_for(
                 open_verified_remote_zarr_variable(
                     zarr_store_url=current_zarr_store_url,
@@ -1849,38 +1982,50 @@ async def calculate_era5_miner_score(
                 timeout=verification_timeout_seconds,
             )
             if isinstance(result_dataset, tuple):
-                miner_forecast_ds, manifest_used = result_dataset
-                if manifest_used and not stored_frozen_manifest:
-                    try:
-                        await task_instance.db_manager.execute(
-                            """
-                            UPDATE weather_miner_responses
-                            SET kerchunk_json_retrieved = COALESCE(kerchunk_json_retrieved, CAST(:manifest AS jsonb)),
-                                frozen_manifest_files = COALESCE(frozen_manifest_files, CAST(:files AS jsonb))
-                            WHERE id = :rid
-                            """,
-                            {
-                                "rid": response_id,
-                                "manifest": dumps(manifest_used),
-                                "files": dumps(manifest_used.get("files", {})) if isinstance(manifest_used, dict) else None,
-                            },
-                        )
-                    except Exception as freeze_err:
-                        logger.warning(f"[FinalScore] Failed to freeze manifest from open path: {freeze_err}")
-                        stored_frozen_manifest = stored_frozen_manifest or manifest_used
-                else:
-                    stored_frozen_manifest = stored_frozen_manifest or manifest_used
+                miner_forecast_ds, _manifest_used = result_dataset
             else:
                 miner_forecast_ds = result_dataset
+                _manifest_used = None
 
-        if miner_forecast_ds is None:
+            # Explicit assertion: ensure verified-open path was used and a frozen manifest is bound
+            try:
+                verified_attr = bool(getattr(miner_forecast_ds, "attrs", {}).get("verified_open"))
+            except Exception:
+                verified_attr = False
+            if not verified_attr or _manifest_used is None:
+                logger.error(
+                    f"[FinalScore] Verified-open assertion failed (verified_attr={verified_attr}, manifest_present={_manifest_used is not None}). Aborting scoring."
+                )
+                await task_instance.db_manager.execute(
+                    """UPDATE weather_miner_responses 
+                           SET status = 'verification_failed', error_message = 'Verified dataset assertion failed in final scoring'
+                           WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey""",
+                    {"run_id": run_id, "miner_hotkey": miner_hotkey},
+                )
+                await _check_run_completion(task_instance, run_id)
+                return False
+
+            # Log concise frozen manifest summary for visibility
+            try:
+                files_dict = _manifest_used.get("files", {}) if isinstance(_manifest_used, dict) else {}
+                algo = _manifest_used.get("chunk_hash_algorithm") if isinstance(_manifest_used, dict) else None
+                sample_keys = sorted(list(files_dict.keys()))[:12]
+                logger.info(
+                    f"[FinalScore] Using frozen manifest during ERA5: files={len(files_dict)} algo={algo} sample_keys={sample_keys}"
+                )
+            except Exception:
+                pass
+
+        # Fail fast if dataset is missing or has no data variables
+        if miner_forecast_ds is None or len(list(miner_forecast_ds.data_vars)) == 0:
             logger.error(
-                f"[FinalScore] Manifest verification FAILED for miner {miner_hotkey} — frozen manifest does not match served content (possible file swap/cheating)."
+                f"[FinalScore] Manifest verification FAILED for miner {miner_hotkey} — "
+                f"no requested variables available after verified open (possible file swap/cheating)."
             )
             # Mark this miner as failed but don't crash the entire batch
             await task_instance.db_manager.execute(
                 """UPDATE weather_miner_responses 
-                   SET status = 'verification_failed', error_message = 'Manifest verification failed during final scoring'
+                   SET status = 'verification_failed', error_message = 'No requested variables after verified open during final scoring'
                    WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey""",
                 {"run_id": run_id, "miner_hotkey": miner_hotkey},
             )
@@ -1972,6 +2117,31 @@ async def calculate_era5_miner_score(
         # This prevents duplicate HTTP requests when processing multiple variables
         logger.info(f"[FinalScore] Miner {miner_hotkey}: Skipping dataset-wide preloading; relying on on-demand verified reads per variable/time.")
 
+        # Resolve time coordinate names for miner and ERA5 datasets
+        def _resolve_time_coord_name(ds: xr.Dataset) -> Optional[str]:
+            for name in ("time", "valid_time", "forecast_time"):
+                try:
+                    if name in ds.coords or name in ds.dims:
+                        return name
+                except Exception:
+                    continue
+            return None
+
+        miner_time_name = _resolve_time_coord_name(miner_forecast_ds)
+        era5_time_name = _resolve_time_coord_name(era5_truth_ds)
+        if miner_time_name is None or era5_time_name is None:
+            logger.error(
+                f"[FinalScore] Missing time coordinate (miner_time={miner_time_name}, era5_time={era5_time_name}). Aborting scoring for miner {miner_hotkey}."
+            )
+            await task_instance.db_manager.execute(
+                """UPDATE weather_miner_responses 
+                   SET status = 'verification_failed', error_message = 'Missing time coordinate in dataset during final scoring'
+                   WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey""",
+                {"run_id": run_id, "miner_hotkey": miner_hotkey},
+            )
+            await _check_run_completion(task_instance, run_id)
+            return False
+
         for valid_time_dt in target_datetimes:
             logger.info(
                 f"[FinalScore] Miner {miner_hotkey}: Processing Valid Time: {valid_time_dt}"
@@ -1999,12 +2169,13 @@ async def calculate_era5_miner_score(
                     )
 
                 # Handle miner forecast dataset time dtype with robust checking
-                if _is_integer_dtype(miner_forecast_ds.time.dtype):
+                miner_time_coord = miner_forecast_ds[miner_time_name]
+                if _is_integer_dtype(miner_time_coord.dtype):
                     selection_label_miner = int(
                         valid_time_dt.timestamp() * 1_000_000_000
                     )
-                elif _is_datetime_dtype(miner_forecast_ds.time.dtype):
-                    dtype_str = str(miner_forecast_ds.time.dtype)
+                elif _is_datetime_dtype(miner_time_coord.dtype):
+                    dtype_str = str(miner_time_coord.dtype)
                     if "UTC" in dtype_str or "tz" in dtype_str.lower():
                         # Timezone-aware - use timezone-aware timestamp
                         selection_label_miner = valid_time_dt
@@ -2015,12 +2186,13 @@ async def calculate_era5_miner_score(
                     selection_label_miner = valid_time_dt
 
                 # Handle ERA5 truth dataset time dtype with robust checking
-                if _is_integer_dtype(era5_truth_ds.time.dtype):
+                era5_time_coord = era5_truth_ds[era5_time_name]
+                if _is_integer_dtype(era5_time_coord.dtype):
                     selection_label_era5 = int(
                         valid_time_dt.timestamp() * 1_000_000_000
                     )
-                elif _is_datetime_dtype(era5_truth_ds.time.dtype):
-                    dtype_str = str(era5_truth_ds.time.dtype)
+                elif _is_datetime_dtype(era5_time_coord.dtype):
+                    dtype_str = str(era5_time_coord.dtype)
                     if "UTC" in dtype_str or "tz" in dtype_str.lower():
                         # Timezone-aware - use timezone-aware timestamp
                         selection_label_era5 = valid_time_dt
@@ -2031,7 +2203,7 @@ async def calculate_era5_miner_score(
                     selection_label_era5 = valid_time_dt
 
                 logger.info(
-                    f"[FinalScore info] Miner time dtype: {miner_forecast_ds.time.dtype}, ERA5 time dtype: {era5_truth_ds.time.dtype}"
+                    f"[FinalScore info] Miner time dtype: {miner_time_coord.dtype}, ERA5 time dtype: {era5_time_coord.dtype}"
                 )
                 logger.info(
                     f"[FinalScore info] Using selection_label_miner: {selection_label_miner} (type: {type(selection_label_miner)}) for miner_forecast_ds"
@@ -2041,34 +2213,87 @@ async def calculate_era5_miner_score(
                 )
 
                 # Remove duplicate time indices before selection to prevent reindexing errors
-                if len(miner_forecast_ds.time) > len(
-                    np.unique(miner_forecast_ds.time.values)
+                if len(miner_forecast_ds[miner_time_name]) > len(
+                    np.unique(miner_forecast_ds[miner_time_name].values)
                 ):
                     logger.debug(
                         f"[FinalScore] Removing duplicate time indices from miner forecast data"
                     )
                     _, unique_indices = np.unique(
-                        miner_forecast_ds.time.values, return_index=True
+                        miner_forecast_ds[miner_time_name].values, return_index=True
                     )
                     miner_forecast_ds = miner_forecast_ds.isel(
-                        time=sorted(unique_indices)
+                        **{miner_time_name: sorted(unique_indices)}
                     )
 
-                if len(era5_truth_ds.time) > len(np.unique(era5_truth_ds.time.values)):
+                if len(era5_truth_ds[era5_time_name]) > len(np.unique(era5_truth_ds[era5_time_name].values)):
                     logger.debug(
                         f"[FinalScore] Removing duplicate time indices from ERA5 data"
                     )
                     _, unique_indices = np.unique(
-                        era5_truth_ds.time.values, return_index=True
+                        era5_truth_ds[era5_time_name].values, return_index=True
                     )
-                    era5_truth_ds = era5_truth_ds.isel(time=sorted(unique_indices))
+                    era5_truth_ds = era5_truth_ds.isel(**{era5_time_name: sorted(unique_indices)})
 
-                miner_forecast_lead_slice = miner_forecast_ds.sel(
-                    time=selection_label_miner, method="nearest"
-                )
-                era5_truth_lead_slice = era5_truth_ds.sel(
-                    time=selection_label_era5, method="nearest"
-                )
+                # CRITICAL: Use .isel() instead of .sel() to avoid reading coordinate chunks
+                # Pre-compute time indices to minimize chunk reads
+                # First, read only the time coordinate array (small, one chunk) to find the index
+                logger.info(f"[FinalScore] Reading time coordinate to find index for {valid_time_dt}")
+                
+                # Read time coordinate - this will trigger verification for coordinate chunks
+                # Force computation if it's a dask array to ensure verification
+                miner_time_coord_da = miner_forecast_ds[miner_time_name]
+                if hasattr(miner_time_coord_da, 'compute'):
+                    miner_time_coord_values = miner_time_coord_da.compute(scheduler='synchronous')
+                    logger.info(f"[FinalScore] Computed miner time coordinate - should have triggered verification")
+                else:
+                    miner_time_coord_values = miner_time_coord_da.values
+                
+                era5_time_coord_da = era5_truth_ds[era5_time_name]
+                if hasattr(era5_time_coord_da, 'compute'):
+                    era5_time_coord_values = era5_time_coord_da.compute(scheduler='synchronous')
+                    logger.info(f"[FinalScore] Computed ERA5 time coordinate - should have triggered verification")
+                else:
+                    era5_time_coord_values = era5_time_coord_da.values
+                
+                # Find nearest index without reading all data chunks
+                if _is_datetime_dtype(type(miner_time_coord_values[0])):
+                    miner_time_coord_dt = pd.to_datetime(miner_time_coord_values)
+                    if miner_time_coord_dt.tz is None:
+                        miner_time_coord_dt = miner_time_coord_dt.tz_localize("UTC")
+                    else:
+                        miner_time_coord_dt = miner_time_coord_dt.tz_convert("UTC")
+                    valid_time_dt_aware = valid_time_dt if valid_time_dt.tzinfo else valid_time_dt.replace(tzinfo=timezone.utc)
+                    miner_time_idx = int(np.argmin(np.abs((miner_time_coord_dt - valid_time_dt_aware).total_seconds())))
+                else:
+                    # Integer timestamp - convert to nanoseconds for comparison
+                    if isinstance(selection_label_miner, datetime):
+                        target_ns = int(selection_label_miner.timestamp() * 1_000_000_000)
+                    else:
+                        target_ns = int(selection_label_miner)
+                    miner_time_idx = int(np.argmin(np.abs(miner_time_coord_values - target_ns)))
+                
+                if _is_datetime_dtype(type(era5_time_coord_values[0])):
+                    era5_time_coord_dt = pd.to_datetime(era5_time_coord_values)
+                    if era5_time_coord_dt.tz is None:
+                        era5_time_coord_dt = era5_time_coord_dt.tz_localize("UTC")
+                    else:
+                        era5_time_coord_dt = era5_time_coord_dt.tz_convert("UTC")
+                    valid_time_dt_aware = valid_time_dt if valid_time_dt.tzinfo else valid_time_dt.replace(tzinfo=timezone.utc)
+                    era5_time_idx = int(np.argmin(np.abs((era5_time_coord_dt - valid_time_dt_aware).total_seconds())))
+                else:
+                    # Integer timestamp
+                    if isinstance(selection_label_era5, datetime):
+                        target_ns = int(selection_label_era5.timestamp() * 1_000_000_000)
+                    else:
+                        target_ns = int(selection_label_era5)
+                    era5_time_idx = int(np.argmin(np.abs(era5_time_coord_values - target_ns)))
+                
+                logger.info(f"[FinalScore] Using time indices: miner={miner_time_idx}, era5={era5_time_idx} for {valid_time_dt}")
+                
+                # Now use .isel() with integer indices - this avoids reading coordinate chunks again
+                miner_forecast_lead_slice = miner_forecast_ds.isel(**{miner_time_name: miner_time_idx})
+                era5_truth_lead_slice = era5_truth_ds.isel(**{era5_time_name: era5_time_idx})
 
                 if miner_forecast_lead_slice is not None:
                     miner_forecast_lead_slice = miner_forecast_lead_slice.squeeze(
@@ -2077,7 +2302,7 @@ async def calculate_era5_miner_score(
                 if era5_truth_lead_slice is not None:
                     era5_truth_lead_slice = era5_truth_lead_slice.squeeze(drop=True)
 
-                miner_time_item = miner_forecast_lead_slice.time.item()
+                miner_time_item = miner_forecast_lead_slice[miner_time_name].item()
                 if isinstance(miner_time_item, (int, float, np.integer, np.floating)):
                     miner_time_actual_utc = pd.Timestamp(
                         miner_time_item, unit="ns", tz="UTC"
@@ -2362,50 +2587,11 @@ async def calculate_era5_miner_score(
                                     return False
                                 break
                         else:
-                            # Missing-variable policy: zero contribution for this var/time
+                            # Missing variable is a hard failure: incomplete dataset
                             logger.error(
-                                f"[FinalScore] No suitable miner variable found for '{var_name}'. Available: {list(miner_forecast_lead_slice.data_vars)}. Applying missing-variable policy (zero contribution)."
+                                f"[FinalScore] No suitable miner variable found for '{var_name}'. Available: {list(miner_forecast_lead_slice.data_vars)}. Failing ERA5 scoring due to incomplete dataset."
                             )
-                            from ..weather_scoring.scoring import VARIABLE_WEIGHTS
-                            base_variable_weight = VARIABLE_WEIGHTS.get(var_name, 0.0)
-                            component_scores_for_this_var = []
-                            pl_list = [None] if (var_level is None or var_level != 'all') else [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
-                            for pl in pl_list:
-                                component_scores_for_this_var.append({
-                                    "run_id": run_id,
-                                    "response_id": response_id,
-                                    "miner_uid": miner_uid,
-                                    "miner_hotkey": miner_hotkey,
-                                    "score_type": f"era5_{var_key}_{int(lead_hours)}h",
-                                    "lead_hours": int(lead_hours),
-                                    "valid_time_utc": valid_time_dt,
-                                    "variable_name": var_name,
-                                    "pressure_level": pl,
-                                    "rmse": 0.0,
-                                    "mse": 0.0,
-                                    "acc": 0.0,
-                                    "skill_score": 0.0,
-                                    "bias": 0.0,
-                                    "mae": 0.0,
-                                    "climatology_check_passed": True,
-                                    "pattern_correlation": 0.0,
-                                    "pattern_correlation_passed": True,
-                                    "clone_penalty": 0.0,
-                                    "quality_penalty": 0.0,
-                                    "weighted_score": 0.0,
-                                    "variable_weight": base_variable_weight / (len(pl_list) if pl_list and pl_list[0] is not None else 1),
-                                    "calculation_duration_ms": 0,
-                                })
-                            all_component_scores.extend(component_scores_for_this_var)
-                            current_metrics = {"rmse": 0.0, "acc": 0.0, "skill": 0.0}
-                            db_metric_row = {
-                                **db_metric_row_base,
-                                "metrics": current_metrics,
-                                "score_type": f"era5_zero_missing_{var_key}_{int(lead_hours)}h",
-                                "score": 0.0,
-                            }
-                            all_metrics_for_db.append(db_metric_row)
-                            continue
+                            return False
                     
                     # CRITICAL FIX: Standardize dimension names across all datasets before processing
                     def standardize_pressure_dims(data_array, target_dim_name="pressure_level"):
@@ -2471,39 +2657,8 @@ async def calculate_era5_miner_score(
                         miner_pid = _get_param_id(miner_var)
                         era5_pid = _get_param_id(era5_var)
                         if miner_pid is not None and miner_pid != expected_param_id:
-                            logger.error(f"[FinalScore] paramId mismatch for {var_key}: miner={miner_pid}, expected={expected_param_id}. Zeroing contribution.")
-                            # Zero contribution and continue
-                            from ..weather_scoring.scoring import VARIABLE_WEIGHTS
-                            base_variable_weight = VARIABLE_WEIGHTS.get(var_name, 0.0)
-                            component_scores_for_this_var = [{
-                                "run_id": run_id,
-                                "response_id": response_id,
-                                "miner_uid": miner_uid,
-                                "miner_hotkey": miner_hotkey,
-                                "score_type": f"era5_{var_key}_{int(lead_hours)}h",
-                                "lead_hours": int(lead_hours),
-                                "valid_time_utc": valid_time_dt,
-                                "variable_name": var_name,
-                                "pressure_level": None if var_level is None or var_level == 'all' else int(var_level),
-                                "rmse": 0.0,
-                                "mse": 0.0,
-                                "acc": 0.0,
-                                "skill_score": 0.0,
-                                "bias": 0.0,
-                                "mae": 0.0,
-                                "climatology_check_passed": True,
-                                "pattern_correlation": 0.0,
-                                "pattern_correlation_passed": True,
-                                "clone_penalty": 0.0,
-                                "quality_penalty": 0.0,
-                                "weighted_score": 0.0,
-                                "variable_weight": base_variable_weight,
-                                "calculation_duration_ms": 0,
-                            }]
-                            all_component_scores.extend(component_scores_for_this_var)
-                            db_metric_row = {**db_metric_row_base, "metrics": {"rmse": 0.0, "acc": 0.0, "skill": 0.0}, "score_type": f"era5_zero_paramid_{var_key}_{int(lead_hours)}h", "score": 0.0}
-                            all_metrics_for_db.append(db_metric_row)
-                            continue
+                            logger.error(f"[FinalScore] paramId mismatch for {var_key}: miner={miner_pid}, expected={expected_param_id}. Failing ERA5 scoring.")
+                            return False
                         if era5_pid is not None and era5_pid != expected_param_id:
                             logger.error(f"[FinalScore] ERA5 paramId mismatch for {var_key}: era5={era5_pid}, expected={expected_param_id}. Failing timestep.")
                             return False
@@ -2512,43 +2667,19 @@ async def calculate_era5_miner_score(
                         miner_sname = _get_standard_name(miner_var)
                         era5_sname = _get_standard_name(era5_var)
                         if miner_sname and miner_sname.lower() != expected_standard_name.lower():
-                            logger.error(f"[FinalScore] standard_name mismatch for {var_key}: miner={miner_sname}, expected={expected_standard_name}. Zeroing contribution.")
-                            from ..weather_scoring.scoring import VARIABLE_WEIGHTS
-                            base_variable_weight = VARIABLE_WEIGHTS.get(var_name, 0.0)
-                            component_scores_for_this_var = [{
-                                "run_id": run_id,
-                                "response_id": response_id,
-                                "miner_uid": miner_uid,
-                                "miner_hotkey": miner_hotkey,
-                                "score_type": f"era5_{var_key}_{int(lead_hours)}h",
-                                "lead_hours": int(lead_hours),
-                                "valid_time_utc": valid_time_dt,
-                                "variable_name": var_name,
-                                "pressure_level": None if var_level is None or var_level == 'all' else int(var_level),
-                                "rmse": 0.0,
-                                "mse": 0.0,
-                                "acc": 0.0,
-                                "skill_score": 0.0,
-                                "bias": 0.0,
-                                "mae": 0.0,
-                                "climatology_check_passed": True,
-                                "pattern_correlation": 0.0,
-                                "pattern_correlation_passed": True,
-                                "clone_penalty": 0.0,
-                                "quality_penalty": 0.0,
-                                "weighted_score": 0.0,
-                                "variable_weight": base_variable_weight,
-                                "calculation_duration_ms": 0,
-                            }]
-                            all_component_scores.extend(component_scores_for_this_var)
-                            db_metric_row = {**db_metric_row_base, "metrics": {"rmse": 0.0, "acc": 0.0, "skill": 0.0}, "score_type": f"era5_zero_sname_{var_key}_{int(lead_hours)}h", "score": 0.0}
-                            all_metrics_for_db.append(db_metric_row)
-                            continue
+                            logger.error(f"[FinalScore] standard_name mismatch for {var_key}: miner={miner_sname}, expected={expected_standard_name}. Failing ERA5 scoring.")
+                            return False
                         if era5_sname and era5_sname.lower() != expected_standard_name.lower():
                             logger.error(f"[FinalScore] ERA5 standard_name mismatch for {var_key}: era5={era5_sname}, expected={expected_standard_name}. Failing timestep.")
                             return False
 
-                    # Minimal raw diagnostics
+                    # Log what we're about to score
+                    logger.info(
+                        f"[FinalScore] SCORING VARIABLE: {var_key} at {valid_time_dt}"
+                    )
+                    logger.info(
+                        f"[FinalScore] Loading data for {var_key} - this will trigger chunk verification"
+                    )
                     logger.info(
                         f"[FinalScore] RAW DATA DIAGNOSTICS for {var_key} at {valid_time_dt} (units miner={miner_var_da_unaligned.attrs.get('units')}, truth={truth_var_da_unaligned.attrs.get('units')})"
                     )
@@ -2593,48 +2724,9 @@ async def calculate_era5_miner_score(
                         miner_ok = (canon_miner == canon_expected) or (allow_missing_miner_units and canon_miner is None)
                         if not (truth_ok and miner_ok):
                             logger.error(
-                                f"[FinalScore] Unit validation failed for {var_key}: miner_units={miner_units_raw}, truth_units={truth_units_raw}, expected={unit_expected}. Zeroing contribution."
+                                f"[FinalScore] Unit validation failed for {var_key}: miner_units={miner_units_raw}, truth_units={truth_units_raw}, expected={unit_expected}. Failing ERA5 scoring."
                             )
-                            from ..weather_scoring.scoring import VARIABLE_WEIGHTS
-                            base_variable_weight = VARIABLE_WEIGHTS.get(var_name, 0.0)
-                            component_scores_for_this_var = []
-                            pl_list = [None] if (var_level is None or var_level != 'all') else [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
-                            for pl in pl_list:
-                                component_scores_for_this_var.append({
-                                    "run_id": run_id,
-                                    "response_id": response_id,
-                                    "miner_uid": miner_uid,
-                                    "miner_hotkey": miner_hotkey,
-                                    "score_type": f"era5_{var_key}_{int(lead_hours)}h",
-                                    "lead_hours": int(lead_hours),
-                                    "valid_time_utc": valid_time_dt,
-                                    "variable_name": var_name,
-                                    "pressure_level": pl,
-                                    "rmse": 0.0,
-                                    "mse": 0.0,
-                                    "acc": 0.0,
-                                    "skill_score": 0.0,
-                                    "bias": 0.0,
-                                    "mae": 0.0,
-                                    "climatology_check_passed": True,
-                                    "pattern_correlation": 0.0,
-                                    "pattern_correlation_passed": True,
-                                    "clone_penalty": 0.0,
-                                    "quality_penalty": 0.0,
-                                    "weighted_score": 0.0,
-                                    "variable_weight": base_variable_weight / (len(pl_list) if pl_list and pl_list[0] is not None else 1),
-                                    "calculation_duration_ms": 0,
-                                })
-                            all_component_scores.extend(component_scores_for_this_var)
-                            current_metrics = {"rmse": 0.0, "acc": 0.0, "skill": 0.0}
-                            db_metric_row = {
-                                **db_metric_row_base,
-                                "metrics": current_metrics,
-                                "score_type": f"era5_zero_units_{var_key}_{int(lead_hours)}h",
-                                "score": 0.0,
-                            }
-                            all_metrics_for_db.append(db_metric_row)
-                            continue
+                            return False
 
                     clim_dayofyear = pd.Timestamp(valid_time_dt).dayofyear
                     clim_hour_rounded = (valid_time_dt.hour // 6) * 6
@@ -2863,7 +2955,29 @@ async def calculate_era5_miner_score(
                     except Exception:
                         min_cov = 0.999
                     try:
-                        miner_vals_np = miner_var_da_aligned.values
+                        # CRITICAL: Force chunk reads to trigger verification
+                        logger.info(f"[FinalScore] Forcing chunk read for miner data: {var_key} at {valid_time_dt}")
+                        
+                        # Clear dask cache to ensure fresh reads through VerifyingChunkMapper
+                        try:
+                            import dask
+                            dask.cache.clear()
+                            logger.info(f"[FinalScore] Cleared dask cache before reading {var_key}")
+                        except Exception:
+                            pass
+                        
+                        # FORCE ACTUAL CHUNK READS by computing dask arrays
+                        # Just calling .values might use cached data
+                        if hasattr(miner_var_da_aligned, 'compute'):
+                            # This is a dask array - force computation which should trigger chunk reads
+                            # Use scheduler='synchronous' to ensure reads happen immediately and go through our mapper
+                            miner_vals_np = miner_var_da_aligned.compute(scheduler='synchronous')
+                            logger.info(f"[FinalScore] Computed dask array for {var_key} - should have triggered verification")
+                        else:
+                            miner_vals_np = miner_var_da_aligned.values
+                            logger.warning(f"[FinalScore] WARNING: {var_key} is not a dask array - verification may not be triggered!")
+                        
+                        logger.info(f"[FinalScore] Miner data loaded for {var_key}")
                         truth_vals_np = truth_var_da_final.values
                         mask_overlap = np.isfinite(truth_vals_np)
                         if mask_overlap.any():
@@ -2875,11 +2989,10 @@ async def calculate_era5_miner_score(
                             finite_elems = int(np.isfinite(miner_vals_np).sum()) if total_elems else 0
                         coverage_ratio = (finite_elems / total_elems) if total_elems else 0.0
                         if coverage_ratio < min_cov:
-                            logger.warning(
-                                f"[FinalScore] Low finite coverage for {var_key}: {coverage_ratio:.6f} < {min_cov:.6f}. Skipping with zero metrics."
+                            logger.error(
+                                f"[FinalScore] Low finite coverage for {var_key}: {coverage_ratio:.6f} < {min_cov:.6f}. Failing ERA5 scoring due to incomplete/invalid data."
                             )
-                            current_metrics = {"rmse": 0.0, "skill": 0.0, "acc": 0.0}
-                            # Continue to component score creation with zeros
+                            return False
                     except Exception as _cov_err:
                         logger.debug(f"[FinalScore] Coverage ratio check failed for {var_key}: {_cov_err}")
 
@@ -2919,21 +3032,10 @@ async def calculate_era5_miner_score(
                     # Post-normalization shape guard (true mismatches only)
                     try:
                         if tuple(miner_var_da_aligned.shape) != tuple(truth_var_da_final.shape):
-                            logger.warning(
-                                f"[FinalScore] Shape mismatch after normalization for {var_key}: miner={miner_var_da_aligned.shape}, truth={truth_var_da_final.shape}. Skipping with zero metrics."
+                            logger.error(
+                                f"[FinalScore] Shape mismatch after normalization for {var_key}: miner={miner_var_da_aligned.shape}, truth={truth_var_da_final.shape}. Failing ERA5 scoring."
                             )
-                            current_metrics = {"rmse": 0.0, "skill": 0.0, "acc": 0.0}
-                            # Continue to component score creation with zeros
-                            # Ensure climatology is aligned for component record completeness
-                            try:
-                                climatology_da_aligned = await asyncio.to_thread(
-                                    clim_var_to_interpolate.interp_like,
-                                    truth_var_da_final,
-                                    method="linear",
-                                    kwargs={"fill_value": None},
-                                )
-                            except Exception:
-                                pass
+                            return False
                     except Exception as _shape_guard_err:
                         logger.debug(f"[FinalScore] Shape guard skipped due to error: {_shape_guard_err}")
 
@@ -3344,6 +3446,9 @@ async def calculate_era5_miner_score(
                                     f"[FinalScore] ACC aggregation encountered NaN per-level values: {acc_vals}"
                                 )
                             acc_val = float(np.sum(weights_pl * acc_vals))
+                            if not np.isfinite(acc_val):
+                                logger.error(f"[FinalScore] ACC aggregation produced non-finite value for {var_key} at {valid_time_dt}. Failing ERA5 scoring.")
+                                return False
                         else:
                             raise ValueError("[FinalScore] No per-level ACC scores to aggregate")
                         current_metrics["acc"] = acc_val
@@ -3360,6 +3465,9 @@ async def calculate_era5_miner_score(
                             climatology_da_aligned,
                             mse_weights,
                         )
+                        if not np.isfinite(acc_val):
+                            logger.error(f"[FinalScore] ACC calculation produced non-finite value for {var_key} at {valid_time_dt}. Failing ERA5 scoring.")
+                            return False
                         current_metrics["acc"] = acc_val
                         
                         # Update component score with ACC
@@ -3967,49 +4075,93 @@ async def _calculate_and_store_aggregated_era5_score(
 
     # Compute normalized per-lead ERA5 scores combining skill/acc/rmse if available
     # Then write per-lead normalized scores, averages, and overall_forecast_score (80% ERA5 + 20% Day1)
-    try:
-        # Fetch Day1 overall score for binary QC blend
-        day1_row = await task_instance.db_manager.fetch_one(
+    # Fetch Day1 overall score for binary QC blend
+    day1_row = await task_instance.db_manager.fetch_one(
             """
             SELECT forecast_score_initial
             FROM weather_forecast_stats
             WHERE run_id = :rid AND miner_uid = :uid
             """,
-            {"rid": run_id, "uid": miner_uid},
-        )
-        day1_overall = float(day1_row["forecast_score_initial"]) if day1_row and day1_row["forecast_score_initial"] is not None else None
+        {"rid": run_id, "uid": miner_uid},
+    )
+    day1_overall = float(day1_row["forecast_score_initial"]) if day1_row and day1_row["forecast_score_initial"] is not None else None
 
-        # Compute normalized per-lead scores from weather_miner_scores table
-        # We aggregate by lead and variable
-        rows = await task_instance.db_manager.fetch_all(
+    # Compute normalized per-lead scores from weather_miner_scores table
+    # We aggregate by lead and variable (restricted to this response)
+    rows = await task_instance.db_manager.fetch_all(
             """
             SELECT lead_hours, score_type, score
             FROM weather_miner_scores
-            WHERE run_id = :rid AND miner_uid = :uid AND score IS NOT NULL
+            WHERE run_id = :rid AND miner_uid = :uid AND response_id = :resp_id AND score IS NOT NULL
               AND (score_type LIKE 'era5_rmse_%' OR score_type LIKE 'era5_acc_%' OR score_type LIKE 'era5_skill_%')
             """,
-            {"rid": run_id, "uid": miner_uid},
-        )
-        per_lead_metrics: Dict[int, Dict[str, List[float]]] = {}
-        for r in rows:
-            lh = r.get("lead_hours")
-            st = r.get("score_type")
-            sc = r.get("score")
-            if lh is None or st is None or sc is None:
-                continue
-            bucket = per_lead_metrics.setdefault(int(lh), {"acc": [], "skill": [], "rmse": []})
-            if st.startswith("era5_acc_"):
-                bucket["acc"].append(float(sc))
-            elif st.startswith("era5_skill_"):
-                bucket["skill"].append(float(sc))
-            elif st.startswith("era5_rmse_"):
-                bucket["rmse"].append(float(sc))
+        {"rid": run_id, "uid": miner_uid, "resp_id": response_id},
+    )
+    per_lead_metrics: Dict[int, Dict[str, List[float]]] = {}
+    per_lead_present_vars: Dict[int, Dict[str, set]] = {}
+    # Build expected var_key set from configuration
+    expected_var_keys: set = set()
+    try:
+        for vc in vars_levels_scored:
+            if isinstance(vc, dict) and vc.get("name"):
+                vk = f"{vc['name']}{vc['level'] if vc.get('level') and vc.get('level') != 'all' else ''}"
+                expected_var_keys.add(vk)
+    except Exception:
+        expected_var_keys = set()
+    for r in rows:
+        lh = r.get("lead_hours")
+        st = r.get("score_type")
+        sc = r.get("score")
+        if lh is None or st is None or sc is None:
+            continue
+        lead_key = int(lh)
+        bucket = per_lead_metrics.setdefault(lead_key, {"acc": [], "skill": [], "rmse": []})
+        present = per_lead_present_vars.setdefault(lead_key, {"acc": set(), "skill": set(), "rmse": set()})
+        # Parse var_key from score_type by trimming prefix/suffix
+        var_key = None
+        try:
+            st_str = str(st)
+            # drop trailing _{lead}h
+            idx_h = st_str.rfind("_")
+            base = st_str[:idx_h] if idx_h != -1 else st_str
+            for prefix in ("era5_rmse_", "era5_acc_", "era5_skill_gfs_", "era5_skill_clim_"):
+                if base.startswith(prefix):
+                    var_key = base[len(prefix):]
+                    break
+        except Exception:
+            var_key = None
+        if st.startswith("era5_acc_"):
+            bucket["acc"].append(float(sc))
+            if var_key:
+                present["acc"].add(var_key)
+        elif st.startswith("era5_skill_"):
+            bucket["skill"].append(float(sc))
+            if var_key:
+                present["skill"].add(var_key)
+        elif st.startswith("era5_rmse_"):
+            bucket["rmse"].append(float(sc))
+            if var_key:
+                present["rmse"].add(var_key)
 
-        normalized_by_lead: Dict[int, float] = {}
-        rmse_ref_by_lead: Dict[int, float] = {}
-        # Establish a reference RMSE per lead as median of miner RMSEs for stability when GFS ref not present in table
-        # Here we fallback to miner's own median across vars; could be enhanced with network-wide stats
-        for lh, met in per_lead_metrics.items():
+    normalized_by_lead: Dict[int, float] = {}
+    rmse_ref_by_lead: Dict[int, float] = {}
+    # Establish a reference RMSE per lead as median of miner RMSEs for stability when GFS ref not present in table
+    # Here we fallback to miner's own median across vars; could be enhanced with network-wide stats
+    # Completeness: every lead must have metrics for all expected variables
+    if expected_var_keys:
+        for lh_check, kinds in per_lead_present_vars.items():
+            vars_union = kinds.get("acc", set()) | kinds.get("skill", set()) | kinds.get("rmse", set())
+            if vars_union != expected_var_keys:
+                logger.error(
+                    f"[AggFinalScore] Incomplete metrics for lead {lh_check}: present={sorted(list(vars_union))}, expected={sorted(list(expected_var_keys))}. Aborting aggregation."
+                )
+                await task_instance.db_manager.execute(
+                    """UPDATE weather_miner_responses SET status = 'era5_scoring_failed', error_message = 'Incomplete metrics in aggregation' WHERE id = :rid""",
+                    {"rid": response_id},
+                )
+                return None
+
+    for lh, met in per_lead_metrics.items():
             rmse_vals = [v for v in met["rmse"] if v is not None]
             if rmse_vals:
                 rmse_vals_sorted = sorted(rmse_vals)
@@ -4017,7 +4169,7 @@ async def _calculate_and_store_aggregated_era5_score(
             else:
                 rmse_ref_by_lead[lh] = 1.0
 
-        for lh, met in per_lead_metrics.items():
+    for lh, met in per_lead_metrics.items():
             # Normalize components
             acc_vals = [a for a in met["acc"] if a is not None]
             skill_vals = [s for s in met["skill"] if s is not None]
@@ -4049,53 +4201,69 @@ async def _calculate_and_store_aggregated_era5_score(
             else:
                 normalized = 0.0
             # Clamp final per-lead normalized score to [0, 1]
-            normalized_by_lead[lh] = float(clamp(float(normalized), 0.0, 1.0))
+            norm_val = float(clamp(float(normalized), 0.0, 1.0))
+            if not np.isfinite(norm_val):
+                logger.error(f"[AggFinalScore] Non-finite per-lead normalized score for lead {lh}. Aborting aggregation.")
+                await task_instance.db_manager.execute(
+                    """UPDATE weather_miner_responses SET status = 'era5_scoring_failed', error_message = 'Non-finite per-lead normalized score' WHERE id = :rid""",
+                    {"rid": response_id},
+                )
+                return None
+            normalized_by_lead[lh] = norm_val
 
-        # Push per-lead normalized writes early, as part of final scoring loop
-        stats_mgr = WeatherStatsManager(task_instance.db_manager, validator_hotkey=getattr(task_instance, "validator", None) and getattr(getattr(getattr(task_instance, "validator", None), "validator_wallet", None), "hotkey", None) and getattr(getattr(getattr(task_instance, "validator", None), "validator_wallet", None).hotkey, "ss58_address", None) or "unknown_validator")
+    # Push per-lead normalized writes early, as part of final scoring loop
+    stats_mgr = WeatherStatsManager(task_instance.db_manager, validator_hotkey=getattr(task_instance, "validator", None) and getattr(getattr(getattr(task_instance, "validator", None), "validator_wallet", None), "hotkey", None) and getattr(getattr(getattr(task_instance, "validator", None), "validator_wallet", None).hotkey, "ss58_address", None) or "unknown_validator")
 
-        # Compute averages from component table for avg_rmse/avg_acc/avg_skill
-        avg_comp = await task_instance.db_manager.fetch_one(
-            sa.text(
-                """
-                SELECT AVG(rmse) AS avg_rmse, AVG(acc) AS avg_acc, AVG(skill_score) AS avg_skill
-                FROM weather_forecast_component_scores
-                WHERE run_id = :rid AND miner_uid = :uid AND score_type = 'era5'
-                """
-            ),
-            {"rid": run_id, "uid": miner_uid},
+    # Compute averages from component table for avg_rmse/avg_acc/avg_skill
+    avg_comp = await task_instance.db_manager.fetch_one(
+        sa.text(
+            """
+            SELECT AVG(rmse) AS avg_rmse, AVG(acc) AS avg_acc, AVG(skill_score) AS avg_skill
+            FROM weather_forecast_component_scores
+            WHERE run_id = :rid AND miner_uid = :uid AND score_type = 'era5'
+            """
+        ),
+        {"rid": run_id, "uid": miner_uid},
+    )
+    era5_avg_rmse = float(avg_comp["avg_rmse"]) if avg_comp and avg_comp["avg_rmse"] is not None else None
+    era5_avg_acc = float(avg_comp["avg_acc"]) if avg_comp and avg_comp["avg_acc"] is not None else None
+    era5_avg_skill = float(avg_comp["avg_skill"]) if avg_comp and avg_comp["avg_skill"] is not None else None
+
+    # Aggregate normalized ERA5 with completeness penalty: divide by full expected horizon
+    # This prevents partially-complete forecasts from appearing better due to fewer (shorter) leads
+    expected_leads = task_instance.config.get("final_scoring_lead_hours", [24,48,72,96,120,144,168,192,216,240])
+    available_leads = [h for h in expected_leads if h in normalized_by_lead]
+    era5_norm_total = sum(normalized_by_lead[h] for h in available_leads)
+    era5_norm_avg = (era5_norm_total / float(len(expected_leads))) if expected_leads else 0.0
+
+    # Binary Day1 QC: day1_pass = 1 if day1_overall >= threshold else 0
+    qc_threshold = float(task_instance.config.get("day1_binary_threshold", 0.1))
+    day1_pass = 1.0 if (day1_overall is not None and float(day1_overall) >= qc_threshold) else 0.0
+
+    # Blend with configured weights (defaults: 0.95 ERA5, 0.05 Day1-pass)
+    W_era5 = task_instance.config.get("weather_score_era5_weight", 0.95)
+    W_day1 = task_instance.config.get("weather_score_day1_weight", 0.05)
+    try:
+        W_era5 = float(W_era5)
+        W_day1 = float(W_day1)
+    except Exception:
+        W_era5, W_day1 = 0.95, 0.05
+    if (W_era5 + W_day1) > 0:
+        norm = float(W_era5 + W_day1)
+        W_era5 /= norm
+        W_day1 /= norm
+
+    overall_forecast_score = W_era5 * era5_norm_avg + W_day1 * day1_pass
+    overall_forecast_score = clamp(float(overall_forecast_score), 0.0, 1.0)
+    if not np.isfinite(overall_forecast_score):
+        logger.error(f"[AggFinalScore] Non-finite overall_forecast_score. Aborting aggregation.")
+        await task_instance.db_manager.execute(
+            """UPDATE weather_miner_responses SET status = 'era5_scoring_failed', error_message = 'Non-finite overall score' WHERE id = :rid""",
+            {"rid": response_id},
         )
-        era5_avg_rmse = float(avg_comp["avg_rmse"]) if avg_comp and avg_comp["avg_rmse"] is not None else None
-        era5_avg_acc = float(avg_comp["avg_acc"]) if avg_comp and avg_comp["avg_acc"] is not None else None
-        era5_avg_skill = float(avg_comp["avg_skill"]) if avg_comp and avg_comp["avg_skill"] is not None else None
+        return None
 
-        # Aggregate normalized ERA5 with completeness penalty: divide by full expected horizon
-        # This prevents partially-complete forecasts from appearing better due to fewer (shorter) leads
-        expected_leads = task_instance.config.get("final_scoring_lead_hours", [24,48,72,96,120,144,168,192,216,240])
-        available_leads = [h for h in expected_leads if h in normalized_by_lead]
-        era5_norm_total = sum(normalized_by_lead[h] for h in available_leads)
-        era5_norm_avg = (era5_norm_total / float(len(expected_leads))) if expected_leads else 0.0
-
-        # Binary Day1 QC: day1_pass = 1 if day1_overall >= threshold else 0
-        qc_threshold = float(task_instance.config.get("day1_binary_threshold", 0.1))
-        day1_pass = 1.0 if (day1_overall is not None and float(day1_overall) >= qc_threshold) else 0.0
-
-        # Blend with configured weights (defaults: 0.95 ERA5, 0.05 Day1-pass)
-        W_era5 = task_instance.config.get("weather_score_era5_weight", 0.95)
-        W_day1 = task_instance.config.get("weather_score_day1_weight", 0.05)
-        try:
-            W_era5 = float(W_era5)
-            W_day1 = float(W_day1)
-        except Exception:
-            W_era5, W_day1 = 0.95, 0.05
-        if (W_era5 + W_day1) > 0:
-            norm = float(W_era5 + W_day1)
-            W_era5 /= norm
-            W_day1 /= norm
-
-        overall_forecast_score = W_era5 * era5_norm_avg + W_day1 * day1_pass
-        overall_forecast_score = clamp(float(overall_forecast_score), 0.0, 1.0)
-
+    try:
         await stats_mgr.update_forecast_stats(
             run_id=run_id,
             miner_uid=miner_uid,
@@ -4108,7 +4276,12 @@ async def _calculate_and_store_aggregated_era5_score(
             overall_forecast_score=overall_forecast_score,
         )
     except Exception as _agg_err:
-        logger.debug(f"[AggFinalScore] Skipped normalized aggregation write due to error: {_agg_err}")
+        logger.error(f"[AggFinalScore] Aggregation write failed: {_agg_err}")
+        await task_instance.db_manager.execute(
+            """UPDATE weather_miner_responses SET status = 'era5_scoring_failed', error_message = 'Aggregation write failed' WHERE id = :rid""",
+            {"rid": response_id},
+        )
+        return None
 
     # Log progressive scoring details
     logger.info(

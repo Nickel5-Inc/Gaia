@@ -1070,7 +1070,13 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                         return True
                     # Enqueue/mark step rows per miner for these confirmed leads
                     miners = await db.fetch_all(
-                        "SELECT DISTINCT miner_uid, miner_hotkey FROM weather_miner_responses WHERE run_id = :rid",
+                        """
+                        SELECT DISTINCT miner_uid, miner_hotkey
+                        FROM weather_miner_responses
+                        WHERE run_id = :rid
+                          AND verification_passed IS TRUE
+                          AND status = 'verified_manifest_store_opened'
+                        """,
                         {"rid": rid},
                     )
                     from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_start
@@ -1169,7 +1175,13 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                         if not confirmed:
                             continue
                         miners = await db.fetch_all(
-                            "SELECT DISTINCT miner_uid, miner_hotkey FROM weather_miner_responses WHERE run_id = :rid",
+                            """
+                            SELECT DISTINCT miner_uid, miner_hotkey
+                            FROM weather_miner_responses
+                            WHERE run_id = :rid
+                              AND verification_passed IS TRUE
+                              AND status = 'verified_manifest_store_opened'
+                            """,
                             {"rid": rid},
                         )
                         # Build skip sets to avoid re-scoring already completed leads

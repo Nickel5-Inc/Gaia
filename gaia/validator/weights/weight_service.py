@@ -108,50 +108,12 @@ async def commit_weights_if_eligible(validator) -> bool:
             nz_pre = arr_pre[arr_pre > 0]
             if nz_pre.size > 0:
                 logger.info(
-                    f"[WeightEligibility] Pre-perturb weights summary: nonzero={nz_pre.size}, min>0={nz_pre.min():.6f}, max>0={nz_pre.max():.6f}, mean>0={nz_pre.mean():.6f}"
+                    f"[WeightEligibility] Weights summary: nonzero={nz_pre.size}, min>0={nz_pre.min():.6f}, max>0={nz_pre.max():.6f}, mean>0={nz_pre.mean():.6f}"
                 )
             else:
-                logger.warning("[WeightEligibility] All computed weights are zero before perturbation")
+                logger.warning("[WeightEligibility] All computed weights are zero")
         except Exception:
             pass
-        if getattr(validator, "perturbation_manager", None):
-            # Skip perturbation when using burn fallback (100% to UID 252)
-            is_burn_fallback = False
-            try:
-                nonzero_count = int(np.count_nonzero(arr_pre))
-                if nonzero_count == 1:
-                    max_idx = int(np.argmax(arr_pre))
-                    max_val = float(arr_pre[max_idx])
-                    is_burn_fallback = (max_idx == 252 and abs(max_val - 1.0) < 1e-9)
-            except Exception:
-                pass
-
-            if is_burn_fallback:
-                logger.info("[WeightEligibility] Skipping perturbation under burn fallback (100% to UID 252)")
-            else:
-                logger.info("[WeightEligibility] Applying weight perturbation...")
-                try:
-                    arr = np.array(weights)
-                    perturbed = await validator.perturbation_manager.get_perturbed_weights(arr)
-                    weights = perturbed.tolist()
-                    try:
-                        arr_post = np.array(weights, dtype=float)
-                        nz_post = arr_post[arr_post > 0]
-                        if nz_post.size > 0:
-                            logger.info(
-                                f"[WeightEligibility] Post-perturb weights summary: nonzero={nz_post.size}, min>0={nz_post.min():.6f}, max>0={nz_post.max():.6f}, mean>0={nz_post.mean():.6f}"
-                            )
-                            if 252 < len(arr_post) and arr_post[252] > 0:
-                                logger.info(
-                                    f"[WeightEligibility] Perturbation allocated weight to UID 252 (burn): {arr_post[252]:.6f}"
-                                )
-                        else:
-                            logger.warning("[WeightEligibility] All post-perturb weights are zero")
-                    except Exception:
-                        pass
-                    logger.info("[WeightEligibility] Weight perturbation applied successfully")
-                except Exception as e:
-                    logger.warning(f"[WeightEligibility] Weight perturbation failed: {e}")
         
         logger.info(f"[WeightEligibility] Creating FiberWeightSetter for netuid {netuid}")
         setter = FiberWeightSetter(

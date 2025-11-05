@@ -196,8 +196,10 @@ def _format_log_record(record: Dict[str, Any]) -> str:
     timestamp_colored = f"{dim_color}{timestamp}{RESET}"
     caller_colored = f"{dim_color}{caller_info}{RESET}"
     
-    # Clean message (only escape loguru-specific characters)
+    # Clean message (escape braces and angle brackets to avoid Loguru color tag parsing)
     message = str(record['message']).replace('{', '{{').replace('}', '}}')
+    # Prevent Loguru Colorizer from interpreting things like "<redacted>" as color tags
+    message = message.replace('<', '&lt;').replace('>', '&gt;')
     
     # Build colorful log line
     log_line = f"{worker_prefix} {timestamp_colored} | {level_colored} | {caller_colored} - {message}\n"
@@ -529,20 +531,19 @@ def get_logger(name: str):
         CustomLogger instance with enhanced functionality, or SilentLogger for noisy modules
     """
     # Return silent logger for noisy fiber modules
-    noisy_modules = [
+    # Silence only fiber.* internal modules, not Gaia modules that happen to contain 'utils'
+    fiber_noisy_parts = (
         "chain_utils",
-        "interface", 
+        "interface",
         "weights",
-        "fetch_nodes", 
+        "fetch_nodes",
         "signatures",
         "utils",
         "client",
         "handshake",
         "metagraph",
-    ]
-    
-    # Check if this is a noisy fiber module
-    if any(noisy_module in name for noisy_module in noisy_modules):
+    )
+    if name.startswith("fiber.") and any(part in name for part in fiber_noisy_parts):
         return SilentLogger()
     
     # Return full logger for everything else

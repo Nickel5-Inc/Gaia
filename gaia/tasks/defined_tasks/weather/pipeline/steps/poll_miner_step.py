@@ -170,6 +170,12 @@ async def run_poll_miner_job(
                                 setattr(validator, "weather_task_singleton", task)
                             except Exception:
                                 pass
+                    # Ensure task has a reference to validator (needed for handshake keypair)
+                    if validator is not None:
+                        try:
+                            setattr(task, "validator", validator)
+                        except Exception:
+                            pass
 
                     run_details = {"id": run_id}
                     response_details = {"id": response_id, "miner_hotkey": miner_hotkey, "job_id": job_id}
@@ -177,6 +183,21 @@ async def run_poll_miner_job(
                 except Exception as freeze_err:
                     logger.error(f"[Run {run_id}] Manifest freeze failed for miner {miner_hotkey[:8]}: {freeze_err}")
                 
+                # Check verification result before enqueuing Day1
+                try:
+                    vrec = await db.fetch_one(
+                        "SELECT verification_passed, status, error_message FROM weather_miner_responses WHERE id = :rid",
+                        {"rid": response_id},
+                    )
+                except Exception:
+                    vrec = None
+                if not vrec or not bool(vrec.get("verification_passed")) or vrec.get("status") != "verified_manifest_store_opened":
+                    logger.warning(
+                        f"[Run {run_id}] Skipping Day1 enqueue for miner {miner_hotkey[:8]} due to verification state: "
+                        f"verified={vrec and vrec.get('verification_passed')}, status={vrec and vrec.get('status')}"
+                    )
+                    return True
+
                 # Update stats with inference time and status
                 await db.execute(
                     """

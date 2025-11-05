@@ -233,11 +233,12 @@ async def run_item(
             FROM weather_miner_scores
             WHERE run_id = :rid
               AND miner_uid = :uid
+              AND response_id = :resp_id
               AND score_type LIKE 'era5_rmse_%'
               AND lead_hours IS NOT NULL
             """
         ),
-        {"rid": run_id, "uid": miner_uid},
+        {"rid": run_id, "uid": miner_uid, "resp_id": resp["id"]},
     )
     existing_scores: Dict[int, float] = {}
     for r in rows:
