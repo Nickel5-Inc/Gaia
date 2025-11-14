@@ -30,10 +30,10 @@ def apply_burn_from_env(
       - Sum of weights remains unchanged (normalization downstream preserves final fractions).
     """
     try:
-        enabled = _parse_bool(os.getenv("BURN_MINER_EMISSION"))
+        enabled = _parse_bool(os.getenv("BURN_MINER_EMISSION", "true"))
         if not enabled:
             return weights_by_uid
-        rate_str = os.getenv("BURN_RATE", "0")
+        rate_str = os.getenv("BURN_RATE", "0.75")
         try:
             burn_rate = float(rate_str)
         except Exception:
@@ -41,7 +41,7 @@ def apply_burn_from_env(
         burn_rate = max(0.0, min(1.0, burn_rate))
         if burn_rate <= 0.0:
             return weights_by_uid
-        burn_hotkey = os.getenv("BURN_HOTKEY", "").strip()
+        burn_hotkey = os.getenv("BURN_HOTKEY", "5GmhjCqDTsRcKqPFw4FDig8tVBfFGNrwP8ywe5En5hnELwDQ").strip()
         if not burn_hotkey:
             logger.warning("[Burn] BURN_MINER_EMISSION enabled but BURN_HOTKEY is not set - skipping burn")
             return weights_by_uid
@@ -97,10 +97,10 @@ def get_burn_uid_if_enabled(substrate, netuid: int) -> Optional[int]:
     Return the UID of the burn hotkey if burn is enabled and resolvable; otherwise None.
     """
     try:
-        enabled = _parse_bool(os.getenv("BURN_MINER_EMISSION"))
+        enabled = _parse_bool(os.getenv("BURN_MINER_EMISSION", "true"))
         if not enabled:
             return None
-        rate_str = os.getenv("BURN_RATE", "0")
+        rate_str = os.getenv("BURN_RATE", "0.5")
         try:
             burn_rate = float(rate_str)
         except Exception:
@@ -108,7 +108,7 @@ def get_burn_uid_if_enabled(substrate, netuid: int) -> Optional[int]:
         burn_rate = max(0.0, min(1.0, burn_rate))
         if burn_rate <= 0.0:
             return None
-        burn_hotkey = os.getenv("BURN_HOTKEY", "").strip()
+        burn_hotkey = os.getenv("BURN_HOTKEY", "5GmhjCqDTsRcKqPFw4FDig8tVBfFGNrwP8ywe5En5hnELwDQ").strip()
         if not burn_hotkey:
             return None
         try:
