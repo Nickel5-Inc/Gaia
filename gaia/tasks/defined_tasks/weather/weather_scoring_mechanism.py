@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 from .processing.weather_logic import _request_fresh_token
 from .utils.remote_access import open_verified_remote_zarr_dataset, get_last_verified_open_error, open_verified_remote_zarr_variable
-from .utils.hashing import verify_minimal_chunks_and_reconstruct_manifest_hash, is_rehash_verified, get_last_manifest_log
+from .utils.hashing import get_last_manifest_log
 
 from .weather_scoring.metrics import (
     calculate_bias_corrected_forecast,
@@ -281,71 +281,31 @@ async def evaluate_miner_forecast_day1(
             task_instance.config.get("verification_timeout_seconds", 300) / 2
         )
 
-        # Efficient verification & single open for Day1 as well
+        # Open dataset with VerifyingChunkMapper for on-demand verification
         miner_forecast_ds = None
-        if not is_rehash_verified(zarr_store_url, claimed_manifest_content_hash):
-            # Determine times/vars for Day1 minimal verification
-            lead_times_to_score_hours: List[int] = day1_scoring_config.get(
-                "lead_times_hours",
-                task_instance.config.get("initial_scoring_lead_hours", [6, 12]),
+        try:
+            result_ds = await asyncio.wait_for(
+                open_verified_remote_zarr_dataset(
+                    zarr_store_url=zarr_store_url,
+                    claimed_manifest_content_hash=claimed_manifest_content_hash,
+                    miner_hotkey_ss58=miner_hotkey,
+                    storage_options=storage_options,
+                    job_id=f"{job_id}_day1_score",
+                    frozen_manifest=frozen_manifest_json,
+                    return_manifest=True,
+                ),
+                timeout=verification_timeout_seconds,
             )
-            times_to_evaluate = [
-                run_gfs_init_time + timedelta(hours=h) for h in lead_times_to_score_hours
-            ]
-            variables_to_score: List[Dict] = day1_scoring_config.get(
-                "variables_levels_to_score", []
+            if isinstance(result_ds, tuple):
+                miner_forecast_ds, _manifest_used = result_ds
+            else:
+                miner_forecast_ds = result_ds
+        except Exception as open_err:
+            logger.error(
+                f"[Day1Score] Exception during verified open for {miner_hotkey} at {zarr_store_url}: {open_err}",
+                exc_info=True,
             )
-            variables = [vc["name"] for vc in variables_to_score if isinstance(vc, dict) and "name" in vc]
-            levels = None
-            try:
-                if any(vc.get("level") in ("all", None) and vc.get("name") in ("t","u","v","q","z") for vc in variables_to_score if isinstance(vc, dict)):
-                    levels = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
-            except Exception:
-                levels = None
-            ok_min, min_details, preopened_ds = await verify_minimal_chunks_and_reconstruct_manifest_hash(
-                zarr_store_url=zarr_store_url,
-                claimed_manifest_content_hash=claimed_manifest_content_hash,
-                miner_hotkey_ss58=miner_hotkey,
-                variables=variables,
-                times=[pd.Timestamp(t) for t in times_to_evaluate],
-                levels=levels,
-                headers=storage_options.get("headers"),
-                num_samples=int(task_instance.config.get("day1_minimal_verify_samples", 0)),
-                job_id=f"{job_id}_day1_minrehash",
-                frozen_manifest=frozen_manifest_json,
-            )
-            # The minimal verification now returns None for the dataset to prevent caching
-            # Always open a fresh dataset for scoring
-            if not ok_min:
-                logger.warning(
-                    f"[Day1Score] Minimal verify failed or preopen None (error={min_details.get('error') if isinstance(min_details, dict) else 'unknown'}). "
-                    f"Attempting strict verified open without minimal subset."
-                )
-
-        if miner_forecast_ds is None:
-            try:
-                result_ds = await asyncio.wait_for(
-                    open_verified_remote_zarr_dataset(
-                        zarr_store_url=zarr_store_url,
-                        claimed_manifest_content_hash=claimed_manifest_content_hash,
-                        miner_hotkey_ss58=miner_hotkey,
-                        storage_options=storage_options,
-                        job_id=f"{job_id}_day1_score",
-                        frozen_manifest=frozen_manifest_json,
-                        return_manifest=True,
-                    ),
-                    timeout=verification_timeout_seconds,
-                )
-                if isinstance(result_ds, tuple):
-                    miner_forecast_ds, _manifest_used = result_ds
-                else:
-                    miner_forecast_ds = result_ds
-            except Exception as open_err:
-                logger.error(
-                    f"[Day1Score] Exception during verified open for {miner_hotkey} at {zarr_store_url}: {open_err}",
-                    exc_info=True,
-                )
-                miner_forecast_ds = None
+            miner_forecast_ds = None
 
         if miner_forecast_ds is None:
             logger.error(
@@ -353,13 +313,8 @@ async def evaluate_miner_forecast_day1(
                 f"  URL: {zarr_store_url}\n  ClaimedHash: {claimed_manifest_content_hash}"
             )
             try:
-                # If minimal verification was attempted, log its details and traceback
-                if 'min_details' in locals() and min_details is not None:
-                    logger.error(f"[Day1Score] Minimal verification details: {json.dumps(min_details, default=str)[:2000]}")
-                    if isinstance(min_details, dict) and min_details.get('open_exception'):
-                        logger.error("[Day1Score] Minimal verification subset open traceback follows:\n" + str(min_details.get('open_exception')))
-                # Also log the last manifest verification log for more context
-                last_log = get_last_manifest_log(f"{job_id}_day1_minrehash") or get_last_manifest_log(f"{job_id}_day1_score")
+                # Log the last manifest verification log for context
+                last_log = get_last_manifest_log(f"{job_id}_day1_score")
                 if last_log:
                     logger.error(f"[Day1Score] Last manifest verify log: {json.dumps(last_log, default=str)[:2000]}")
                 # Capture last verified open error

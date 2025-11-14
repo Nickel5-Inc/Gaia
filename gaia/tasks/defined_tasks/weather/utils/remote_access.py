@@ -64,7 +64,27 @@ except ImportError:
 
 logger = get_logger(__name__)
 
- 
+_verifying_mapper_registry: Dict[str, Any] = {}
+
+def register_verifying_mapper(job_id: str, mapper: Any) -> None:
+    try:
+        if job_id:
+            _verifying_mapper_registry[job_id] = mapper
+    except Exception:
+        pass
+
+def get_registered_verifying_mapper(job_id: str) -> Optional[Any]:
+    try:
+        return _verifying_mapper_registry.get(job_id)
+    except Exception:
+        return None
+
+def deregister_verifying_mapper(job_id: str) -> None:
+    try:
+        if job_id in _verifying_mapper_registry:
+            _verifying_mapper_registry.pop(job_id, None)
+    except Exception:
+        pass
 
 
 def _synchronous_open_with_verifying_mapper(
@@ -240,7 +260,6 @@ async def open_verified_remote_zarr_variable(
         
         # CRITICAL: Disable all caching to ensure every read goes through VerifyingChunkMapper
         http_fs_kwargs["cache_type"] = "none"  # Disable fsspec caching
-        http_fs_kwargs["cache"] = None  # Explicitly disable cache
         
         fs = fsspec.filesystem(protocol, **http_fs_kwargs)
         verifying_mapper = VerifyingChunkMapper(
@@ -250,6 +269,22 @@ async def open_verified_remote_zarr_variable(
             job_id_for_logging=job_id,
             strict_metadata=True,
         )
+        # Register this mapper for later retrieval by job_id
+        try:
+            register_verifying_mapper(job_id, verifying_mapper)
+        except Exception:
+            pass
+        
+        # Pre-read metadata to ensure verification pathway is active
+        logger.debug(f"Job {job_id}: Pre-reading metadata through VerifyingChunkMapper...")
+        try:
+            for key in ['.zattrs', '.zgroup']:
+                try:
+                    _ = verifying_mapper[key]
+                except (KeyError, FileNotFoundError):
+                    pass
+        except Exception:
+            pass
 
         is_consolidated = ".zmetadata" in trusted_manifest.get("files", {})
         
@@ -319,6 +354,11 @@ async def open_verified_remote_zarr_variable(
             ds.attrs["verifying_job_id"] = job_id
             ds.attrs["claimed_manifest_content_hash"] = claimed_manifest_content_hash
             ds.attrs["trusted_manifest_files_count"] = len(trusted_manifest.get("files", {}))
+            # Attach verifying mapper for downstream on-demand pure-HTTP verified reads
+            try:
+                setattr(ds, "_verifying_store", verifying_mapper)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -401,7 +441,6 @@ async def open_verified_remote_zarr_dataset(
         
         # CRITICAL: Disable all caching to ensure every read goes through VerifyingChunkMapper
         http_fs_kwargs["cache_type"] = "none"  # Disable fsspec caching
-        http_fs_kwargs["cache"] = None  # Explicitly disable cache
 
         fs = fsspec.filesystem(protocol, **http_fs_kwargs)
 
@@ -415,6 +454,62 @@ async def open_verified_remote_zarr_dataset(
         logger.info(
             f"Job {job_id}: VerifyingChunkMapper created for {zarr_store_url_cleaned}."
         )
+        # Register this mapper so downstream logic can retrieve it even if xarray drops attributes
+        try:
+            register_verifying_mapper(job_id, verifying_mapper)
+        except Exception:
+            pass
+
+        # CRITICAL: Pre-read essential metadata AND time coordinate through our mapper
+        # This ensures verification happens for critical chunks BEFORE xarray can bypass us
+        # The reads are cached in the mapper, avoiding duplicate HTTP requests
+        logger.info(f"Job {job_id}: Pre-reading critical chunks through VerifyingChunkMapper...")
+        try:
+            # Read metadata files first
+            essential_metadata = ['.zattrs', '.zgroup', '.zmetadata']
+            for key in essential_metadata:
+                try:
+                    _ = verifying_mapper[key]
+                    logger.info(f"Job {job_id}: Pre-read metadata through mapper: {key}")
+                except (KeyError, FileNotFoundError):
+                    pass  # Not all metadata files exist
+            
+            # IMPORTANT: Pre-read time coordinate metadata - but only for coordinates that exist in manifest
+            # Check manifest to determine which time coordinate name is actually used
+            manifest_files = trusted_manifest.get("files", {})
+            time_coord_names = []
+            
+            # Check which time coordinate exists by looking for .zarray files in manifest
+            for possible_name in ['time', 'valid_time', 'forecast_time']:
+                if f"{possible_name}/.zarray" in manifest_files:
+                    time_coord_names.append(possible_name)
+                    break  # Use first match
+            
+            # If no match found, default to 'time' (most common)
+            if not time_coord_names:
+                time_coord_names = ['time']
+            
+            # Pre-read metadata for the actual time coordinate that exists
+            for coord_name in time_coord_names:
+                time_metadata = [f'{coord_name}/.zarray', f'{coord_name}/.zattrs']
+                for key in time_metadata:
+                    try:
+                        _ = verifying_mapper[key]
+                        logger.info(f"Job {job_id}: Pre-read time metadata through mapper: {key}")
+                    except (KeyError, FileNotFoundError):
+                        pass  # Not all metadata files exist
+            
+            # Read the first time chunk for the coordinate that exists
+            for coord_name in time_coord_names:
+                try:
+                    chunk_data = verifying_mapper[f"{coord_name}/0"]
+                    logger.info(f"Job {job_id}: ✅ Pre-verified time chunk through mapper: {coord_name}/0 ({len(chunk_data)} bytes)")
+                    break  # Only read one time coordinate
+                except (KeyError, FileNotFoundError):
+                    pass  # Chunk might not exist
+                    
+        except Exception as e:
+            logger.warning(f"Job {job_id}: Pre-read warning (non-fatal): {e}")
 
         # Detect consolidated heuristically: prefer presence of .zmetadata on server if available in listing,
         # but don't rely solely on manifest contents since many manifests exclude metadata files.
@@ -473,6 +568,11 @@ async def open_verified_remote_zarr_dataset(
                 dataset.attrs["verifying_job_id"] = job_id
                 dataset.attrs["claimed_manifest_content_hash"] = claimed_manifest_content_hash
                 dataset.attrs["trusted_manifest_files_count"] = len(trusted_manifest.get("files", {}))
+                # Attach verifying mapper for downstream on-demand pure-HTTP verified reads
+                try:
+                    setattr(dataset, "_verifying_store", verifying_mapper)
+                except Exception:
+                    pass
             except Exception:
                 pass
             if return_manifest:

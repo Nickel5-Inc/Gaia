@@ -115,6 +115,13 @@ async def commit_weights_if_eligible(validator) -> bool:
         except Exception:
             pass
         
+        # Apply burn if enabled via environment
+        try:
+            from gaia.validator.weights.burn import apply_burn_from_env
+            weights = apply_burn_from_env(weights, validator.substrate, netuid)
+        except Exception as burn_err:
+            logger.warning(f"[WeightEligibility] Burn application failed/disabled: {burn_err}")
+        
         logger.info(f"[WeightEligibility] Creating FiberWeightSetter for netuid {netuid}")
         setter = FiberWeightSetter(
             netuid=netuid,

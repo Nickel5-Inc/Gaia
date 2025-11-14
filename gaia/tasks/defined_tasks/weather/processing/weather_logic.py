@@ -836,8 +836,10 @@ async def _request_fresh_token(
 
         # If no response, bail
         if not response_dict or not response_dict.get("success"):
+            err_detail = response_dict.get("error") if response_dict else "no response"
             logger.warning(
-                f"[VerifyLogic] No response received from miner {miner_hotkey[:12]} for job {job_id}"
+                f"[VerifyLogic] Token request failed for miner {miner_hotkey[:12]} job {job_id} "
+                f"endpoint={endpoint_to_call} error={err_detail}"
             )
             return None
         if response_dict.get("success"):
@@ -1890,75 +1892,13 @@ async def calculate_era5_miner_score(
             task_instance.config.get("verification_timeout_seconds", 300) / 2
         )
 
-        # RIGOR: Full rehash verification of remote store before any reads
-        from ..utils.hashing import recompute_remote_manifest_content_hash
-        from ..utils.hashing import verify_minimal_chunks_and_reconstruct_manifest_hash
-        # Optionally run minimal verification for final scoring to pre-detect swaps
-        # Default is disabled (0) to minimize data transfer; rely on verifying mapper during scoring reads
-        n_min_samples = int(task_instance.config.get("era5_minimal_verify_samples", 0))
-        preopened_ds = None
-        if n_min_samples > 0:
-            # Efficient path: verify only needed chunks for this scoring window (variables/times/levels)
-            variables = [vc["name"] for vc in variables_to_score if isinstance(vc, dict) and "name" in vc]
-            # Build the times to score for this call
-            times_to_score = [pd.Timestamp(dt) for dt in target_datetimes]
-            # Levels: if any variable has 'level' == 'all', pass the standard 13 plevs; else None
-            levels = None
-            try:
-                if any(vc.get("level") in ("all", None) and vc.get("name") in ("t","u","v","q","z") for vc in variables_to_score if isinstance(vc, dict)):
-                    levels = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
-            except Exception:
-                levels = None
-            ok_rehash, rehash_details, preopened_ds = await verify_minimal_chunks_and_reconstruct_manifest_hash(
-                zarr_store_url=current_zarr_store_url,
-                claimed_manifest_content_hash=stored_manifest_hash,
-                miner_hotkey_ss58=miner_hotkey,
-                variables=variables,
-                times=times_to_score,
-                levels=levels,
-                headers=storage_options.get("headers"),
-                num_samples=n_min_samples,
-                job_id=f"{job_id}_final_score_minrehash",
-                frozen_manifest=stored_frozen_manifest,
-            )
-            if not ok_rehash:
-                logger.error(
-                    f"[FinalScore] Miner {miner_hotkey}: Full rehash verification failed: {rehash_details}"
-                )
-                await task_instance.db_manager.execute(
-                    """
-                    UPDATE weather_miner_responses 
-                    SET status = 'verification_failed', error_message = 'Full rehash verification failed before scoring'
-                    WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey
-                    """,
-                    {"run_id": run_id, "miner_hotkey": miner_hotkey},
-                )
-                await _check_run_completion(task_instance, run_id)
-                return False
-
-        # Reuse verified open dataset if provided by minimal verifier; otherwise open once here
+        # Get requested variables for dataset opening
         requested_variables = sorted({vc["name"] for vc in variables_to_score if isinstance(vc, dict) and vc.get("name")})
         if not requested_variables:
             requested_variables = sorted(list({vc for vc in variables_to_score if isinstance(vc, str)}))
-
-        # CRITICAL: DO NOT reuse preopened_ds from minimal verification!
-        # We need fresh verification for EVERY chunk read during ERA5 scoring.
-        # The preopened dataset has cached values that won't be re-verified.
-        
-        # The minimal verification now returns None for the dataset to prevent caching
-        # We always need to open a fresh dataset for ERA5 scoring
-        if 'preopened_ds' in locals():
-            if preopened_ds is not None:
-                logger.warning(f"[FinalScore] Unexpected: preopened_ds should be None after minimal verification")
-                try:
-                    preopened_ds.close()
-                except Exception:
-                    pass
-            preopened_ds = None
         
         # Clear any xarray/dask caches
         try:
-            import gc
             gc.collect()
             logger.info(f"[FinalScore] Cleared memory caches before opening fresh dataset")
         except Exception:
@@ -1986,6 +1926,37 @@ async def calculate_era5_miner_score(
             else:
                 miner_forecast_ds = result_dataset
                 _manifest_used = None
+
+            # CRITICAL: Extract _verifying_store BEFORE any dataset modifications
+            # (rename/drop_vars create new Dataset objects that lose this attribute)
+            verifying_store_from_open = None
+            try:
+                if hasattr(miner_forecast_ds, '_verifying_store'):
+                    verifying_store_from_open = miner_forecast_ds._verifying_store
+                    logger.info(f"[FinalScore] ✅ Extracted _verifying_store from opened dataset: {type(verifying_store_from_open)}")
+                else:
+                    logger.warning(f"[FinalScore] ⚠️ No _verifying_store found on opened dataset")
+                    # Fallback: try the registry via verifying_job_id or known job_id
+                    try:
+                        from ..utils.remote_access import get_registered_verifying_mapper
+                        reg_key = None
+                        try:
+                            reg_key = getattr(miner_forecast_ds, "attrs", {}).get("verifying_job_id")
+                        except Exception:
+                            reg_key = None
+                        if not reg_key:
+                            # Use the exact job_id used in open call
+                            reg_key = f"{job_id}_final_score_reverify"
+                        vm = get_registered_verifying_mapper(reg_key) if reg_key else None
+                        if vm is not None:
+                            verifying_store_from_open = vm
+                            logger.info(f"[FinalScore] ✅ Retrieved VerifyingChunkMapper from registry using key '{reg_key}'")
+                        else:
+                            logger.warning(f"[FinalScore] ⚠️ No VerifyingChunkMapper found in registry for key '{reg_key}'")
+                    except Exception as _reg_err:
+                        logger.debug(f"[FinalScore] Registry fallback failed: {_reg_err}")
+            except Exception as e:
+                logger.warning(f"[FinalScore] ⚠️ Error extracting _verifying_store: {e}")
 
             # Explicit assertion: ensure verified-open path was used and a frozen manifest is bound
             try:
@@ -2106,6 +2077,14 @@ async def calculate_era5_miner_score(
         else:
             logger.info(f"[FinalScore] Miner data already has mapped variable names, no mapping needed")  # Skip this miner gracefully
 
+        # CRITICAL: Re-attach _verifying_store after any dataset modifications
+        if verifying_store_from_open is not None:
+            try:
+                setattr(miner_forecast_ds, '_verifying_store', verifying_store_from_open)
+                logger.info(f"[FinalScore] ✅ Re-attached _verifying_store to dataset after modifications")
+            except Exception as e:
+                logger.warning(f"[FinalScore] ⚠️ Failed to re-attach _verifying_store: {e}")
+
         # Final scoring uses ERA5-based skill scores only (no GFS operational forecast)
         # GFS data is typically unavailable by the time final scoring runs due to retention limits
         gfs_operational_fcst_ds = None
@@ -2113,9 +2092,11 @@ async def calculate_era5_miner_score(
             f"[FinalScore] Miner {miner_hotkey}: Using ERA5-climatology skill scores (GFS operational not used for final scoring)"
         )
 
-        # PRE-LOAD STRATEGY: Download all required data chunks ONCE before processing
-        # This prevents duplicate HTTP requests when processing multiple variables
-        logger.info(f"[FinalScore] Miner {miner_hotkey}: Skipping dataset-wide preloading; relying on on-demand verified reads per variable/time.")
+        # CRITICAL: The VerifyingChunkMapper was used to open this dataset
+        # - Time coordinate chunks were pre-verified through the mapper BEFORE xarray opened the dataset
+        # - All subsequent reads will go through our mapper: HTTP read -> verify hash -> cache -> return
+        # - No duplicate HTTP requests because verified chunks are cached in the mapper
+        logger.info(f"[FinalScore] Miner {miner_hotkey}: Dataset opened with VerifyingChunkMapper for on-demand chunk verification.")
 
         # Resolve time coordinate names for miner and ERA5 datasets
         def _resolve_time_coord_name(ds: xr.Dataset) -> Optional[str]:
@@ -2212,29 +2193,6 @@ async def calculate_era5_miner_score(
                     f"[FinalScore info] Using selection_label_era5: {selection_label_era5} (type: {type(selection_label_era5)}) for era5_truth_ds"
                 )
 
-                # Remove duplicate time indices before selection to prevent reindexing errors
-                if len(miner_forecast_ds[miner_time_name]) > len(
-                    np.unique(miner_forecast_ds[miner_time_name].values)
-                ):
-                    logger.debug(
-                        f"[FinalScore] Removing duplicate time indices from miner forecast data"
-                    )
-                    _, unique_indices = np.unique(
-                        miner_forecast_ds[miner_time_name].values, return_index=True
-                    )
-                    miner_forecast_ds = miner_forecast_ds.isel(
-                        **{miner_time_name: sorted(unique_indices)}
-                    )
-
-                if len(era5_truth_ds[era5_time_name]) > len(np.unique(era5_truth_ds[era5_time_name].values)):
-                    logger.debug(
-                        f"[FinalScore] Removing duplicate time indices from ERA5 data"
-                    )
-                    _, unique_indices = np.unique(
-                        era5_truth_ds[era5_time_name].values, return_index=True
-                    )
-                    era5_truth_ds = era5_truth_ds.isel(**{era5_time_name: sorted(unique_indices)})
-
                 # CRITICAL: Use .isel() instead of .sel() to avoid reading coordinate chunks
                 # Pre-compute time indices to minimize chunk reads
                 # First, read only the time coordinate array (small, one chunk) to find the index
@@ -2257,7 +2215,13 @@ async def calculate_era5_miner_score(
                     era5_time_coord_values = era5_time_coord_da.values
                 
                 # Find nearest index without reading all data chunks
-                if _is_datetime_dtype(type(miner_time_coord_values[0])):
+                # Check dtype of the array, not the type of first element
+                miner_is_datetime = (
+                    pd.api.types.is_datetime64_any_dtype(miner_time_coord_values)
+                    or (hasattr(miner_time_coord_values, 'dtype') and 'datetime64' in str(miner_time_coord_values.dtype))
+                )
+                
+                if miner_is_datetime:
                     miner_time_coord_dt = pd.to_datetime(miner_time_coord_values)
                     if miner_time_coord_dt.tz is None:
                         miner_time_coord_dt = miner_time_coord_dt.tz_localize("UTC")
@@ -2273,7 +2237,13 @@ async def calculate_era5_miner_score(
                         target_ns = int(selection_label_miner)
                     miner_time_idx = int(np.argmin(np.abs(miner_time_coord_values - target_ns)))
                 
-                if _is_datetime_dtype(type(era5_time_coord_values[0])):
+                # Check dtype of the array, not the type of first element
+                era5_is_datetime = (
+                    pd.api.types.is_datetime64_any_dtype(era5_time_coord_values)
+                    or (hasattr(era5_time_coord_values, 'dtype') and 'datetime64' in str(era5_time_coord_values.dtype))
+                )
+                
+                if era5_is_datetime:
                     era5_time_coord_dt = pd.to_datetime(era5_time_coord_values)
                     if era5_time_coord_dt.tz is None:
                         era5_time_coord_dt = era5_time_coord_dt.tz_localize("UTC")
@@ -2378,20 +2348,6 @@ async def calculate_era5_miner_score(
             gfs_op_lead_slice = None
             if gfs_operational_fcst_ds is not None:
                 try:
-                    # Remove duplicate time indices from GFS operational data if needed
-                    if len(gfs_operational_fcst_ds.time) > len(
-                        np.unique(gfs_operational_fcst_ds.time.values)
-                    ):
-                        logger.debug(
-                            f"[FinalScore] Removing duplicate time indices from GFS operational data"
-                        )
-                        _, unique_indices = np.unique(
-                            gfs_operational_fcst_ds.time.values, return_index=True
-                        )
-                        gfs_operational_fcst_ds = gfs_operational_fcst_ds.isel(
-                            time=sorted(unique_indices)
-                        )
-
                     selection_label_gfs_op = valid_time_dt
                     if np.issubdtype(gfs_operational_fcst_ds.time.dtype, np.integer):
                         selection_label_gfs_op = int(
@@ -2606,6 +2562,53 @@ async def calculate_era5_miner_score(
                                 return data_array.rename(rename_map)
                         return data_array
 
+                    # DIAGNOSTIC: Check if VerifyingChunkMapper is available for this dataset
+                    logger.info(f"[FinalScore] 🔍 DIAGNOSTIC: Checking for VerifyingChunkMapper for {miner_var_name} at {valid_time_dt}")
+                    verifying_store = None
+                    try:
+                        # Try to get _verifying_store from the dataset (attached during open)
+                        if hasattr(miner_forecast_ds, '_verifying_store'):
+                            verifying_store = miner_forecast_ds._verifying_store
+                            logger.info(f"[FinalScore] ✅ Found _verifying_store attribute on dataset: {type(verifying_store)}")
+                        elif hasattr(miner_forecast_lead_slice, '_verifying_store'):
+                            verifying_store = miner_forecast_lead_slice._verifying_store
+                            logger.info(f"[FinalScore] ✅ Found _verifying_store attribute on lead slice: {type(verifying_store)}")
+                        else:
+                            logger.warning(f"[FinalScore] ⚠️ No _verifying_store attribute found on dataset or lead slice")
+                            # Fallback 1: Use verifying_store_from_open if available (extracted before dataset modifications)
+                            # This variable is in the outer function scope, accessible via closure
+                            try:
+                                # Check if verifying_store_from_open exists in outer scope (it's defined before the loop)
+                                if verifying_store_from_open is not None:
+                                    verifying_store = verifying_store_from_open
+                                    logger.info(f"[FinalScore] ✅ Using verifying_store_from_open (extracted before modifications): {type(verifying_store)}")
+                            except NameError:
+                                # Variable doesn't exist in scope (shouldn't happen, but handle gracefully)
+                                pass
+                            except Exception as e:
+                                logger.debug(f"[FinalScore] Error accessing verifying_store_from_open: {e}")
+                            
+                            # Fallback 2: try to access via _file_obj.store
+                            if verifying_store is None and hasattr(miner_forecast_ds, '_file_obj') and hasattr(miner_forecast_ds._file_obj, 'store'):
+                                fallback_store = miner_forecast_ds._file_obj.store
+                                logger.info(f"[FinalScore] 🔄 Fallback: Found store via _file_obj: {type(fallback_store)}")
+                                from ..utils.hashing import VerifyingChunkMapper
+                                if isinstance(fallback_store, VerifyingChunkMapper):
+                                    verifying_store = fallback_store
+                                    logger.info(f"[FinalScore] ✅ Fallback store IS VerifyingChunkMapper")
+                                else:
+                                    logger.warning(f"[FinalScore] ⚠️ Fallback store is NOT VerifyingChunkMapper: {type(fallback_store)}")
+                            elif verifying_store is None:
+                                logger.warning(f"[FinalScore] ⚠️ No _file_obj.store found either")
+                        
+                        from ..utils.hashing import VerifyingChunkMapper
+                        if verifying_store is not None and isinstance(verifying_store, VerifyingChunkMapper):
+                            logger.info(f"[FinalScore] ✅ VerifyingChunkMapper confirmed: job_id={verifying_store.job_id_for_logging}, files_in_manifest={len(verifying_store.trusted_manifest_files)}")
+                        else:
+                            logger.error(f"[FinalScore] ❌ CRITICAL: VerifyingChunkMapper NOT available! Store type: {type(verifying_store) if verifying_store else 'None'}")
+                    except Exception as diag_err:
+                        logger.error(f"[FinalScore] ❌ Error during diagnostic check: {diag_err}", exc_info=True)
+
                     miner_var_da_unaligned = standardize_pressure_dims(miner_forecast_lead_slice[miner_var_name])
                     truth_var_da_unaligned = standardize_pressure_dims(era5_truth_lead_slice[era5_var_name])
 
@@ -2614,7 +2617,23 @@ async def calculate_era5_miner_score(
                     logger.info(f"  Config variable: '{var_name}'")
                     logger.info(f"  Selected miner variable: '{miner_var_name}'")
                     logger.info(f"  Selected ERA5 variable: '{era5_var_name}'")
-                    
+                    # Fallback 3: Registry by verifying_job_id or job_id
+                    if verifying_store is None:
+                        try:
+                            from ..utils.remote_access import get_registered_verifying_mapper
+                            reg_key = None
+                            try:
+                                reg_key = getattr(miner_forecast_ds, "attrs", {}).get("verifying_job_id")
+                            except Exception:
+                                reg_key = None
+                            if not reg_key:
+                                reg_key = f"{job_id}_final_score_reverify"
+                            vm2 = get_registered_verifying_mapper(reg_key) if reg_key else None
+                            if vm2 is not None:
+                                verifying_store = vm2
+                                logger.info(f"[FinalScore] ✅ Registry fallback: obtained VerifyingChunkMapper using key '{reg_key}'")
+                        except Exception as _reg2_err:
+                            logger.debug(f"[FinalScore] Registry fallback error: {_reg2_err}")
                     # Check ERA5 variable attributes for identity verification
                     era5_var = era5_truth_lead_slice[era5_var_name]
                     logger.info(f"  ERA5 variable attributes: {dict(era5_var.attrs)}")
@@ -2955,29 +2974,259 @@ async def calculate_era5_miner_score(
                     except Exception:
                         min_cov = 0.999
                     try:
-                        # CRITICAL: Force chunk reads to trigger verification
-                        logger.info(f"[FinalScore] Forcing chunk read for miner data: {var_key} at {valid_time_dt}")
+                        # CRITICAL: Force chunk reads through VerifyingChunkMapper BEFORE dask computation
+                        # This ensures pure HTTP reads with verification for the exact chunks needed for this time slice
+                        logger.info(f"[FinalScore] 🔍 DIAGNOSTIC: Starting chunk verification for {var_key} at {valid_time_dt}")
+                        
+                        if verifying_store is not None and isinstance(verifying_store, VerifyingChunkMapper):
+                            logger.info(f"[FinalScore] ✅ VerifyingChunkMapper available - computing chunk keys for time slice...")
+                            
+                            try:
+                                import itertools as _it
+                                import json
+                                
+                                # Get variable metadata to determine chunking
+                                var_zarray_key = f"{miner_var_name}/.zarray"
+                                var_zattrs_key = f"{miner_var_name}/.zattrs"
+                                
+                                logger.info(f"[FinalScore] 📋 Reading metadata: {var_zarray_key}, {var_zattrs_key}")
+                                
+                                # Read .zarray to get chunking info
+                                zarray_content = None
+                                if var_zarray_key in verifying_store.trusted_manifest_files:
+                                    try:
+                                        zarray_bytes = verifying_store[var_zarray_key]
+                                        zarray_content = json.loads(zarray_bytes.decode('utf-8'))
+                                        logger.info(f"[FinalScore] ✅ Read .zarray: chunks={zarray_content.get('chunks')}, shape={zarray_content.get('shape')}, dims={zarray_content.get('_ARRAY_DIMENSIONS')}")
+                                    except Exception as zarr_err:
+                                        logger.warning(f"[FinalScore] ⚠️ Failed to read .zarray: {zarr_err}")
+                                else:
+                                    logger.warning(f"[FinalScore] ⚠️ {var_zarray_key} not in manifest")
+                                
+                                # Determine chunk keys for this time slice
+                                chunk_keys_to_verify = []
+                                
+                                if zarray_content:
+                                    chunks = zarray_content.get('chunks')
+                                    shape = zarray_content.get('shape')
+                                    dims_in_store = zarray_content.get('_ARRAY_DIMENSIONS', [])
+                                    
+                                    if chunks and shape and dims_in_store and len(chunks) == len(shape) == len(dims_in_store):
+                                        logger.info(f"[FinalScore] 📊 Chunking info: chunks={chunks}, shape={shape}, dims={dims_in_store}")
+                                        
+                                        # Find time dimension index
+                                        time_dim_idx = -1
+                                        for i, dim in enumerate(dims_in_store):
+                                            if dim in ['time', 'valid_time', 'forecast_time']:
+                                                time_dim_idx = i
+                                                break
+                                        
+                                        if time_dim_idx != -1:
+                                            logger.info(f"[FinalScore] ✅ Found time dimension at index {time_dim_idx}: {dims_in_store[time_dim_idx]}")
+                                            
+                                            # Compute which chunk(s) contain this time index
+                                            time_chunk_size = chunks[time_dim_idx]
+                                            time_chunk_idx = miner_time_idx // time_chunk_size
+                                            
+                                            logger.info(f"[FinalScore] 📍 Time index {miner_time_idx} -> time chunk index {time_chunk_idx} (chunk size: {time_chunk_size})")
+                                            
+                                            # Build chunk key ranges for all dimensions
+                                            idxs_ranges = []
+                                            for dim_idx, (dim_name, dim_size, chunk_size) in enumerate(zip(dims_in_store, shape, chunks)):
+                                                if dim_idx == time_dim_idx:
+                                                    # For time dimension, only include the chunk(s) we need
+                                                    # Include neighbor chunks to be safe
+                                                    chunk_indices = set([time_chunk_idx])
+                                                    if time_chunk_idx > 0:
+                                                        chunk_indices.add(time_chunk_idx - 1)
+                                                    if time_chunk_idx < (dim_size // chunk_size):
+                                                        chunk_indices.add(time_chunk_idx + 1)
+                                                    idxs_ranges.append(sorted(chunk_indices))
+                                                    logger.info(f"[FinalScore]   Time dim {dim_name}: chunk indices {sorted(chunk_indices)}")
+                                                else:
+                                                    # For other dimensions, include all chunks (or a reasonable subset)
+                                                    num_chunks = (dim_size + chunk_size - 1) // chunk_size
+                                                    idxs_ranges.append(list(range(num_chunks)))
+                                                    logger.info(f"[FinalScore]   Dim {dim_name}: all {num_chunks} chunks")
+                                            
+                                            # Generate all chunk keys for this time slice
+                                            for idxs in _it.product(*idxs_ranges):
+                                                chunk_key = f"{miner_var_name}/" + ".".join(str(int(i)) for i in idxs)
+                                                # Only add if it exists in manifest
+                                                if chunk_key in verifying_store.trusted_manifest_files:
+                                                    chunk_keys_to_verify.append(chunk_key)
+                                            
+                                            logger.info(f"[FinalScore] 📦 Generated {len(chunk_keys_to_verify)} chunk keys for time slice")
+                                            if len(chunk_keys_to_verify) <= 20:
+                                                logger.info(f"[FinalScore]   Chunk keys: {chunk_keys_to_verify}")
+                                            else:
+                                                logger.info(f"[FinalScore]   First 10 chunk keys: {chunk_keys_to_verify[:10]}...")
+                                        
+                                        else:
+                                            logger.warning(f"[FinalScore] ⚠️ Could not find time dimension in {dims_in_store}")
+                                    else:
+                                        logger.warning(f"[FinalScore] ⚠️ Incomplete zarr metadata: chunks={chunks}, shape={shape}, dims={dims_in_store}")
+                                
+                                # Fallback: derive chunk keys from manifest if zarray metadata is missing
+                                if not chunk_keys_to_verify:
+                                    logger.info(f"[FinalScore] 🔄 Fallback: Deriving chunk keys from manifest only...")
+                                    manifest_files = stored_frozen_manifest.get("files", {}) if stored_frozen_manifest else {}
+                                    var_chunks_all = [k for k in manifest_files.keys() if k.startswith(f"{miner_var_name}/") and not k.endswith((".zarray", ".zattrs"))]
+                                    
+                                    logger.info(f"[FinalScore] 📋 Found {len(var_chunks_all)} total chunks for {miner_var_name} in manifest")
+                                    
+                                    if var_chunks_all:
+                                        # Infer time chunk indices from first component
+                                        time_chunk_ids = []
+                                        for ck in var_chunks_all:
+                                            try:
+                                                parts = ck.split("/")[1].split(".")
+                                                if parts[0].isdigit():
+                                                    time_chunk_ids.append(int(parts[0]))
+                                            except Exception:
+                                                continue
+                                        
+                                        if time_chunk_ids:
+                                            unique_tids = sorted(set(time_chunk_ids))
+                                            logger.info(f"[FinalScore] 📊 Inferred time chunk IDs from manifest: {unique_tids[:10]}... (total: {len(unique_tids)})")
+                                            
+                                            # Approximate which time chunk contains miner_time_idx
+                                            try:
+                                                tlen = int(miner_forecast_ds[miner_var_name].sizes.get("time", 0))
+                                            except Exception:
+                                                tlen = 0
+                                            
+                                            if tlen > 0 and len(unique_tids) > 0:
+                                                approx_c = max(1, (tlen + len(unique_tids) - 1) // len(unique_tids))
+                                                approx_tchunk = min(unique_tids[-1], max(unique_tids[0], miner_time_idx // approx_c))
+                                                
+                                                logger.info(f"[FinalScore] 📍 Approximated time chunk: {approx_tchunk} (time_idx={miner_time_idx}, tlen={tlen}, approx_chunk_size={approx_c})")
+                                                
+                                                # Include neighbor chunks
+                                                cand_tids = set([approx_tchunk])
+                                                if (approx_tchunk - 1) in unique_tids:
+                                                    cand_tids.add(approx_tchunk - 1)
+                                                if (approx_tchunk + 1) in unique_tids:
+                                                    cand_tids.add(approx_tchunk + 1)
+                                                
+                                                logger.info(f"[FinalScore] 🎯 Verifying chunks for time chunk IDs: {sorted(cand_tids)}")
+                                                
+                                                # Filter chunk keys
+                                                for ck in var_chunks_all:
+                                                    try:
+                                                        first_part = ck.split("/")[1].split(".")[0]
+                                                        if first_part.isdigit() and int(first_part) in cand_tids:
+                                                            chunk_keys_to_verify.append(ck)
+                                                    except Exception:
+                                                        continue
+                                                
+                                                logger.info(f"[FinalScore] 📦 Selected {len(chunk_keys_to_verify)} chunk keys from manifest")
+                                                if len(chunk_keys_to_verify) <= 20:
+                                                    logger.info(f"[FinalScore]   Chunk keys: {chunk_keys_to_verify}")
+                                                else:
+                                                    logger.info(f"[FinalScore]   First 10 chunk keys: {chunk_keys_to_verify[:10]}...")
+                                            else:
+                                                logger.warning(f"[FinalScore] ⚠️ Cannot approximate time chunk: tlen={tlen}, unique_tids={len(unique_tids)}")
+                                        else:
+                                            logger.warning(f"[FinalScore] ⚠️ Could not infer time chunk IDs from manifest keys")
+                                    else:
+                                        logger.warning(f"[FinalScore] ⚠️ No chunks found in manifest for {miner_var_name}")
+                                
+                                # Batch verify chunks using getitems()
+                                if chunk_keys_to_verify:
+                                    logger.info(f"[FinalScore] 🔐 VERIFYING {len(chunk_keys_to_verify)} chunks via VerifyingChunkMapper.getitems()...")
+                                    
+                                    # Use batches of 128 to avoid huge requests
+                                    batch_size = 128
+                                    verified_count = 0
+                                    failed_count = 0
+                                    
+                                    for batch_start in range(0, len(chunk_keys_to_verify), batch_size):
+                                        batch = chunk_keys_to_verify[batch_start:batch_start + batch_size]
+                                        batch_num = (batch_start // batch_size) + 1
+                                        total_batches = (len(chunk_keys_to_verify) + batch_size - 1) // batch_size
+                                        
+                                        logger.info(f"[FinalScore] 📦 Batch {batch_num}/{total_batches}: Verifying {len(batch)} chunks...")
+                                        if len(batch) <= 10:
+                                            logger.info(f"[FinalScore]   Batch chunk keys: {batch}")
+                                        
+                                        try:
+                                            # This will trigger [ChunkBatchRead] and per-chunk verification logs
+                                            items = verifying_store.getitems(batch)
+                                            verified_count += len(items)
+                                            logger.info(f"[FinalScore] ✅ Batch {batch_num}: Verified {len(items)}/{len(batch)} chunks")
+                                        except Exception as batch_err:
+                                            failed_count += len(batch)
+                                            logger.error(f"[FinalScore] ❌ Batch {batch_num}: Failed to verify chunks: {batch_err}")
+                                    
+                                    logger.info(f"[FinalScore] ✅✅✅ CHUNK VERIFICATION COMPLETE: {verified_count} verified, {failed_count} failed out of {len(chunk_keys_to_verify)} total")
+                                    
+                                    if failed_count > 0:
+                                        logger.error(f"[FinalScore] ❌ CRITICAL: {failed_count} chunks failed verification!")
+                                        # Immediate hard-fail: purge any ERA5 scores for this response and mark verification_failed
+                                        try:
+                                            # Remove any previously written ERA5 metrics for this response (safety)
+                                            await task_instance.db_manager.execute(
+                                                "DELETE FROM weather_miner_scores WHERE response_id = :rid AND score_type LIKE 'era5%'",  # remove partial/previous ERA5 metrics
+                                                {"rid": response_id},
+                                            )
+                                        except Exception as _purge1_err:
+                                            logger.debug(f"[FinalScore] Purge weather_miner_scores skipped/failed: {_purge1_err}")
+                                        try:
+                                            # Remove component scores for this response if any
+                                            await task_instance.db_manager.execute(
+                                                "DELETE FROM weather_forecast_component_scores WHERE response_id = :rid AND score_type = 'era5'",
+                                                {"rid": response_id},
+                                            )
+                                        except Exception as _purge2_err:
+                                            logger.debug(f"[FinalScore] Purge component scores skipped/failed: {_purge2_err}")
+                                        try:
+                                            await task_instance.db_manager.execute(
+                                                """
+                                                UPDATE weather_miner_responses 
+                                                SET status = 'verification_failed',
+                                                    error_message = :msg
+                                                WHERE id = :rid
+                                                """,
+                                                {
+                                                    "rid": response_id,
+                                                    "msg": f"Chunk verification failed: {failed_count} of {len(chunk_keys_to_verify)} chunks failed",
+                                                },
+                                            )
+                                        except Exception as _upd_err:
+                                            logger.debug(f"[FinalScore] Failed to update response status after verification fail: {_upd_err}")
+                                        try:
+                                            await _check_run_completion(task_instance, run_id)
+                                        except Exception:
+                                            pass
+                                        return False
+                                else:
+                                    logger.warning(f"[FinalScore] ⚠️ No chunk keys to verify - verification may not occur!")
+                            
+                            except Exception as verify_err:
+                                logger.error(f"[FinalScore] ❌ Error during chunk verification: {verify_err}", exc_info=True)
+                        else:
+                            logger.error(f"[FinalScore] ❌ CRITICAL: Cannot verify chunks - VerifyingChunkMapper not available!")
                         
                         # Clear dask cache to ensure fresh reads through VerifyingChunkMapper
                         try:
                             import dask
                             dask.cache.clear()
-                            logger.info(f"[FinalScore] Cleared dask cache before reading {var_key}")
+                            logger.info(f"[FinalScore] 🧹 Cleared dask cache before reading {var_key}")
                         except Exception:
                             pass
                         
                         # FORCE ACTUAL CHUNK READS by computing dask arrays
-                        # Just calling .values might use cached data
+                        # The chunks should now be verified and cached in VerifyingChunkMapper
+                        logger.info(f"[FinalScore] 🚀 Computing dask array for {var_key} - chunks should already be verified and cached")
                         if hasattr(miner_var_da_aligned, 'compute'):
-                            # This is a dask array - force computation which should trigger chunk reads
-                            # Use scheduler='synchronous' to ensure reads happen immediately and go through our mapper
                             miner_vals_np = miner_var_da_aligned.compute(scheduler='synchronous')
-                            logger.info(f"[FinalScore] Computed dask array for {var_key} - should have triggered verification")
+                            logger.info(f"[FinalScore] ✅ Computed dask array for {var_key} - should use verified cached chunks")
                         else:
                             miner_vals_np = miner_var_da_aligned.values
-                            logger.warning(f"[FinalScore] WARNING: {var_key} is not a dask array - verification may not be triggered!")
+                            logger.warning(f"[FinalScore] ⚠️ WARNING: {var_key} is not a dask array - verification may not be triggered!")
                         
-                        logger.info(f"[FinalScore] Miner data loaded for {var_key}")
+                        logger.info(f"[FinalScore] ✅ Miner data loaded for {var_key}")
                         truth_vals_np = truth_var_da_final.values
                         mask_overlap = np.isfinite(truth_vals_np)
                         if mask_overlap.any():

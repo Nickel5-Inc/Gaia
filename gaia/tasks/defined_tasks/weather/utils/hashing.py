@@ -97,157 +97,6 @@ def get_last_manifest_log(job_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def recompute_remote_manifest_content_hash(
-    zarr_store_url: str,
-    claimed_manifest_content_hash: str,
-    miner_hotkey_ss58: str,
-    headers: Optional[Dict[str, str]] = None,
-    job_id: Optional[str] = "unknown_job",
-) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Rigorously recompute the manifest content hash from the remote Zarr store by:
-    1) Fetching the trusted manifest and reading its top-level fields
-    2) Re-hashing every file listed in trusted_manifest['files'] using the same algorithm and method as the miner
-       (hash of path + NUL + content)
-    3) Reconstructing the JSON (sorted keys, indent=4) and computing its sha256 content hash
-    4) Comparing to the claimed_manifest_content_hash
-
-    Returns (ok, details_dict)
-    """
-    start_time = time.time()
-    try:
-        logger.info(
-            f"REHASH START Job {job_id}: store={zarr_store_url} claimed_hash={claimed_manifest_content_hash[:10]}..."
-        )
-    except Exception:
-        pass
-    details: Dict[str, Any] = {
-        "job_id": job_id,
-        "store": zarr_store_url,
-        "claimed_hash": claimed_manifest_content_hash,
-        "recomputed_hash": None,
-        "files_processed": 0,
-        "mismatched_files": 0,
-        "missing_files": 0,
-        "duration_seconds": 0.0,
-    }
-
-    # Acquire trusted manifest first (verifies signer and claimed content hash on the manifest.json bytes)
-    trusted_manifest = await get_trusted_manifest(
-        zarr_store_url=zarr_store_url,
-        claimed_manifest_content_hash=claimed_manifest_content_hash,
-        miner_hotkey_ss58=miner_hotkey_ss58,
-        headers=headers,
-        job_id=job_id,
-    )
-    if trusted_manifest is None:
-        details["error"] = "trusted_manifest_fetch_failed"
-        details["duration_seconds"] = time.time() - start_time
-        return False, details
-
-    # Prepare filesystem and cleaned root URL
-    zarr_store_url_cleaned = zarr_store_url.rstrip("/") + (
-        "/" if not zarr_store_url.endswith("/") and zarr_store_url.endswith(".zarr") else ""
-    )
-    if not zarr_store_url_cleaned.endswith("/"):
-        zarr_store_url_cleaned += "/"
-
-    protocol = zarr_store_url_cleaned.split("://")[0]
-    http_fs_kwargs: Dict[str, Any] = {}
-    if headers:
-        http_fs_kwargs["headers"] = headers
-    http_fs_kwargs["ssl"] = False
-
-    try:
-        fs = fsspec.filesystem(protocol, **http_fs_kwargs)
-    except Exception as e_fs_init:
-        details["error"] = f"fs_init_failed: {e_fs_init}"
-        details["duration_seconds"] = time.time() - start_time
-        return False, details
-
-    # Determine algorithm and files to hash
-    algo = trusted_manifest.get("chunk_hash_algorithm", "xxh64")
-    manifest_schema_version = trusted_manifest.get("manifest_schema_version", "1.0")
-    profile_version = trusted_manifest.get("profile_structure_version", PROFILE_STRUCTURE_VERSION)
-    signer_hotkey = trusted_manifest.get("signer_hotkey_ss58")
-    if not signer_hotkey:
-        details["error"] = "manifest_missing_signer"
-        details["duration_seconds"] = time.time() - start_time
-        return False, details
-
-    files_dict = trusted_manifest.get("files", {}) or {}
-    file_keys = sorted(files_dict.keys())
-
-    def _hash_path_and_bytes(path_key: str, data: bytes, algorithm: str) -> str:
-        path_plus_content = path_key.encode("utf-8") + b"\0" + data
-        if algorithm == "xxh64":
-            return xxhash.xxh64(path_plus_content).hexdigest()
-        elif algorithm == "sha256":
-            return hashlib.sha256(path_plus_content).hexdigest()
-        else:
-            raise ValueError(f"Unsupported chunk hash algorithm: {algorithm}")
-
-    recomputed_files: Dict[str, str] = {}
-    mismatches = 0
-    missing = 0
-
-    for key in file_keys:
-        try:
-            # Fetch bytes of each file/chunk from remote store
-            # Construct full URL path
-            full_path = zarr_store_url_cleaned.rstrip("/") + "/" + key
-            content = fs.cat(full_path)
-            computed = _hash_path_and_bytes(key, content, algo)
-            recomputed_files[key] = computed
-            details["files_processed"] += 1
-            if files_dict.get(key) != computed:
-                mismatches += 1
-        except FileNotFoundError:
-            missing += 1
-        except Exception as e_read:
-            # Treat read errors as mismatches
-            mismatches += 1
-            logger.error(f"Rehash: Error reading '{key}' for job {job_id}: {e_read}")
-
-    details["mismatched_files"] = mismatches
-    details["missing_files"] = missing
-
-    manifest_to_hash = {
-        "manifest_schema_version": manifest_schema_version,
-        "profile_structure_version": profile_version,
-        "chunk_hash_algorithm": algo,
-        "signer_hotkey_ss58": signer_hotkey,
-        "files": recomputed_files,
-    }
-    manifest_json_bytes = json.dumps(manifest_to_hash, sort_keys=True, indent=4).encode("utf-8")
-    recomputed_content_hash = hashlib.sha256(manifest_json_bytes).hexdigest()
-    details["recomputed_hash"] = recomputed_content_hash
-    details["duration_seconds"] = time.time() - start_time
-    try:
-        logger.info(
-            f"REHASH END Job {job_id}: recomputed_hash={recomputed_content_hash[:10]}... files_processed={details.get('files_processed')} mismatches={mismatches} missing={missing} duration={details['duration_seconds']:.2f}s"
-        )
-    except Exception:
-        pass
-
-    # Strict check: recomputed content hash must equal claimed
-    if recomputed_content_hash != claimed_manifest_content_hash:
-        details["error"] = "content_hash_mismatch"
-        return False, details
-
-    # Also require no missing files and zero mismatches for full integrity
-    if missing > 0 or mismatches > 0:
-        details["error"] = f"file_mismatch: missing={missing}, mismatches={mismatches}"
-        return False, details
-
-    # Mark in process cache
-    try:
-        mark_rehash_verified(zarr_store_url, claimed_manifest_content_hash)
-    except Exception:
-        pass
-    return True, details
-
-
 async def verify_minimal_chunks_and_reconstruct_manifest_hash(
     *,
     zarr_store_url: str,
@@ -1900,6 +1749,159 @@ class VerifyingChunkMapper(fsspec.mapping.FSMap):
                 pass
 
         return items
+
+
+async def preverify_zarr_chunks(
+    zarr_store_url: str,
+    manifest_content_hash: str,
+    signer_hotkey: str,
+    job_id: str = "preverify",
+    sample_percentage: float = 1.0,
+    max_chunks: Optional[int] = None,
+) -> bool:
+    """
+    Pre-verify chunk hashes for a zarr store before opening with xarray.
+    This ensures all hash verification happens upfront with proper logging.
+    
+    Args:
+        zarr_store_url: URL to the zarr store
+        manifest_content_hash: Expected manifest content hash
+        signer_hotkey: Expected signer hotkey for manifest
+        job_id: Job ID for logging
+        sample_percentage: Percentage of chunks to verify (0.0 to 1.0)
+        max_chunks: Maximum number of chunks to verify (None for all)
+    
+    Returns:
+        True if verification succeeds, False otherwise
+    """
+    import random
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    
+    logger.info(
+        f"🔍 PRE-VERIFY [{job_id}]: Starting chunk pre-verification for {zarr_store_url}"
+    )
+    logger.info(
+        f"PRE-VERIFY [{job_id}]: Sample: {sample_percentage*100:.1f}%, Max chunks: {max_chunks or 'all'}"
+    )
+    
+    # Get trusted manifest
+    trusted_manifest = await get_trusted_manifest(
+        zarr_store_url=zarr_store_url,
+        claimed_manifest_content_hash=manifest_content_hash,
+        miner_hotkey_ss58=signer_hotkey,
+        job_id=job_id,
+    )
+    
+    if not trusted_manifest:
+        logger.error(f"PRE-VERIFY [{job_id}]: Failed to get trusted manifest")
+        return False
+    
+    # Get chunk files from manifest
+    files = trusted_manifest.get("files", {})
+    chunk_files = [
+        f for f in files.keys() 
+        if not f.startswith(".") and not f.endswith(".json")
+    ]
+    
+    logger.info(f"PRE-VERIFY [{job_id}]: Found {len(chunk_files)} chunk files in manifest")
+    
+    # Sample chunks if requested
+    if sample_percentage < 1.0 or max_chunks:
+        sample_size = int(len(chunk_files) * sample_percentage)
+        if max_chunks:
+            sample_size = min(sample_size, max_chunks)
+        if sample_size < len(chunk_files):
+            chunk_files = random.sample(chunk_files, sample_size)
+            logger.info(f"PRE-VERIFY [{job_id}]: Sampled {len(chunk_files)} chunks for verification")
+    
+    # Setup filesystem
+    zarr_store_url_cleaned = zarr_store_url.rstrip("/") + "/"
+    protocol = zarr_store_url_cleaned.split("://")[0]
+    fs = fsspec.filesystem(protocol, cache_type="none")
+    
+    # Create verifying mapper for chunk verification
+    verifying_mapper = VerifyingChunkMapper(
+        root=zarr_store_url_cleaned,
+        fs=fs,
+        trusted_manifest=trusted_manifest,
+        job_id_for_logging=f"{job_id}_preverify",
+        strict_metadata=True,
+    )
+    
+    # Verify chunks in parallel batches
+    verification_failures = []
+    batch_size = 10
+    total_verified = 0
+    
+    def verify_single_chunk(chunk_path):
+        """Synchronous function to verify a single chunk"""
+        try:
+            # The __getitem__ method will verify the chunk when we read it
+            _ = verifying_mapper[chunk_path]
+            return (chunk_path, True, None)
+        except Exception as e:
+            return (chunk_path, False, str(e))
+    
+    async def verify_chunk_batch(batch):
+        nonlocal total_verified
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = []
+            for chunk_path in batch:
+                future = loop.run_in_executor(
+                    executor,
+                    verify_single_chunk,
+                    chunk_path
+                )
+                futures.append(future)
+            
+            results = []
+            for future in futures:
+                chunk_path, success, error = await future
+                results.append((chunk_path, success))
+                if not success:
+                    logger.error(
+                        f"PRE-VERIFY [{job_id}]: Chunk verification failed for {chunk_path}: {error}"
+                    )
+            
+            total_verified += len(batch)
+            success_count = sum(1 for _, success in results if success)
+            if success_count < len(batch):
+                failed = [p for p, s in results if not s]
+                verification_failures.extend(failed)
+                logger.warning(
+                    f"PRE-VERIFY [{job_id}]: Batch verification: {success_count}/{len(batch)} succeeded. "
+                    f"Total progress: {total_verified}/{len(chunk_files)}"
+                )
+            else:
+                logger.info(
+                    f"PRE-VERIFY [{job_id}]: Batch verified successfully. "
+                    f"Progress: {total_verified}/{len(chunk_files)}"
+                )
+            
+            return results
+    
+    # Process in batches
+    for i in range(0, len(chunk_files), batch_size):
+        batch = chunk_files[i:i+batch_size]
+        await verify_chunk_batch(batch)
+    
+    # Report results
+    if verification_failures:
+        logger.error(
+            f"❌ PRE-VERIFY [{job_id}]: Verification FAILED. "
+            f"{len(verification_failures)}/{len(chunk_files)} chunks failed verification"
+        )
+        logger.error(
+            f"PRE-VERIFY [{job_id}]: Failed chunks (first 10): {verification_failures[:10]}"
+        )
+        return False
+    else:
+        logger.info(
+            f"✅ PRE-VERIFY [{job_id}]: SUCCESS! All {len(chunk_files)} chunks verified"
+        )
+        return True
 
 
 def _verify_manifest_integrity_sync(

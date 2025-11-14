@@ -294,8 +294,19 @@ class FiberWeightSetter:
 
             # Copy weights and zero out validators
             weights_copy = weights.copy()
+            # Exempt burn UID (subnet owner) from zeroing if burn is enabled
+            try:
+                from gaia.validator.weights.burn import get_burn_uid_if_enabled
+                exempt_burn_uid = get_burn_uid_if_enabled(self.substrate, self.netuid)
+            except Exception:
+                exempt_burn_uid = None
             for uid in active_validator_uids:
                 if uid < len(weights_copy):
+                    if exempt_burn_uid is not None and int(uid) == int(exempt_burn_uid):
+                        logger.info(
+                            f"Skipping zeroing of burn UID {uid} due to active burn settings"
+                        )
+                        continue
                     if weights_copy[uid] > 0:
                         logger.info(
                             f"Setting validator UID {uid} weight to zero (was {weights_copy[uid]:.6f})"
@@ -335,11 +346,28 @@ class FiberWeightSetter:
 
             version_key = __spec_version__
 
+            # Map calculated weights (aligned to present node_ids) into a fixed 256-length WeightVec
+            try:
+                WEIGHT_VEC_LEN = 256
+                uids_256 = list(range(WEIGHT_VEC_LEN))
+                weights_256 = [0.0] * WEIGHT_VEC_LEN
+                for idx, uid in enumerate(node_ids):
+                    if 0 <= uid < WEIGHT_VEC_LEN:
+                        weights_256[uid] = float(calculated_weights[idx])
+                # Safety clamp and renormalize non-zero entries to sum to 1
+                nz_sum = float(sum(w for w in weights_256 if w > 0))
+                if nz_sum > 0:
+                    weights_256 = [w / nz_sum if w > 0 else 0.0 for w in weights_256]
+                logger.info(f"Prepared fixed WeightVec length {WEIGHT_VEC_LEN} for submission")
+            except Exception as map_err:
+                logger.error(f"Failed to map weights to 256-length vector: {map_err}")
+                return False
+
             # Set weights using standard fiber function (with timeout)
             try:
-                logger.info(f"Setting weights for {len(self.nodes)} nodes")
+                logger.info(f"Setting weights with 256-length WeightVec")
                 # Log the exact array and ordering submitted to the chain
-                weights_list = calculated_weights.tolist()
+                weights_list = list(weights_256)
                 try:
                     arr = np.array(weights_list, dtype=float)
                     nz = arr[arr > 0]
@@ -348,7 +376,7 @@ class FiberWeightSetter:
                             f"Submitting weights summary: nonzero={nz.size}, min>0={nz.min():.6f}, max>0={nz.max():.6f}, mean>0={nz.mean():.6f}"
                         )
                         top_idx = np.argsort(-arr)[:10]
-                        top_pairs = [(int(self.nodes[i].node_id), float(arr[i])) for i in top_idx if arr[i] > 0]
+                        top_pairs = [(int(i), float(arr[i])) for i in top_idx if arr[i] > 0]
                         logger.info(f"Top submitted weights (uid,weight): {top_pairs}")
                     else:
                         logger.warning("All submitted weights are zero")
@@ -356,7 +384,7 @@ class FiberWeightSetter:
                     pass
                 # Debug: full arrays being sent to fiber
                 try:
-                    debug_node_ids = [node.node_id for node in self.nodes]
+                    debug_node_ids = list(range(256))
                     logger.debug(f"Submitted node_ids order: {debug_node_ids}")
                     logger.debug(f"Submitted weights array: {weights_list}")
                 except Exception:
@@ -365,8 +393,8 @@ class FiberWeightSetter:
                     self._async_set_node_weights(
                         substrate=self.substrate,
                         keypair=self.keypair,
-                        node_ids=[node.node_id for node in self.nodes],
-                        node_weights=calculated_weights.tolist(),
+                        node_ids=list(range(256)),
+                        node_weights=weights_256,
                         netuid=self.netuid,
                         validator_node_id=validator_uid,
                         version_key=version_key,
