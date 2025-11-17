@@ -194,6 +194,14 @@ async def query_single_miner(
         f"\n  Timeout: {timeout}s"
     )
     
+    # Network diagnostics: basic resolution echo (works for IPs and hostnames)
+    try:
+        import socket
+        resolved_addrs = sorted({ai[4][0] for ai in socket.getaddrinfo(str(miner_ip), None)})
+        logger.info(f"[NetDiag] Resolution for {miner_ip}: {resolved_addrs}")
+    except Exception as _res_err:
+        logger.debug(f"[NetDiag] Resolution check failed for {miner_ip}: {_res_err}")
+    
     # Get validator keypair
     validator_keypair = validator.keypair
     if not validator_keypair:
@@ -213,10 +221,20 @@ async def query_single_miner(
     # Single attempt - retries are handled by the job system
     try:
         # Create HTTP client for this request
+        timeout_cfg = httpx.Timeout(timeout)
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout),
+            timeout=timeout_cfg,
             verify=False  # Disable SSL verification for self-signed certs
         ) as client:
+            try:
+                # httpx client-level diagnostics
+                http2_enabled = getattr(client, "http2", False)
+                logger.info(
+                    f"[NetDiag] httpx client ready: http2={http2_enabled} "
+                    f"timeout(connect={timeout_cfg.connect}, read={timeout_cfg.read}, write={timeout_cfg.write}, pool={timeout_cfg.pool})"
+                )
+            except Exception:
+                pass
             try:
                 if not symmetric_key:
                     # Need to perform handshake
@@ -284,6 +302,16 @@ async def query_single_miner(
                     request_start = time.time()
                     
                     try:
+                        # Net diagnostics: payload size
+                        try:
+                            payload_bytes = len(json.dumps(payload))
+                        except Exception:
+                            payload_bytes = -1
+                        logger.info(
+                            f"[NetDiag] POST {server_address}{endpoint} "
+                            f"using_cached_key=False uuid={symmetric_key_uuid[:8]}... "
+                            f"payload_bytes={payload_bytes}"
+                        )
                         response = await vali_client.make_non_streamed_post(
                             httpx_client=client,
                             server_address=server_address,
@@ -314,7 +342,10 @@ async def query_single_miner(
                             
                     except Exception as e:
                         request_time = time.time() - request_start
-                        logger.error(f"❌ Step 3 failed: Encrypted request to {miner_hotkey[:8]} failed after {request_time:.2f}s: {e}")
+                        logger.error(
+                            f"❌ Step 3 failed: Encrypted request to {miner_hotkey[:8]} failed after {request_time:.2f}s: {e}"
+                            f"\n  Exception type: {type(e).__name__}"
+                        )
                         raise
                     
                     status_code = getattr(response, 'status_code', None)
@@ -365,6 +396,17 @@ async def query_single_miner(
                     request_start = time.time()
                     
                     try:
+                        # Net diagnostics: payload size
+                        try:
+                            payload_bytes = len(json.dumps(payload))
+                        except Exception:
+                            payload_bytes = -1
+                        diag_uuid = (symmetric_key_uuid or "")[:8]
+                        logger.info(
+                            f"[NetDiag] POST {server_address}{endpoint} "
+                            f"using_cached_key=True uuid={diag_uuid} "
+                            f"payload_bytes={payload_bytes}"
+                        )
                         response = await vali_client.make_non_streamed_post(
                             httpx_client=client,
                             server_address=server_address,
@@ -395,12 +437,64 @@ async def query_single_miner(
                             
                     except Exception as e:
                         request_time = time.time() - request_start
-                        logger.error(f"❌ Encrypted request (cached key) to {miner_hotkey[:8]} failed after {request_time:.2f}s: {e}")
+                        logger.error(
+                            f"❌ Encrypted request (cached key) to {miner_hotkey[:8]} failed after {request_time:.2f}s: {e}"
+                            f"\n  Exception type: {type(e).__name__}"
+                        )
                         
                         # If the cached key fails, invalidate it so next attempt does fresh handshake
                         await _invalidate_cached_key(db, miner_uid)
                         logger.warning(f"🗑️ Invalidated cached key for {miner_hotkey[:8]} due to request failure")
-                        raise
+                        
+                        # NEW: Retry once with a fresh handshake on transport errors (e.g., ReadTimeout with no response)
+                        try:
+                            logger.info(f"[Retry] Attempting fresh handshake after cached-key failure for {miner_hotkey[:8]}")
+                            # Perform handshake
+                            pubkey = await handshake.get_public_encryption_key(
+                                client,
+                                server_address,
+                                timeout=int(timeout),
+                            )
+                            new_key: bytes = os.urandom(32)
+                            new_uuid = os.urandom(32).hex()
+                            hs_ok = await handshake.send_symmetric_key_to_server(
+                                client,
+                                server_address,
+                                validator_keypair,
+                                pubkey,
+                                new_key,
+                                new_uuid,
+                                miner_hotkey,
+                                timeout=int(timeout),
+                            )
+                            if not hs_ok:
+                                logger.error("[Retry] Handshake failed during retry after cached-key transport error")
+                                raise httpx.TimeoutException("Retry handshake failed")
+                            await _cache_symmetric_key(db, miner_uid, new_key, new_uuid)
+                            fernet_retry = Fernet(base64.b64encode(new_key).decode())
+                            
+                            # Retry the encrypted POST once
+                            retry_start = time.time()
+                            try:
+                                response = await vali_client.make_non_streamed_post(
+                                    httpx_client=client,
+                                    server_address=server_address,
+                                    fernet=fernet_retry,
+                                    keypair=validator_keypair,
+                                    symmetric_key_uuid=new_uuid,
+                                    validator_ss58_address=validator_keypair.ss58_address,
+                                    miner_ss58_address=miner_hotkey,
+                                    payload=payload,
+                                    endpoint=endpoint,
+                                )
+                                request_time = time.time() - retry_start
+                                logger.info(f"[Retry] 📡 HTTP response after re-handshake from {miner_hotkey[:8]} in {request_time:.2f}s")
+                            except Exception as retry_err:
+                                logger.error(f"[Retry] ❌ Re-handshake POST failed: {type(retry_err).__name__}: {retry_err}")
+                                raise
+                        except Exception as re_err:
+                            # Give up; bubble to outer handler
+                            raise
                     
                     status_code = getattr(response, 'status_code', None)
                     # If non-2xx with cached key, optionally retry with fresh handshake on known key-missing errors
@@ -544,13 +638,42 @@ async def query_single_miner(
                 }
                 
             except httpx.TimeoutException as e:
+                try:
+                    phase = (
+                        "connect" if isinstance(e, httpx.ConnectTimeout) else
+                        "read" if isinstance(e, httpx.ReadTimeout) else
+                        "write" if isinstance(e, httpx.WriteTimeout) else
+                        "pool" if isinstance(e, httpx.PoolTimeout) else
+                        "unknown"
+                    )
+                except Exception:
+                    phase = "unknown"
                 logger.error(
                     f"⏰ Timeout querying {miner_hotkey[:8]} (UID {miner_uid})"
-                    f"\n  Target: {server_address}"
-                    f"\n  Timeout: {timeout}s"
+                    f"\n  Target: {server_address}{endpoint}"
+                    f"\n  Timeout: {timeout}s (phase={phase})"
                     f"\n  Error: {e}"
                     f"\n  Error type: {type(e).__name__}"
                 )
+                # Optional TCP probe to distinguish app stall vs network issue
+                try:
+                    probe_start = time.time()
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(str(miner_ip), int(miner_port)),
+                        timeout=2.0,
+                    )
+                    try:
+                        writer.close()
+                        try:
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    probe_ms = int((time.time() - probe_start) * 1000)
+                    logger.info(f"[NetDiag] TCP probe to {miner_ip}:{miner_port} succeeded in {probe_ms} ms")
+                except Exception as probe_err:
+                    logger.warning(f"[NetDiag] TCP probe to {miner_ip}:{miner_port} failed: {type(probe_err).__name__}: {probe_err}")
                 return {
                     "success": False,
                     "error": f"Timeout: {e}",

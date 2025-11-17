@@ -197,6 +197,26 @@ def _load_config(self):
     config["verification_timeout_seconds"] = int(
         os.getenv("WEATHER_VERIFICATION_TIMEOUT_SECONDS", "3600")
     )
+    # Hardening defaults
+    config["manifest_freeze_window_hours"] = float(
+        os.getenv("WEATHER_MANIFEST_FREEZE_WINDOW_HOURS", "2")
+    )
+    config["require_sha256_manifests"] = os.getenv(
+        "WEATHER_REQUIRE_SHA256_MANIFESTS", "true"
+    ).lower() in ("1", "true", "yes", "on")
+    # Minimal verification samples: ensure non-zero for both day1 and era5
+    try:
+        config["day1_minimal_verify_samples"] = int(
+            os.getenv("WEATHER_DAY1_MIN_VERIFY_SAMPLES", "32")
+        )
+    except Exception:
+        config["day1_minimal_verify_samples"] = 32
+    try:
+        config["era5_minimal_verify_samples"] = int(
+            os.getenv("WEATHER_ERA5_MIN_VERIFY_SAMPLES", "32")
+        )
+    except Exception:
+        config["era5_minimal_verify_samples"] = 32
     # More frequent checking for progressive scoring (check every 30 minutes instead of 1 hour)
     config["final_scoring_check_interval_seconds"] = int(
         os.getenv("WEATHER_FINAL_SCORING_INTERVAL_S", "1800")
@@ -2178,7 +2198,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         run_record = await self.db_manager.fetch_one(
                             run_insert_query,
                             {
-                                "init_time": now_utc,
+                                # Use real current time for run_initiation_time even in test-mode hindcast
+                                "init_time": datetime.now(timezone.utc),
                                 "target_time": gfs_t0_run_time,
                                 "gfs_init": gfs_t0_run_time,
                                 "status": "created",

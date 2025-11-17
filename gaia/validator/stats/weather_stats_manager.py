@@ -204,28 +204,46 @@ class WeatherStatsManager:
                 except Exception:
                     pass
             
-            # Add ERA5 scores (clamped 0..1)
+            # Add ERA5 scores (clamped 0..1) - cumulative across existing row + new inputs
             if era5_scores:
-                completeness_count = 0
-                total_score = 0.0
                 fixed_leads = [24, 48, 72, 96, 120, 144, 168, 192, 216, 240]
+                merged_scores: Dict[int, float] = {}
+                try:
+                    # Fetch existing per-lead values to accumulate completeness across multiple updates
+                    existing_row = await self.db.fetch_one(
+                        sa.select(
+                            *[getattr(weather_forecast_stats_table.c, f"era5_score_{h}h") for h in fixed_leads]
+                        ).where(
+                            (weather_forecast_stats_table.c.miner_uid == miner_uid)
+                            & (weather_forecast_stats_table.c.forecast_run_id == forecast_run_id)
+                        )
+                    )
+                except Exception:
+                    existing_row = None
+
                 for lead_hour in fixed_leads:
-                    # Only count provided (non-null) leads for completeness, but combined score is against full horizon
+                    val = None
+                    # Prefer newly provided value
                     if lead_hour in era5_scores:
                         try:
-                            s_val = float(era5_scores[lead_hour])
+                            val = float(era5_scores[lead_hour])
                         except Exception:
-                            continue
-                        s_val = max(0.0, min(1.0, s_val))
-                        col_name = f"era5_score_{lead_hour}h"
-                        if hasattr(weather_forecast_stats_table.c, col_name):
-                            stats_data[col_name] = s_val
-                        completeness_count += 1
-                        total_score += s_val
-                # Calculate combined score and completeness (complete horizon is 10 steps)
-                max_timesteps = 10
-                stats_data["era5_completeness"] = (completeness_count / max_timesteps) if max_timesteps else 0.0
-                stats_data["era5_combined_score"] = (total_score / max_timesteps) if max_timesteps else 0.0
+                            val = None
+                    # Else fallback to existing stored value
+                    if val is None and existing_row is not None:
+                        try:
+                            val = existing_row.get(f"era5_score_{lead_hour}h")
+                        except Exception:
+                            val = None
+                    if val is not None:
+                        clamped = max(0.0, min(1.0, float(val)))
+                        merged_scores[lead_hour] = clamped
+                        stats_data[f"era5_score_{lead_hour}h"] = clamped
+
+                completeness_count = len(merged_scores)
+                total_score = sum(merged_scores.values())
+                stats_data["era5_completeness"] = (completeness_count / 10.0)
+                stats_data["era5_combined_score"] = (total_score / 10.0)
             
             # Add hosting metrics
             if hosting_status:

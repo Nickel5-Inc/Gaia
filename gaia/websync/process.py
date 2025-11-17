@@ -8,7 +8,7 @@ logger = get_logger(__name__)
 
 
 def start_websync_subprocess() -> Optional[mp.Process]:
-    if os.getenv("WEBSYNC_ON", "true").lower() != "true":
+    if os.getenv("WEBSYNC_ON", "false").lower() != "true":
         logger.info("WebSync: disabled by WEBSYNC_ON env var")
         return None
 

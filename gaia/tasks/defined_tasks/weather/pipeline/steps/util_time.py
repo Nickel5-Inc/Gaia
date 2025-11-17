@@ -13,8 +13,8 @@ def get_effective_gfs_init(task, gfs_init):
     """
     try:
         if getattr(task, "test_mode", False):
-            # Defaults: -7 days hindcast
-            days = int(getattr(task.config, "test_hindcast_days", task.config.get("test_hindcast_days", 7)))
+            # Defaults: -8 days hindcast (adjusted by -1 additional day)
+            days = int(getattr(task.config, "test_hindcast_days", task.config.get("test_hindcast_days", 8)))
             hours = int(getattr(task.config, "test_hindcast_hours", task.config.get("test_hindcast_hours", 0)))
             if days or hours:
                 return gfs_init - timedelta(days=days, hours=hours)

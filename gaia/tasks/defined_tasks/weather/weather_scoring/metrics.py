@@ -440,24 +440,53 @@ async def calculate_acc_by_pressure_level(
                 f"Got dims: {acc_result.dims} with sizes {getattr(acc_result, 'sizes', {})}"
             )
 
+        # Degeneracy guards: if anomalies have near-zero variance, ACC is undefined
+        try:
+            eps = 1e-12
+            std_f = await asyncio.to_thread(_compute_metric_to_array, xr.apply_ufunc, np.std, forecast_anom, input_core_dims=[spatial_dims], kwargs={"keepdims": False})
+            std_t = await asyncio.to_thread(_compute_metric_to_array, xr.apply_ufunc, np.std, truth_anom, input_core_dims=[spatial_dims], kwargs={"keepdims": False})
+        except Exception:
+            std_f = None
+            std_t = None
+
         # Extract per-pressure-level scores
         per_level_scores = {}
         if "pressure_level" in acc_result.dims:
             for level in acc_result.coords["pressure_level"]:
                 level_val = int(level.item())
                 level_result = acc_result.sel(pressure_level=level)
-                if level_result.size == 1:
-                    score_val = float(level_result.item())
-                else:
-                    logger.warning(f"ACC result for level {level_val} has {level_result.size} elements, taking mean")
-                    score_val = float(level_result.mean().item())
+                # Degenerate anomalies -> NaN
+                try:
+                    if std_f is not None and std_t is not None:
+                        sf = float(std_f.sel(pressure_level=level).item()) if "pressure_level" in getattr(std_f, 'dims', ()) else float(std_f.item())
+                        st = float(std_t.sel(pressure_level=level).item()) if "pressure_level" in getattr(std_t, 'dims', ()) else float(std_t.item())
+                        if (sf < eps) or (st < eps):
+                            score_val = float('nan')
+                        else:
+                            score_val = float(level_result.mean().item()) if level_result.size > 1 else float(level_result.item())
+                    else:
+                        score_val = float(level_result.mean().item()) if level_result.size > 1 else float(level_result.item())
+                except Exception:
+                    score_val = float(level_result.mean().item()) if level_result.size > 1 else float(level_result.item())
                 per_level_scores[level_val] = score_val
         else:
             if acc_result.size != 1:
                 raise ValueError(
                     f"Surface ACC result must be scalar. Got size={acc_result.size}"
                 )
-            per_level_scores[None] = float(acc_result.item())
+            # Surface degeneracy check
+            try:
+                eps = 1e-12
+                std_f_s = await asyncio.to_thread(_compute_metric_to_array, xr.apply_ufunc, np.std, forecast_anom, input_core_dims=[spatial_dims], kwargs={"keepdims": False})
+                std_t_s = await asyncio.to_thread(_compute_metric_to_array, xr.apply_ufunc, np.std, truth_anom, input_core_dims=[spatial_dims], kwargs={"keepdims": False})
+                sf = float(std_f_s.item())
+                st = float(std_t_s.item())
+                if (sf < eps) or (st < eps):
+                    per_level_scores[None] = float('nan')
+                else:
+                    per_level_scores[None] = float(acc_result.item())
+            except Exception:
+                per_level_scores[None] = float(acc_result.item())
         
         return per_level_scores
 
@@ -506,6 +535,16 @@ async def calculate_acc(
             weights=lat_weights,
             skipna=True,
         )
+
+        # Degeneracy guard: anomalies must have non-zero variance across spatial dims
+        try:
+            eps = 1e-12
+            std_f = await asyncio.to_thread(_compute_metric_to_array, xr.apply_ufunc, np.std, forecast_anom, input_core_dims=[spatial_dims], kwargs={"keepdims": False})
+            std_t = await asyncio.to_thread(_compute_metric_to_array, xr.apply_ufunc, np.std, truth_anom, input_core_dims=[spatial_dims], kwargs={"keepdims": False})
+            if float(std_f.item()) < eps or float(std_t.item()) < eps:
+                return float('nan')
+        except Exception:
+            pass
 
         acc_float = acc_scalar.item()
         logger.info(f"ACC calculated (xskillscore): {acc_float:.4f}")

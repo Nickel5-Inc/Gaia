@@ -65,7 +65,7 @@ async def _get_era5_truth(task: WeatherTask, run_id: int, gfs_init, leads: list[
             try:
                 use_progressive_fetch = task.config.get("progressive_era5_fetch", True)
                 if use_progressive_fetch:
-                    from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data_progressive
+                    from ...data.acquisition import fetch_era5_data_progressive
                     ds = await fetch_era5_data_progressive(
                         target_datetimes, cache_dir=Path(cache_dir_str), cache_only=True
                     )
@@ -90,7 +90,7 @@ async def _get_era5_truth(task: WeatherTask, run_id: int, gfs_init, leads: list[
             try:
                 use_progressive_fetch = task.config.get("progressive_era5_fetch", True)
                 if use_progressive_fetch:
-                    from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data_progressive
+                    from ...data.acquisition import fetch_era5_data_progressive
                     ds = await fetch_era5_data_progressive(
                         target_datetimes, cache_dir=Path(cache_dir_str), cache_only=True
                     )
@@ -139,7 +139,7 @@ async def run_item(
         setattr(task, "validator", validator)
     # Pull response details
     resp = await db.fetch_one(
-        "SELECT id, run_id, miner_uid, miner_hotkey, job_id FROM weather_miner_responses WHERE id = :rid",
+        "SELECT id, run_id, miner_uid, miner_hotkey, job_id, verification_passed, status FROM weather_miner_responses WHERE id = :rid",
         {"rid": response_id},
     )
     if not resp:
@@ -159,6 +159,16 @@ async def run_item(
             f"but job specifies miner UID {miner_uid}. Aborting to prevent crossover."
         )
         return False
+    # Gate ERA5 scoring on verified manifest to prevent TOCTOU swaps
+    try:
+        if not bool(resp.get("verification_passed")) or resp.get("status") != "verified_manifest_store_opened":
+            logger.warning(
+                f"[ERA5] Run {run_id} Miner {miner_uid}: Skipping ERA5 scoring - manifest not verified (verification_passed={resp.get('verification_passed')}, status={resp.get('status')})"
+            )
+            return False
+    except Exception:
+        return False
+
     run = await db.fetch_one(
         "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :rid",
         {"rid": run_id},
@@ -223,11 +233,12 @@ async def run_item(
             FROM weather_miner_scores
             WHERE run_id = :rid
               AND miner_uid = :uid
+              AND response_id = :resp_id
               AND score_type LIKE 'era5_rmse_%'
               AND lead_hours IS NOT NULL
             """
         ),
-        {"rid": run_id, "uid": miner_uid},
+        {"rid": run_id, "uid": miner_uid, "resp_id": resp["id"]},
     )
     existing_scores: Dict[int, float] = {}
     for r in rows:
@@ -546,6 +557,31 @@ async def run_item(
         )
         ok = False
     if not ok:
+        # Build descriptive error message from latest response/error state
+        detailed_msg = "ERA5 scoring failed"
+        detailed_reason = "scoring_failed"
+        try:
+            resp_state = await db.fetch_one(
+                "SELECT status, error_message FROM weather_miner_responses WHERE id = :rid",
+                {"rid": resp["id"]},
+            )
+            # Check for last verified open error
+            try:
+                from gaia.tasks.defined_tasks.weather.utils.remote_access import get_last_verified_open_error as _get_last_open_err
+                last_open_err = _get_last_open_err(resp.get("job_id"))
+            except Exception:
+                last_open_err = None
+            if resp_state and resp_state.get("error_message"):
+                detailed_msg = str(resp_state.get("error_message"))
+            elif last_open_err:
+                detailed_msg = f"Verified-open error: {last_open_err}"
+            # Set a more precise reason when possible
+            if resp_state and str(resp_state.get("status", "")).startswith("verification"):
+                detailed_reason = "verification_failed"
+            elif "verification" in detailed_msg.lower() or "chunk" in detailed_msg.lower():
+                detailed_reason = "verification_failed"
+        except Exception:
+            pass
         # Mark per-lead steps as failed to prevent re-enqueue
         try:
             from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_failure
@@ -559,7 +595,12 @@ async def run_item(
                         step_name="era5",
                         substep="score",
                         lead_hours=int(_lh),
-                        error_json={"type": "scoring_failed", "reason": "manifest_verification_failed_or_open_error"},
+                        error_json={
+                            "type": "scoring_failed",
+                            "reason": detailed_reason,
+                            "message": detailed_msg,
+                            "context": {"run_id": run_id, "miner_uid": miner_uid, "lead_hours": int(_lh)},
+                        },
                     )
                     try:
                         await db.execute(
@@ -581,7 +622,8 @@ async def run_item(
             substep="score",
             error_json={
                 "type": "scoring_failed",
-                "message": "calculate_era5_miner_score returned False (manifest verification/open error). This failure will NOT be rescheduled.",
+                "reason": detailed_reason,
+                "message": detailed_msg,
                 "context": {"run_id": run_id, "miner_uid": miner_uid, "ready_leads": ready_leads},
             },
         )

@@ -562,9 +562,6 @@ class GaiaValidator:
             test_mode=args.test,
         )
 
-        # Initialize weight perturbation manager for anti-weight-copying defense
-        self.perturbation_manager = None  # Will be initialized when database is ready
-        self.last_seed_rotation_check = 0  # Track last seed rotation check
 
         self.weights = [0.0] * 256
         self.last_set_weights_block = 0
@@ -3387,9 +3384,9 @@ class GaiaValidator:
                 
                 # Monitor websync subprocess (respawn if dead)
                 try:
-                    websync_enabled = os.getenv("WEBSYNC_ON", "true").lower() == "true"
+                    websync_enabled = os.getenv("WEBSYNC_ON", "false").lower() == "true"
                 except Exception:
-                    websync_enabled = True
+                    websync_enabled = False
                 
                 if websync_enabled:
                     p = getattr(self, "_websync_process", None)
@@ -3826,45 +3823,6 @@ class GaiaValidator:
                 # Defer starting worker pool until after AutoSyncManager setup below
 
 
-                # Initialize weight perturbation manager for anti-weight-copying defense
-                try:
-                    from gaia.validator.weight_perturbation import (
-                        WeightPerturbationManager,
-                        ENABLE_PERTURBATION,
-                        P_MOVE,
-                    )
-
-                    validator_hotkey = None
-                    if (
-                        hasattr(self, "config")
-                        and self.config
-                        and hasattr(self.config.wallet, "hotkey")
-                    ):
-                        validator_hotkey = self.config.wallet.hotkey.ss58_address
-
-                    self.perturbation_manager = WeightPerturbationManager(
-                        self.database_manager, validator_hotkey
-                    )
-                    await self.perturbation_manager.initialize_seed_table()
-
-                    # Simple, clear logging
-                    if ENABLE_PERTURBATION:
-                        logger.info(
-                            f"Weight perturbation ENABLED - P={P_MOVE} (anti-weight-copying active)"
-                        )
-                        if self.perturbation_manager.is_primary:
-                            logger.info(
-                                "This is the PRIMARY validator - will generate seeds at :10 each hour"
-                            )
-                        else:
-                            logger.info("Using seeds from primary validator")
-                    else:
-                        logger.info("Weight perturbation DISABLED")
-
-                except Exception as e:
-                    logger.error(f"Failed to initialize weight perturbation: {e}")
-
-                # Initialize DB Sync Components - AFTER DB init
                 await self._initialize_db_sync_components()
 
                 # Perform startup history cleanup AFTER db init and wipe check
@@ -4418,7 +4376,7 @@ class GaiaValidator:
                 # Legacy MinerScoreSender removed (replaced by websync subprocess)
 
                 # Conditionally start WebSync subprocess for streaming updates to webserver
-                if os.getenv("WEBSYNC_ON", "true").lower() == "true":
+                if os.getenv("WEBSYNC_ON", "false").lower() == "true":
                     try:
                         self._websync_process = start_websync_subprocess()
                     except Exception as ws_err:
@@ -4574,19 +4532,6 @@ class GaiaValidator:
 
         while True:
             try:
-                # Check for seed generation (primary validator only, every minute)
-                if self.perturbation_manager:
-                    current_time = time.time()
-                    if current_time - self.last_seed_rotation_check > 60:  # Check every minute
-                        try:
-                            generated = await self.perturbation_manager.rotate_seed_if_needed()
-                            if generated:
-                                logger.info("Future perturbation seed generated (primary validator)")
-                                logger.info("Seed will be synced at :39 and activate at :00 next hour")
-                            self.last_seed_rotation_check = current_time
-                        except Exception as e:
-                            logger.error(f"Error checking seed generation: {e}")
-
                 # Update status - monitoring has extended timeout to prevent false alerts
                 await self.update_task_status("scoring", "active", "monitoring")
                 

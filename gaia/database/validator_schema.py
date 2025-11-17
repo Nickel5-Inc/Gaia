@@ -411,6 +411,12 @@ weather_miner_responses_table = sa.Table(
     sa.Column("verification_hash_claimed", sa.VARCHAR(64), nullable=True),
     sa.Column("verification_passed", sa.Boolean, nullable=True),
     sa.Column(
+        "manifest_frozen_at",
+        postgresql.TIMESTAMP(timezone=True),
+        nullable=True,
+        comment="UTC timestamp when manifest was verified and frozen",
+    ),
+    sa.Column(
         "status", sa.VARCHAR(50), nullable=False, server_default=sa.text("'received'")
     ),
     sa.Column("error_message", sa.Text, nullable=True),
@@ -1408,27 +1414,6 @@ validator_job_logs_table = sa.Table(
     comment="Per-job log messages for auditing and debugging.",
 )
 sa.Index("idx_vjob_logs_job", validator_job_logs_table.c.job_id)
-
-# --- Perturbation Seed Table (Anti-Weight-Copying Mechanism) ---
-# REDESIGNED: Now stores multiple seeds with activation times for safe synchronization
-perturb_seed_table = sa.Table(
-    "perturb_seed",
-    validator_metadata,
-    sa.Column(
-        "activation_hour",
-        postgresql.TIMESTAMP(timezone=True),
-        primary_key=True,
-        nullable=False,
-    ),
-    sa.Column("seed_hex", sa.String(64), nullable=False),  # 32-byte hex = 64 chars
-    sa.Column(
-        "generated_at",
-        postgresql.TIMESTAMP(timezone=True),
-        nullable=False,
-        server_default=sa.func.now(),
-    ),
-    extend_existing=True,
-)
 
 # Placeholder for trigger function/trigger definitions if we move them here or handle in Alembic only
 # For now, the check_node_table_size function and its trigger are defined in the first migration directly.

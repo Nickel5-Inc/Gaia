@@ -255,18 +255,16 @@ async def run_query_miner_job(
                     f"[Run {run_id}] Miner {miner_hotkey[:8]} completed on initial query. Scheduling Day1 scoring immediately.\n"
                     f"  Job ID: {job_id}\n  Zarr: {zarr_url}\n  Hash: {claimed_hash}"
                 )
-                manifest_json = miner_response.get("manifest_json")
-                # Record forecast-ready status and metadata (including manifest JSON for freezing)
+                # Do NOT trust miner-provided manifest here; freeze will fetch and verify later
                 await db.execute(
                     """
-                    INSERT INTO weather_miner_responses (run_id, miner_uid, miner_hotkey, response_time, job_id, status, kerchunk_json_url, verification_hash_claimed, kerchunk_json_retrieved, job_accepted_at)
-                    VALUES (:run_id, :miner_uid, :miner_hotkey, NOW(), :job_id, 'forecast_ready', :url, :hash, CAST(:manifest_json AS jsonb), NOW())
+                    INSERT INTO weather_miner_responses (run_id, miner_uid, miner_hotkey, response_time, job_id, status, kerchunk_json_url, verification_hash_claimed, job_accepted_at)
+                    VALUES (:run_id, :miner_uid, :miner_hotkey, NOW(), :job_id, 'forecast_ready', :url, :hash, NOW())
                     ON CONFLICT (run_id, miner_uid) DO UPDATE SET
                         status = EXCLUDED.status,
                         job_id = EXCLUDED.job_id,
                         kerchunk_json_url = COALESCE(EXCLUDED.kerchunk_json_url, weather_miner_responses.kerchunk_json_url),
                         verification_hash_claimed = COALESCE(EXCLUDED.verification_hash_claimed, weather_miner_responses.verification_hash_claimed),
-                        kerchunk_json_retrieved = COALESCE(weather_miner_responses.kerchunk_json_retrieved, EXCLUDED.kerchunk_json_retrieved),
                         job_accepted_at = COALESCE(weather_miner_responses.job_accepted_at, NOW()),
                         response_time = COALESCE(weather_miner_responses.response_time, NOW())
                     """,
@@ -277,9 +275,40 @@ async def run_query_miner_job(
                         "job_id": job_id,
                         "url": zarr_url,
                         "hash": claimed_hash,
-                        "manifest_json": json.dumps(manifest_json) if isinstance(manifest_json, (dict, list)) else manifest_json,
                     },
                 )
+                # Immediately verify and freeze manifest within the allowed window
+                try:
+                    from gaia.tasks.defined_tasks.weather.processing.weather_logic import verify_miner_response as _verify_resp
+                    from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask as _WT
+                    task = None
+                    if validator is not None:
+                        task = getattr(validator, "weather_task_singleton", None)
+                    if task is None:
+                        task = _WT(db_manager=db, node_type="validator", test_mode=True)
+                        if validator is not None:
+                            try:
+                                setattr(validator, "weather_task_singleton", task)
+                            except Exception:
+                                pass
+                    if validator is not None:
+                        try:
+                            setattr(task, "validator", validator)
+                        except Exception:
+                            pass
+                    run_details = {"id": run_id}
+                    response_id = await db.fetch_one(
+                        "SELECT id FROM weather_miner_responses WHERE run_id = :rid AND miner_uid = :uid ORDER BY id DESC LIMIT 1",
+                        {"rid": run_id, "uid": miner_uid},
+                    )
+                    if response_id and response_id.get("id"):
+                        await _verify_resp(
+                            task,
+                            run_details,
+                            {"id": response_id["id"], "miner_hotkey": miner_hotkey, "job_id": job_id},
+                        )
+                except Exception as _e:
+                    logger.warning(f"[Run {run_id}] Immediate verify on fast-path failed or deferred: {_e}")
                 # Enqueue Day1 scoring singleton immediately
                 singleton_key = f"day1_score_run_{run_id}_miner_{miner_uid}"
                 job_id_created = await db.enqueue_singleton_job(

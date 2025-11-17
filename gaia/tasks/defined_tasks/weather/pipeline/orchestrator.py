@@ -5,6 +5,7 @@ This module handles the high-level coordination of a forecast run.
 from __future__ import annotations
 
 import json
+import os
 import logging
 from datetime import datetime, timezone, timedelta
 import random
@@ -296,6 +297,35 @@ async def handle_initiate_fetch_job(
             ORDER BY uid
             """
         )
+        # Optional test-mode filtering to a single miner UID to speed up local runs
+        try:
+            force_uid_env = os.getenv("WEATHER_TEST_ONLY_UID", "").strip()
+            force_uid: Optional[int] = None
+            if force_uid_env:
+                try:
+                    force_uid = int(force_uid_env)
+                except Exception:
+                    force_uid = None
+            else:
+                # Derive from a test mode signal if available
+                tm_env = os.getenv("WEATHER_TASK_TEST_MODE", "").strip().lower()
+                is_test_mode = tm_env in ("1", "true", "yes", "on")
+                if not is_test_mode and validator is not None:
+                    try:
+                        task_like = getattr(validator, "weather_task_singleton", None)
+                        is_test_mode = bool(getattr(task_like, "test_mode", False))
+                    except Exception:
+                        is_test_mode = False
+                if is_test_mode:
+                    force_uid = 80
+            if force_uid is not None:
+                before = len(miners)
+                miners = [m for m in miners if int(m.get("uid", -1)) == int(force_uid)]
+                logger.info(
+                    f"[Run {run_id}] Test-only miner filtering active; restricting to UID {force_uid} (from {before} to {len(miners)})"
+                )
+        except Exception:
+            pass
         # Randomize miner order to avoid all validators hitting miners in the same sequence
         try:
             rng = random.Random()
