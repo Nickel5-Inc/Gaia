@@ -22,36 +22,58 @@ async def reseed_run(*, run_id: int) -> None:
         if not row:
             raise SystemExit(f"Run {run_id} not found in weather_forecast_runs")
 
-        # Order matters due to FKs/cascades
-        await conn.execute(text("DELETE FROM validator_jobs WHERE run_id = :rid"), {"rid": run_id})
-        await conn.execute(text("DELETE FROM weather_forecast_steps WHERE run_id = :rid"), {"rid": run_id})
-        await conn.execute(text("DELETE FROM weather_miner_responses WHERE run_id = :rid"), {"rid": run_id})
-        await conn.execute(text("DELETE FROM weather_scoring_jobs WHERE run_id = :rid"), {"rid": run_id})
-        await conn.execute(text("DELETE FROM weather_forecast_stats WHERE run_id = :rid"), {"rid": run_id})
-        # Ensembles
+        # --- Soft reset (minimal) ---
+        # 1) Cancel active/scheduled jobs that could block singleton re-enqueue
         await conn.execute(
             text(
                 """
-                DELETE FROM weather_ensemble_components USING weather_ensemble_forecasts wef
-                WHERE weather_ensemble_components.ensemble_id = wef.id AND wef.forecast_run_id = :rid
+                UPDATE validator_jobs
+                SET status = 'failed', completed_at = NOW(), lease_expires_at = NULL
+                WHERE run_id = :rid
+                  AND job_type LIKE 'weather.%'
+                  AND status IN ('pending','in_progress','retry_scheduled')
                 """
             ),
             {"rid": run_id},
         )
-        await conn.execute(text("DELETE FROM weather_ensemble_forecasts WHERE forecast_run_id = :rid"), {"rid": run_id})
-        # Historical weights
-        await conn.execute(text("DELETE FROM weather_historical_weights WHERE run_id = :rid"), {"rid": run_id})
-        # Combined score rows for this run (task_id format: weather_scores_{run_id}_{GFSZ})
+        # 1a) Allow re-enqueue of seed by neutralizing prior completed seed jobs (singleton gate includes 'completed')
         await conn.execute(
-            text("DELETE FROM score_table WHERE task_name = 'weather' AND task_id LIKE ('weather_scores_'||:rid_text||'_%')"),
-            {"rid_text": str(run_id)},
+            text(
+                """
+                UPDATE validator_jobs
+                SET status = 'failed', completed_at = NOW(), lease_expires_at = NULL
+                WHERE run_id = :rid
+                  AND job_type = 'weather.seed'
+                  AND status = 'completed'
+                """
+            ),
+            {"rid": run_id},
         )
-        # Reset run state
+        # 1b) Reset seed step row to pending so step enqueuer can recreate the seed job
+        await conn.execute(
+            text(
+                """
+                UPDATE weather_forecast_steps
+                SET status = 'pending', job_id = NULL, next_retry_time = NULL
+                WHERE run_id = :rid
+                  AND step_name = 'seed'
+                  AND substep = 'download_gfs'
+                """
+            ),
+            {"rid": run_id},
+        )
+        # 2) Clear per-miner responses (prevents skip logic and lets poll/enqueue restart)
+        await conn.execute(text("DELETE FROM weather_miner_responses WHERE run_id = :rid"), {"rid": run_id})
+        # 3) Reset run state and move freeze window anchor to now
         await conn.execute(
             text(
                 """
                 UPDATE weather_forecast_runs
-                SET status = 'created', completion_time = NULL, final_scoring_attempted_time = NULL, error_message = NULL
+                SET status = 'created',
+                    run_initiation_time = NOW(),
+                    completion_time = NULL,
+                    final_scoring_attempted_time = NULL,
+                    error_message = NULL
                 WHERE id = :rid
                 """
             ),

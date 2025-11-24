@@ -4,6 +4,7 @@ This step runs in parallel for each miner after GFS data is ready.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
@@ -309,6 +310,24 @@ async def run_query_miner_job(
                         )
                 except Exception as _e:
                     logger.warning(f"[Run {run_id}] Immediate verify on fast-path failed or deferred: {_e}")
+                # Re-check verification result; only enqueue Day1 if manifest verified (with short retry to tolerate commit lag)
+                _v = None
+                for _attempt in range(3):
+                    try:
+                        _v = await db.fetch_one(
+                            "SELECT verification_passed, status FROM weather_miner_responses WHERE run_id = :rid AND miner_uid = :uid ORDER BY id DESC LIMIT 1",
+                            {"rid": run_id, "uid": miner_uid},
+                        )
+                    except Exception:
+                        _v = None
+                    if _v and bool(_v.get("verification_passed")) and str(_v.get("status", "")) == "verified_manifest_store_opened":
+                        break
+                    await asyncio.sleep(0.2)
+                if not _v or not bool(_v.get("verification_passed")) or str(_v.get("status", "")) != "verified_manifest_store_opened":
+                    logger.warning(
+                        f"[Run {run_id}] Skipping Day1 enqueue for miner {miner_hotkey[:8]} due to verification state: verified={bool(_v and _v.get('verification_passed'))}, status={_v and _v.get('status')}"
+                    )
+                    return True
                 # Enqueue Day1 scoring singleton immediately
                 singleton_key = f"day1_score_run_{run_id}_miner_{miner_uid}"
                 job_id_created = await db.enqueue_singleton_job(

@@ -5476,8 +5476,16 @@ class GaiaValidator:
                 fallback_weights[252] = 1.0  # Set 100% weight to UID 252
                 return fallback_weights.tolist(), {}
 
-            M = np.percentile(positives, 80)
-            logger.info(f"Using 80th percentile ({M:.8f}) as curve midpoint")
+            # Use unique-value percentile to avoid flattening when many entries equal the max
+            try:
+                unique_pos = np.unique(positives)
+                if unique_pos.size >= 3:
+                    M = np.percentile(unique_pos, 80)
+                else:
+                    M = np.percentile(positives, 80)
+            except Exception:
+                M = np.percentile(positives, 80)
+            logger.info(f"Using 80th percentile ({M:.8f}) as curve midpoint (unique-based)")
             b, Q, v, k, a, slope = 70, 8, 0.3, 0.98, 0.0, 0.01
             transformed_w = np.zeros_like(weights_final)
             nz_indices = np.where(weights_final > 0.0)[0]
@@ -5504,12 +5512,31 @@ class GaiaValidator:
                 logger.warning("No positive weights after sigmoid transformation!")
                 # Continue to rank-based if needed or return None
 
-            if len(trans_nz) > 1 and np.std(trans_nz) < 0.01:
-                # Keep equal shares among positive weights to avoid UID-biased rank artifacts
-                logger.warning(
-                    f"Transformed weights too uniform (std={np.std(trans_nz):.4f}), keeping equal-share distribution among positives."
-                )
-                transformed_w = np.copy(weights_final)
+            # If transformed weights are too uniform, boost contrast while preserving order
+            if len(trans_nz) > 1:
+                try:
+                    mean_val = float(np.mean(trans_nz)) if float(np.mean(trans_nz)) != 0.0 else 1e-12
+                    cv = float(np.std(trans_nz) / (abs(mean_val) + 1e-12))
+                except Exception:
+                    cv = 0.0
+                if cv < 0.03:
+                    logger.warning(
+                        f"Transformed weights too uniform (cv={cv:.4f}); applying contrast boost instead of equal-share."
+                    )
+                    # Power-law contrast on normalized base with small deterministic jitter to break ties
+                    try:
+                        import os as _os
+                        gamma = float(_os.getenv("WEIGHT_CONTRAST_GAMMA", "1.3"))
+                    except Exception:
+                        gamma = 1.3
+                    nz_idx = np.where(weights_final > 0.0)[0]
+                    base_eps = 1e-9
+                    base = np.maximum(norm_weights[nz_idx], base_eps)
+                    boosted = transformed_w[nz_idx] * np.power(base, gamma)
+                    # Tiny monotonic jitter based on UID to avoid exact equality, preserves order
+                    jitter = 1e-9 * (nz_idx.astype(float) / 256.0)
+                    boosted = boosted + jitter
+                    transformed_w[nz_idx] = boosted
 
             final_sum = np.sum(transformed_w)
             final_weights_list = None

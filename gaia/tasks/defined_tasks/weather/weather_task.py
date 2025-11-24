@@ -223,8 +223,8 @@ def _load_config(self):
     )
     # Optimized for progressive scoring: reduce delay since we're scoring days individually
     config["era5_delay_days"] = int(
-        os.getenv("WEATHER_ERA5_DELAY_DAYS", "4")
-    )  # Reduced from 5 to 4 days
+        os.getenv("WEATHER_ERA5_DELAY_DAYS", "5")
+    )
     config["era5_buffer_hours"] = int(os.getenv("WEATHER_ERA5_BUFFER_HOURS", "6"))
     # After the initial delay window, poll ERA5 regularly for new lead times
     config["era5_poll_interval_minutes"] = int(

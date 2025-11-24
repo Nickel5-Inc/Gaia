@@ -307,16 +307,9 @@ async def handle_initiate_fetch_job(
                 except Exception:
                     force_uid = None
             else:
-                # Derive from a test mode signal if available
+                # Only honor explicit environment toggle; do NOT infer from in-process test flags
                 tm_env = os.getenv("WEATHER_TASK_TEST_MODE", "").strip().lower()
-                is_test_mode = tm_env in ("1", "true", "yes", "on")
-                if not is_test_mode and validator is not None:
-                    try:
-                        task_like = getattr(validator, "weather_task_singleton", None)
-                        is_test_mode = bool(getattr(task_like, "test_mode", False))
-                    except Exception:
-                        is_test_mode = False
-                if is_test_mode:
+                if tm_env in ("1", "true", "yes", "on"):
                     force_uid = 80
             if force_uid is not None:
                 before = len(miners)

@@ -4,6 +4,7 @@ This step runs in parallel for each miner that has accepted a request.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
@@ -183,14 +184,20 @@ async def run_poll_miner_job(
                 except Exception as freeze_err:
                     logger.error(f"[Run {run_id}] Manifest freeze failed for miner {miner_hotkey[:8]}: {freeze_err}")
                 
-                # Check verification result before enqueuing Day1
-                try:
-                    vrec = await db.fetch_one(
-                        "SELECT verification_passed, status, error_message FROM weather_miner_responses WHERE id = :rid",
-                        {"rid": response_id},
-                    )
-                except Exception:
-                    vrec = None
+                # Check verification result before enqueuing Day1 (tolerate brief commit lag with a short retry loop)
+                vrec = None
+                for _attempt in range(3):
+                    try:
+                        vrec = await db.fetch_one(
+                            "SELECT verification_passed, status, error_message FROM weather_miner_responses WHERE id = :rid",
+                            {"rid": response_id},
+                        )
+                    except Exception:
+                        vrec = None
+                    if vrec and bool(vrec.get("verification_passed")) and vrec.get("status") == "verified_manifest_store_opened":
+                        break
+                    # brief backoff before recheck
+                    await asyncio.sleep(0.2)
                 if not vrec or not bool(vrec.get("verification_passed")) or vrec.get("status") != "verified_manifest_store_opened":
                     logger.warning(
                         f"[Run {run_id}] Skipping Day1 enqueue for miner {miner_hotkey[:8]} due to verification state: "

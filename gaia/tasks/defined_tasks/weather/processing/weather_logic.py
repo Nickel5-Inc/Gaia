@@ -1297,15 +1297,44 @@ async def verify_miner_response(
                     {"id": response_id},
                 )
                 return
-            if existing_url and existing_url != zarr_store_url:
-                logger.error(
-                    f"[VerifyLogic, Resp {response_id}] Zarr URL changed after submission. Stored={existing_url}, New={zarr_store_url}"
-                )
-                await task_instance.db_manager.execute(
-                    "UPDATE weather_miner_responses SET status = 'verification_error', verification_passed = FALSE, error_message = 'Zarr URL changed after submission' WHERE id = :id",
-                    {"id": response_id},
-                )
-                return
+            # Normalize relative vs absolute URL differences; treat same path as equivalent
+            try:
+                if existing_url and zarr_store_url:
+                    from urllib.parse import urlparse
+                    old_p = urlparse(str(existing_url))
+                    new_p = urlparse(str(zarr_store_url))
+                    old_path = old_p.path or str(existing_url)
+                    new_path = new_p.path or str(zarr_store_url)
+                    if old_path == new_path:
+                        # Upgrade stored relative URL to absolute
+                        if "://" not in str(existing_url):
+                            try:
+                                await task_instance.db_manager.execute(
+                                    "UPDATE weather_miner_responses SET kerchunk_json_url = :url WHERE id = :id",
+                                    {"url": zarr_store_url, "id": response_id},
+                                )
+                                existing_url = zarr_store_url
+                            except Exception:
+                                pass
+                    else:
+                        logger.error(
+                            f"[VerifyLogic, Resp {response_id}] Zarr URL changed after submission. Stored={existing_url}, New={zarr_store_url}"
+                        )
+                        await task_instance.db_manager.execute(
+                            "UPDATE weather_miner_responses SET status = 'verification_error', verification_passed = FALSE, error_message = 'Zarr URL changed after submission' WHERE id = :id",
+                            {"id": response_id},
+                        )
+                        return
+            except Exception:
+                if existing_url and existing_url != zarr_store_url:
+                    logger.error(
+                        f"[VerifyLogic, Resp {response_id}] Zarr URL changed after submission. Stored={existing_url}, New={zarr_store_url}"
+                    )
+                    await task_instance.db_manager.execute(
+                        "UPDATE weather_miner_responses SET status = 'verification_error', verification_passed = FALSE, error_message = 'Zarr URL changed after submission' WHERE id = :id",
+                        {"id": response_id},
+                    )
+                    return
         frozen_manifest = None  # Always re-fetch and verify independently
 
         # Prepare storage options early for manifest fetches
@@ -1340,7 +1369,7 @@ async def verify_miner_response(
         await task_instance.db_manager.execute(
             """
             UPDATE weather_miner_responses
-            SET kerchunk_json_url = COALESCE(kerchunk_json_url, :url),
+            SET kerchunk_json_url = CASE WHEN kerchunk_json_url IS NULL THEN :url ELSE kerchunk_json_url END,
                 verification_hash_claimed = COALESCE(verification_hash_claimed, :hash),
                 status = 'verifying_manifest'
             WHERE id = :id

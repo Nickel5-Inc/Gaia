@@ -1015,7 +1015,10 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     from gaia.tasks.defined_tasks.weather.pipeline.steps.util_time import get_effective_gfs_init
                     # Use a lightweight WeatherTask for config access
                     from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
-                    t = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+                    # Honor explicit env for test mode only
+                    import os as _os
+                    _tm = _os.getenv("WEATHER_TASK_TEST_MODE", "").strip().lower() in ("1","true","yes","on")
+                    t = WeatherTask(db_manager=db, node_type="validator", test_mode=_tm)
                     run_row = await db.fetch_one(
                         "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :rid",
                         {"rid": rid},
@@ -1107,7 +1110,9 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     from gaia.tasks.defined_tasks.weather.pipeline.steps.era5_step import _get_era5_truth
                     from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
                     from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_start
-                    t = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+                    import os as _os
+                    _tm = _os.getenv("WEATHER_TASK_TEST_MODE", "").strip().lower() in ("1","true","yes","on")
+                    t = WeatherTask(db_manager=db, node_type="validator", test_mode=_tm)
                     runs = await db.fetch_all(
                         """
                         SELECT id, gfs_init_time_utc
@@ -1285,7 +1290,9 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 try:
                     # Run the recompute pipeline inline using Python APIs
                     from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
-                    task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+                    import os as _os
+                    _tm = _os.getenv("WEATHER_TASK_TEST_MODE", "").strip().lower() in ("1","true","yes","on")
+                    task = WeatherTask(db_manager=db, node_type="validator", test_mode=_tm)
                     # Rebuild combined rows based on stats for recent runs
                     # Find recent run ids
                     runs = await db.fetch_all("SELECT id FROM weather_forecast_runs ORDER BY id DESC LIMIT 32")

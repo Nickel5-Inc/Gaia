@@ -79,8 +79,10 @@ async def worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0, mem
             logger.warning(f"could not load keypair: {e}, will try to proceed without it")
             keypair = None
         
-        # Create the task with the keypair
-        task = WeatherTask(db_manager=db, node_type="validator", test_mode=True, keypair=keypair)
+        # Create the task with the keypair; honor explicit test-mode env only
+        tm_env = os.getenv("WEATHER_TASK_TEST_MODE", "").strip().lower()
+        is_test_mode = tm_env in ("1", "true", "yes", "on")
+        task = WeatherTask(db_manager=db, node_type="validator", test_mode=is_test_mode, keypair=keypair)
         validator = task
         logger.info("initialized WeatherTask for miner communication with keypair")
     except Exception as e:
@@ -199,7 +201,10 @@ async def utility_worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 
     validator = None
     try:
         from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
-        validator = WeatherTask(db_manager=db, node_type="validator", test_mode=True, keypair=None)
+        import os
+        tm_env = os.getenv("WEATHER_TASK_TEST_MODE", "").strip().lower()
+        is_test_mode = tm_env in ("1", "true", "yes", "on")
+        validator = WeatherTask(db_manager=db, node_type="validator", test_mode=is_test_mode, keypair=None)
     except Exception:
         validator = None
     while True:

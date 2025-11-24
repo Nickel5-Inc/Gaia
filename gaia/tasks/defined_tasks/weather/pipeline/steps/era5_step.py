@@ -129,7 +129,8 @@ async def run_item(
     if validator is not None:
         task = getattr(validator, "weather_task_singleton", None)
     if task is None:
-        task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+        # Do not force test mode; honor explicit env only via WeatherTask config if needed
+        task = WeatherTask(db_manager=db, node_type="validator", test_mode=False)
         if validator is not None:
             try:
                 setattr(validator, "weather_task_singleton", task)
