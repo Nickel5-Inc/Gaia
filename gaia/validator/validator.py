@@ -5533,9 +5533,6 @@ class GaiaValidator:
                     base_eps = 1e-9
                     base = np.maximum(norm_weights[nz_idx], base_eps)
                     boosted = transformed_w[nz_idx] * np.power(base, gamma)
-                    # Tiny monotonic jitter based on UID to avoid exact equality, preserves order
-                    jitter = 1e-9 * (nz_idx.astype(float) / 256.0)
-                    boosted = boosted + jitter
                     transformed_w[nz_idx] = boosted
 
             final_sum = np.sum(transformed_w)

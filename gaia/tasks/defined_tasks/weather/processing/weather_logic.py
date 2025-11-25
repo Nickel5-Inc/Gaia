@@ -3256,23 +3256,31 @@ async def calculate_era5_miner_score(
                             logger.warning(f"[FinalScore] ⚠️ WARNING: {var_key} is not a dask array - verification may not be triggered!")
                         
                         logger.info(f"[FinalScore] ✅ Miner data loaded for {var_key}")
-                        truth_vals_np = truth_var_da_final.values
-                        mask_overlap = np.isfinite(truth_vals_np)
-                        if mask_overlap.any():
-                            masked_miner = np.where(mask_overlap, miner_vals_np, np.nan)
-                            total_elems = int(np.sum(mask_overlap))
-                            finite_elems = int(np.isfinite(masked_miner).sum()) if total_elems else 0
-                        else:
-                            total_elems = miner_vals_np.size if hasattr(miner_vals_np, "size") else 0
-                            finite_elems = int(np.isfinite(miner_vals_np).sum()) if total_elems else 0
-                        coverage_ratio = (finite_elems / total_elems) if total_elems else 0.0
-                        if coverage_ratio < min_cov:
-                            logger.error(
-                                f"[FinalScore] Low finite coverage for {var_key}: {coverage_ratio:.6f} < {min_cov:.6f}. Failing ERA5 scoring due to incomplete/invalid data."
-                            )
-                            return False
+                        
+                        # MANIPULATION CHECK 1: Detect extreme values before any operations
+                        # Genuine forecasts should have physically plausible values
+                        try:
+                            miner_finite = miner_vals_np[np.isfinite(miner_vals_np)]
+                            if len(miner_finite) > 0:
+                                val_max = float(np.max(np.abs(miner_finite)))
+                                # Atmospheric values should never exceed ~1e10 (even geopotential is ~5e5)
+                                if val_max > 1e12:
+                                    logger.error(
+                                        f"[FinalScore] MANIPULATION DETECTED for {var_key}: extreme value {val_max:.2e} exceeds physical limits. Hard failing."
+                                    )
+                                    await task_instance.db_manager.execute(
+                                        """UPDATE weather_miner_responses 
+                                           SET status = 'verification_failed', error_message = 'Extreme values detected - possible manipulation'
+                                           WHERE id = :rid""",
+                                        {"rid": response_id},
+                                    )
+                                    return False
+                        except Exception as _extreme_err:
+                            logger.debug(f"[FinalScore] Extreme value check skipped: {_extreme_err}")
+                        
+                        # Coverage check will be done AFTER dimension normalization below
                     except Exception as _cov_err:
-                        logger.debug(f"[FinalScore] Coverage ratio check failed for {var_key}: {_cov_err}")
+                        logger.warning(f"[FinalScore] Data loading failed for {var_key}: {_cov_err}")
 
                     logger.info(
                         f"[FinalScore info Metric Input] Var: {var_key}, Level: {var_level}"
@@ -3317,6 +3325,46 @@ async def calculate_era5_miner_score(
                     except Exception as _shape_guard_err:
                         logger.debug(f"[FinalScore] Shape guard skipped due to error: {_shape_guard_err}")
 
+                    # COVERAGE CHECK (after dimension normalization so shapes match)
+                    # Note: min_cov was already defined above from config
+                    try:
+                        miner_vals_for_cov = miner_var_da_aligned.values if hasattr(miner_var_da_aligned, 'values') else miner_var_da_aligned
+                        truth_vals_for_cov = truth_var_da_final.values if hasattr(truth_var_da_final, 'values') else truth_var_da_final
+                        
+                        # Compute coverage ratio safely
+                        truth_finite_mask = np.isfinite(truth_vals_for_cov)
+                        if truth_finite_mask.any():
+                            total_elems = int(np.sum(truth_finite_mask))
+                            miner_finite_in_overlap = np.isfinite(miner_vals_for_cov) & truth_finite_mask
+                            finite_elems = int(np.sum(miner_finite_in_overlap))
+                        else:
+                            total_elems = int(np.prod(miner_vals_for_cov.shape)) if hasattr(miner_vals_for_cov, 'shape') else 0
+                            finite_elems = int(np.isfinite(miner_vals_for_cov).sum()) if total_elems else 0
+                        
+                        coverage_ratio = (finite_elems / total_elems) if total_elems > 0 else 0.0
+                        
+                        # MANIPULATION CHECK 2: Very low coverage suggests intentional data corruption
+                        if coverage_ratio < 0.1:
+                            logger.error(
+                                f"[FinalScore] MANIPULATION DETECTED for {var_key}: coverage {coverage_ratio:.4f} < 0.1 suggests intentional NaN injection. Hard failing."
+                            )
+                            await task_instance.db_manager.execute(
+                                """UPDATE weather_miner_responses 
+                                   SET status = 'verification_failed', error_message = 'Extremely low coverage - possible NaN injection'
+                                   WHERE id = :rid""",
+                                {"rid": response_id},
+                            )
+                            return False
+                        elif coverage_ratio < min_cov:
+                            logger.error(
+                                f"[FinalScore] Low finite coverage for {var_key}: {coverage_ratio:.4f} < {min_cov:.4f}. Failing ERA5 scoring."
+                            )
+                            return False
+                        else:
+                            logger.info(f"[FinalScore] Coverage check passed for {var_key}: {coverage_ratio:.4f} >= {min_cov:.4f}")
+                    except Exception as _cov_err:
+                        logger.warning(f"[FinalScore] Coverage check failed for {var_key}, continuing: {_cov_err}")
+
                     lat_weights = None
                     if "lat" in truth_var_da_final.dims:
                         one_d_lat_weights = await asyncio.to_thread(
@@ -3340,6 +3388,34 @@ async def calculate_era5_miner_score(
                             )
 
                     current_metrics = {}
+                    
+                    # ANTI-GAMING: Fill miner NaNs with climatology to prevent score manipulation
+                    # If a miner has NaN where they'd perform poorly, they should get skill=0 (not better)
+                    # By filling with climatology, NaN points contribute MSE = MSE_reference → skill = 0
+                    try:
+                        miner_nan_mask = ~np.isfinite(miner_var_da_aligned.values)
+                        nan_count = int(np.sum(miner_nan_mask))
+                        if nan_count > 0:
+                            total_points = int(np.prod(miner_var_da_aligned.shape))
+                            nan_ratio = nan_count / total_points
+                            logger.info(
+                                f"[FinalScore] Filling {nan_count} NaN points ({nan_ratio:.2%}) with climatology for {var_key} to prevent score manipulation"
+                            )
+                            # Fill NaNs with climatology values - these points will contribute skill ≈ 0
+                            filled_values = np.where(
+                                miner_nan_mask,
+                                climatology_da_aligned.values,
+                                miner_var_da_aligned.values
+                            )
+                            miner_var_da_aligned = xr.DataArray(
+                                filled_values,
+                                dims=miner_var_da_aligned.dims,
+                                coords=miner_var_da_aligned.coords,
+                                attrs=miner_var_da_aligned.attrs
+                            )
+                    except Exception as _fill_err:
+                        logger.debug(f"[FinalScore] NaN fill skipped: {_fill_err}")
+                    
                     bias_corrected_forecast_da = (
                         await calculate_bias_corrected_forecast(
                             miner_var_da_aligned, truth_var_da_final
@@ -3349,10 +3425,16 @@ async def calculate_era5_miner_score(
                     actual_bias_op = miner_var_da_aligned - truth_var_da_final
 
                     def calculate_mean_scalar_threaded(op):
-                        computed_mean = op.mean()
-                        if hasattr(computed_mean, "compute"):
-                            computed_mean = computed_mean.compute()
-                        return float(computed_mean.item())
+                        # Suppress numpy overflow warnings during reduce operations
+                        with np.errstate(over='ignore', invalid='ignore'):
+                            computed_mean = op.mean()
+                            if hasattr(computed_mean, "compute"):
+                                computed_mean = computed_mean.compute()
+                            result = float(computed_mean.item())
+                            # Replace inf/nan with 0 to avoid downstream issues
+                            if not np.isfinite(result):
+                                return 0.0
+                            return result
 
                     mean_bias_val = await asyncio.to_thread(
                         calculate_mean_scalar_threaded, actual_bias_op

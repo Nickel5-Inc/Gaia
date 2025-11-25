@@ -290,7 +290,7 @@ async def run_poll_miner_job(
                 
                 return True
                 
-            elif status_value in ["processing", "received"]:
+            elif status_value in ["processing", "received", "running", "running_inference", "processing_output"]:
                 # Still running, update status and reschedule poll
                 if validator:
                     stats = WeatherStatsManager(db, getattr(validator, "hotkey", "unknown"))

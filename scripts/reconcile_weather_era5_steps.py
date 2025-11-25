@@ -100,6 +100,92 @@ async def reconcile_run(db: ValidatorDatabaseManager, run_id: int) -> int:
         )
         present_by_lead = {int(pr["lead_hours"]): pr["status"] for pr in present_rows if pr.get("lead_hours") is not None}
 
+        # Reset stale in_progress steps (orphaned by worker crash/OOM)
+        # A step is considered stale if it's in_progress and there's no active job with a valid lease
+        for lh, st in list(present_by_lead.items()):
+            if st == "in_progress":
+                # Check if there's an active job for this step
+                active_job = await db.fetch_one(
+                    sa.text(
+                        """
+                        SELECT id FROM validator_jobs 
+                        WHERE run_id = :rid AND miner_uid = :uid 
+                          AND job_type = 'weather.era5'
+                          AND status = 'in_progress'
+                          AND lease_expires_at > NOW()
+                        LIMIT 1
+                        """
+                    ),
+                    {"rid": run_id, "uid": uid},
+                )
+                if not active_job:
+                    # Check current retry count to decide whether to retry or fail permanently
+                    step_info = await db.fetch_one(
+                        sa.text(
+                            """
+                            SELECT retry_count FROM weather_forecast_steps
+                            WHERE run_id = :rid AND miner_uid = :uid 
+                              AND step_name = 'era5' AND substep = 'score' AND lead_hours = :lh
+                            """
+                        ),
+                        {"rid": run_id, "uid": uid, "lh": int(lh)},
+                    )
+                    current_retry = int(step_info.get("retry_count") or 0) if step_info else 0
+                    max_retries = 3
+                    
+                    if current_retry >= max_retries:
+                        # Max retries exceeded - mark as permanently failed
+                        try:
+                            await db.execute(
+                                sa.text(
+                                    """
+                                    UPDATE weather_forecast_steps
+                                    SET status = 'failed', 
+                                        job_id = NULL,
+                                        completed_at = NOW(),
+                                        error_json = jsonb_build_object(
+                                            'type', 'max_retries_exceeded',
+                                            'message', 'Step failed after max retries - likely persistent OOM or data issue',
+                                            'retry_count', retry_count,
+                                            'failed_at', NOW()::text
+                                        )
+                                    WHERE run_id = :rid AND miner_uid = :uid 
+                                      AND step_name = 'era5' AND substep = 'score' AND lead_hours = :lh
+                                      AND status = 'in_progress'
+                                    """
+                                ),
+                                {"rid": run_id, "uid": uid, "lh": int(lh)},
+                            )
+                            present_by_lead[lh] = "failed"
+                        except Exception:
+                            pass
+                    else:
+                        # Still have retries left - reset to pending for another attempt
+                        try:
+                            await db.execute(
+                                sa.text(
+                                    """
+                                    UPDATE weather_forecast_steps
+                                    SET status = 'pending', 
+                                        job_id = NULL,
+                                        retry_count = COALESCE(retry_count, 0) + 1,
+                                        error_json = jsonb_build_object(
+                                            'type', 'orphaned_step_recovered',
+                                            'message', 'Step was in_progress with no active job - likely worker crash',
+                                            'recovered_at', NOW()::text
+                                        )
+                                    WHERE run_id = :rid AND miner_uid = :uid 
+                                      AND step_name = 'era5' AND substep = 'score' AND lead_hours = :lh
+                                      AND status = 'in_progress'
+                                    """
+                                ),
+                                {"rid": run_id, "uid": uid, "lh": int(lh)},
+                            )
+                            present_by_lead[lh] = "pending"
+                            inserted += 1  # Count as reconciled
+                        except Exception:
+                            pass
+
         # Flip not-ready retry_scheduled to waiting_for_truth with precise ready_at
         for lh, st in list(present_by_lead.items()):
             if st == "retry_scheduled" and not lead_truth_ready(lh):

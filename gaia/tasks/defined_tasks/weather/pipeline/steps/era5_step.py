@@ -530,7 +530,7 @@ async def run_item(
                 pass
     except Exception:
         pass
-    @substep("era5", "score", should_retry=False)
+    @substep("era5", "score", should_retry=True, retry_delay_seconds=1800, max_retries=3, retry_backoff="exponential")
     async def _score_era5_item(db, task: WeatherTask, *, run_id: int, miner_uid: int, miner_hotkey: str):
         return await calculate_era5_miner_score(
             task_instance=task,
