@@ -233,14 +233,40 @@ async def reconcile_run(db: ValidatorDatabaseManager, run_id: int) -> int:
         for lh in EXPECTED_LEADS:
             if scored_by_lead.get(lh):
                 continue
-            if present_by_lead.get(lh) in {"queued", "in_progress", "succeeded"}:
+            if present_by_lead.get(lh) in {"queued", "in_progress", "succeeded", "failed"}:
                 continue
+            # Also skip if already have too many jobs for this step
+            job_count = await db.fetch_one(
+                sa.text(
+                    """
+                    SELECT COUNT(*) as cnt FROM validator_jobs
+                    WHERE run_id = :rid AND miner_uid = :uid AND job_type = 'weather.era5'
+                    """
+                ),
+                {"rid": run_id, "uid": uid},
+            )
+            if job_count and int(job_count.get("cnt", 0)) >= 5:
+                continue  # Stop creating jobs after 5 attempts
             if not lead_truth_ready(lh):
                 continue
             pending_available.append(lh)
 
         if pending_available:
             lh = min(pending_available)
+            # Check existing retry count for this step before scheduling
+            existing_step = await db.fetch_one(
+                sa.text(
+                    """
+                    SELECT retry_count FROM weather_forecast_steps
+                    WHERE run_id = :rid AND miner_uid = :uid AND step_name = 'era5' AND substep = 'score' AND lead_hours = :lh
+                    """
+                ),
+                {"rid": run_id, "uid": uid, "lh": lh},
+            )
+            existing_retry_count = int(existing_step.get("retry_count") or 0) if existing_step else 0
+            if existing_retry_count >= 5:
+                continue  # Don't reschedule if already retried too many times
+            
             # Jitter 0..3600s to prevent thundering herd (no fixed 30 min delay)
             next_time = now_utc + timedelta(seconds=random.randint(0, 3600))
             await schedule_retry(
@@ -252,7 +278,7 @@ async def reconcile_run(db: ValidatorDatabaseManager, run_id: int) -> int:
                 substep="score",
                 lead_hours=lh,
                 error_json={"type": "reconciled_missing_step", "message": "scheduled first attempt after availability"},
-                retry_count=1,
+                retry_count=existing_retry_count + 1,  # Increment existing count, not reset to 1
                 next_retry_time=next_time,
             )
             inserted += 1

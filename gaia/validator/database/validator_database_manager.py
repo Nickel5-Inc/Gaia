@@ -1419,12 +1419,28 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
     ) -> Optional[int]:
         """Enqueue a job only if there isn't already an active one with the same singleton_key.
 
-        Active set: pending, claimed, retry_scheduled.
-        The unique constraint on singleton_key ensures only one active job per key.
+        Blocks creation if:
+        - Job is active (pending, in_progress, retry_scheduled)
+        - Already have 5+ jobs with this key (exhausted retries)
+        
+        Note: Completed jobs don't block - the step status determines if work is done.
         """
         import json
         try:
-            # Try to insert with the singleton_key using proper duplicate prevention
+            # First check if there are already too many jobs with this key (prevents endless retry loops)
+            count_row = await self.fetch_one(
+                """
+                SELECT COUNT(*) as cnt FROM validator_jobs 
+                WHERE singleton_key = :sk
+                """,
+                {"sk": singleton_key},
+            )
+            if count_row and count_row.get("cnt", 0) >= 5:
+                # Already have 5+ jobs for this key - stop creating more
+                return None
+            
+            # Try to insert with the singleton_key - block only for ACTIVE jobs
+            # Completed jobs don't block - the step status determines if retry is needed
             result = await self.fetch_one(
                 """
                 INSERT INTO validator_jobs 
@@ -1609,7 +1625,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             steps = await self.fetch_all(
                 """
                 SELECT s.id AS step_id, s.run_id, s.miner_uid, s.step_name,
-                       r.id AS response_id, r.miner_hotkey, r.status as response_status, r.verification_passed, s.substep, s.lead_hours
+                       r.id AS response_id, r.miner_hotkey, r.status as response_status, r.verification_passed, s.substep, s.lead_hours,
+                       s.retry_count
                 FROM weather_forecast_steps s
                 LEFT JOIN weather_miner_responses r
                   ON r.run_id = s.run_id AND r.miner_uid = s.miner_uid
@@ -1622,6 +1639,14 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     s.status = 'pending'
                     OR (s.status = 'retry_scheduled' AND (s.next_retry_time IS NULL OR s.next_retry_time <= NOW()))
                     OR (s.status = 'waiting_for_truth' AND s.next_retry_time IS NOT NULL AND s.next_retry_time <= NOW())
+                  )
+                  AND COALESCE(s.retry_count, 0) < 5  -- Skip steps that have exceeded retry limit
+                  -- Skip if already have an active job for this step
+                  AND NOT EXISTS (
+                    SELECT 1 FROM validator_jobs vj
+                    WHERE vj.run_id = s.run_id AND vj.miner_uid = s.miner_uid
+                      AND vj.job_type = 'weather.era5'
+                      AND vj.status IN ('pending', 'in_progress', 'retry_scheduled')
                   )
                 ORDER BY s.run_id ASC, s.miner_uid ASC
                 LIMIT :limit

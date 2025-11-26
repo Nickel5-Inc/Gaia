@@ -859,6 +859,13 @@ async def fetch_gfs_analysis_data(
                             unique_indices_sorted = np.sort(unique_indices)
                             full_ds = full_ds.isel(time=unique_indices_sorted)
 
+                        # NOMADS FIX: Ensure time coordinate is monotonic (sorted) for .sel() to work
+                        if not full_ds.indexes['time'].is_monotonic_increasing:
+                            logger.warning("Time coordinate is not monotonic, sorting to fix NOMADS data issue")
+                            # Use isel with argsort and load to bring into memory (avoids netCDF4.Variable indexing issues)
+                            sort_indices = np.argsort(full_ds.time.values)
+                            full_ds = full_ds.isel(time=sort_indices).load()
+
                         analysis_slice = full_ds.sel(
                             time=analysis_target_dt_np, method="nearest"
                         )
@@ -913,6 +920,13 @@ async def fetch_gfs_analysis_data(
                                 # Keep only the first occurrence of each unique time
                                 unique_indices_sorted = np.sort(unique_indices)
                                 full_ds = full_ds.isel(time=unique_indices_sorted)
+
+                            # NOMADS FIX: Ensure time coordinate is monotonic (sorted) for .sel() to work
+                            if not full_ds.indexes['time'].is_monotonic_increasing:
+                                logger.warning("Time coordinate is not monotonic, sorting to fix NOMADS data issue")
+                                # Use isel with argsort and load to bring into memory (avoids netCDF4.Variable indexing issues)
+                                sort_indices = np.argsort(full_ds.time.values)
+                                full_ds = full_ds.isel(time=sort_indices).load()
 
                             numerical_target_for_sel = (
                                 xr.coding.times.encode_cf_datetime(
